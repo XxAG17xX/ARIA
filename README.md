@@ -2,7 +2,6 @@
 
 > Voice-driven spatial 3D content generation with perceptual lighting in Mixed Reality
 
-**Extended Reality — CSU44054/CS7GV4 — Trinity College Dublin**
 
 ---
 
@@ -84,4 +83,3 @@ Build and deploy APK to Quest 3. Passthrough camera and MRUK require device buil
 
 ---
 
-*Trinity College Dublin — Extended Reality Module — 2026*
