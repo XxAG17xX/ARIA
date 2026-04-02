@@ -1,10 +1,10 @@
 // ARIAOrchestrator.cs
 // Master controller for the ARIA pipeline.
-// Voice transcript → Claude → per-object: Gemini → HiTEM3D → GLTFast → place + scale + light.
+// Voice transcript → Claude (multimodal) → Gemini → HiTEM3D → GLTFast → place + scale + light.
 // Objects appear progressively — each placed as soon as its own generation finishes.
 //
-// APK NOTE: Passthrough frame capture and real MRUK data require a Quest APK build.
-//           Editor runs with a null passthrough image and mock MRUK room data.
+// APK NOTE: WebCamTexture passthrough capture and real MRUK data require a Quest APK build.
+//           Editor runs with mock MRUK data and a null passthrough image (text-only Claude call).
 
 using System;
 using System.Collections.Generic;
@@ -28,6 +28,8 @@ public class ARIAOrchestrator : MonoBehaviour
     [Header("Scene")]
     [Tooltip("Parent transform for all spawned objects. Defaults to this GameObject.")]
     [SerializeField] private Transform spawnRoot;
+    [Tooltip("The scene's main directional light. SH estimator will control its direction.")]
+    [SerializeField] private Light sceneDirectionalLight;
 
     // API keys — loaded from config.json at runtime, never hardcoded
     private string _claudeKey;
@@ -35,8 +37,14 @@ public class ARIAOrchestrator : MonoBehaviour
     private string _hitemAccessKey;
     private string _hitemSecretKey;
 
+    // Passthrough camera for frame capture (WebCamTexture, Quest 3/3S only)
+    private WebCamTexture _webcam;
+
     // Tracks grey-mesh previews so they can be swapped when the textured mesh arrives
     private readonly Dictionary<string, GameObject> _previews = new();
+
+    // Status callback for ARIADebugUI
+    public event Action<string> OnStatusChanged;
 
     // -------------------------------------------------------------------------
     // Unity lifecycle
@@ -45,6 +53,34 @@ public class ARIAOrchestrator : MonoBehaviour
     private void Awake()
     {
         LoadConfig();
+    }
+
+    private void Start()
+    {
+        // Initialise shadow receiver (configures EffectMesh materials) once scene is ready
+        shadowReceiver?.Configure();
+
+        // Subscribe to MRUK scene loaded event so we know when room data is available
+#if UNITY_ANDROID && !UNITY_EDITOR
+        if (MRUK.Instance != null)
+            MRUK.Instance.SceneLoadedEvent.AddListener(OnMRUKSceneLoaded);
+#endif
+    }
+
+    private void OnDestroy()
+    {
+        if (_webcam != null && _webcam.isPlaying)
+            _webcam.Stop();
+
+#if UNITY_ANDROID && !UNITY_EDITOR
+        if (MRUK.Instance != null)
+            MRUK.Instance.SceneLoadedEvent.RemoveListener(OnMRUKSceneLoaded);
+#endif
+    }
+
+    private void OnMRUKSceneLoaded()
+    {
+        Debug.Log("[ARIA] MRUK scene loaded — real room data available.");
     }
 
     // -------------------------------------------------------------------------
@@ -71,60 +107,90 @@ public class ARIAOrchestrator : MonoBehaviour
     private static string GetConfigPath()
     {
 #if UNITY_EDITOR
-        // Project root — two levels up from Assets/
-        return Path.GetFullPath(Path.Combine(Application.dataPath, "../config.json"));
+        return Path.GetFullPath(Path.Combine(Application.dataPath, "../Assets/config.json"));
 #else
-        // Quest: push config.json before first run with:
+        // Quest: push config.json with adb before first run:
         // adb push config.json /sdcard/Android/data/<package-name>/files/config.json
         return Path.Combine(Application.persistentDataPath, "config.json");
 #endif
     }
 
     // -------------------------------------------------------------------------
-    // Entry point — called by the voice input system
+    // Entry point — called by Voice SDK or ARIADebugUI
     // -------------------------------------------------------------------------
 
     /// <summary>
     /// Pass the recognised voice transcript here to trigger the full ARIA pipeline.
+    /// Called by VoiceSDKConnector (subscribes to AppVoiceExperience.VoiceEvents.OnFullTranscription)
+    /// or directly from ARIADebugUI in editor.
     /// </summary>
     public async void ProcessVoiceCommand(string transcript)
     {
         Debug.Log($"[ARIA] Voice command: \"{transcript}\"");
+        SetStatus("Capturing room...");
 
-        byte[] passthroughJpeg = await CapturePassthroughFrameAsync();
-        string mrukJson        = SerializeMRUKData();
+        // Capture passthrough frame ONCE — reused for Claude API and SH estimator
+        byte[] jpeg = await CapturePassthroughFrameAsync();
 
-        List<PlacementInstruction> instructions =
-            await CallClaudeAsync(passthroughJpeg, mrukJson, transcript);
+        // Serialize MRUK room data
+        string mrukJson = SerializeMRUKData();
+
+        SetStatus("Asking Claude...");
+        List<PlacementInstruction> instructions = await CallClaudeAsync(jpeg, mrukJson, transcript);
 
         if (instructions == null || instructions.Count == 0)
         {
             Debug.LogWarning("[ARIA] Claude returned no placement instructions.");
+            SetStatus("No objects to place.");
             return;
         }
 
         Debug.Log($"[ARIA] Spawning {instructions.Count} object(s) progressively...");
+        SetStatus($"Generating {instructions.Count} object(s)...");
 
         // Launch all object pipelines concurrently — progressive placement
         var tasks = new List<Task>();
         foreach (var instr in instructions)
-            tasks.Add(ProcessObjectAsync(instr));
+            tasks.Add(ProcessObjectAsync(instr, jpeg));
 
         await Task.WhenAll(tasks);
+        SetStatus("Done.");
         Debug.Log("[ARIA] All objects placed.");
     }
 
     // -------------------------------------------------------------------------
-    // Passthrough frame capture
+    // Passthrough frame capture (WebCamTexture, Quest 3 only)
     // -------------------------------------------------------------------------
 
     private async Task<byte[]> CapturePassthroughFrameAsync()
     {
-        // APK only — read Quest passthrough camera texture and encode to JPEG.
-        // Passthrough camera is unavailable in the editor.
-        // TODO: implement via OVRCameraRig passthrough texture + Texture2D.EncodeToJPG()
+#if UNITY_ANDROID && !UNITY_EDITOR
+        if (_webcam == null)
+        {
+            _webcam = new WebCamTexture();
+            _webcam.Play();
+        }
+
+        // Wait 2 frames for first valid frame (first frame is often black)
         await Task.Yield();
-        return null;
+        await Task.Yield();
+
+        if (!_webcam.isPlaying || _webcam.width < 2)
+        {
+            Debug.LogWarning("[ARIA] WebCamTexture not ready — Claude will run text-only.");
+            return null;
+        }
+
+        var snap = new Texture2D(_webcam.width, _webcam.height, TextureFormat.RGB24, false);
+        snap.SetPixels(_webcam.GetPixels());
+        snap.Apply();
+        byte[] jpeg = snap.EncodeToJPG(75);
+        Destroy(snap);
+        return jpeg;
+#else
+        await Task.Yield();
+        return null; // Editor: Claude operates on text + mock MRUK only
+#endif
     }
 
     // -------------------------------------------------------------------------
@@ -170,11 +236,18 @@ public class ARIAOrchestrator : MonoBehaviour
 
     private static string MockMRUKJson() => JsonConvert.SerializeObject(new
     {
-        surfaces = new[]
+        room_width  = 5.0f,
+        room_depth  = 4.0f,
+        room_height = 2.8f,
+        anchors = new[]
         {
-            new { label = "FLOOR",     position = new { x = 0f, y = 0f,   z = 0f  }, normal = new { x = 0f, y =  1f, z = 0f }, scale = new { x = 4f, y = 3f } },
-            new { label = "WALL_FACE", position = new { x = 0f, y = 1.5f, z = -3f }, normal = new { x = 0f, y =  0f, z = 1f }, scale = new { x = 4f, y = 3f } },
-            new { label = "CEILING",   position = new { x = 0f, y = 3f,   z = 0f  }, normal = new { x = 0f, y = -1f, z = 0f }, scale = new { x = 4f, y = 3f } }
+            new { label = "FLOOR",     position = new[] { 0f,   -0.05f, 0f   }, normal = new[] { 0f,  1f,  0f }, size = new[] { 5f,   4f   }, height = 0f    },
+            new { label = "CEILING",   position = new[] { 0f,    2.8f,  0f   }, normal = new[] { 0f, -1f,  0f }, size = new[] { 5f,   4f   }, height = 0f    },
+            new { label = "WALL_FACE", position = new[] { 2.5f,  1.4f,  0f   }, normal = new[] {-1f,  0f,  0f }, size = new[] { 4f, 2.8f   }, height = 0f    },
+            new { label = "WALL_FACE", position = new[] {-2.5f,  1.4f,  0f   }, normal = new[] { 1f,  0f,  0f }, size = new[] { 4f, 2.8f   }, height = 0f    },
+            new { label = "WALL_FACE", position = new[] { 0f,    1.4f,  2f   }, normal = new[] { 0f,  0f, -1f }, size = new[] { 5f, 2.8f   }, height = 0f    },
+            new { label = "WALL_FACE", position = new[] { 0f,    1.4f, -2f   }, normal = new[] { 0f,  0f,  1f }, size = new[] { 5f, 2.8f   }, height = 0f    },
+            new { label = "TABLE",     position = new[] { 1f,    0.75f, -0.5f }, normal = new[] { 0f,  1f,  0f }, size = new[] { 1.2f, 0.8f }, height = 0.75f }
         }
     });
 
@@ -192,12 +265,7 @@ public class ARIAOrchestrator : MonoBehaviour
             content.Add(new
             {
                 type   = "image",
-                source = new
-                {
-                    type       = "base64",
-                    media_type = "image/jpeg",
-                    data       = Convert.ToBase64String(jpeg)
-                }
+                source = new { type = "base64", media_type = "image/jpeg", data = Convert.ToBase64String(jpeg) }
             });
         }
 
@@ -211,10 +279,18 @@ public class ARIAOrchestrator : MonoBehaviour
         {
             model      = "claude-sonnet-4-6",
             max_tokens = 1024,
-            system     = "You are a spatial interior design AI. Respond with valid JSON only. " +
-                         "No explanation. Return a JSON array where each element has: " +
-                         "prompt (string), surface_label (string: FLOOR/WALL_FACE/CEILING), " +
-                         "height_metres (float), category (string).",
+            system     = "You are a spatial interior design AI. Respond with valid JSON only. No explanation. " +
+                         "Return a JSON array where each element has: " +
+                         "prompt (string — description for image generation), " +
+                         "surface_label (string: FLOOR/WALL_FACE/CEILING/TABLE), " +
+                         "height_metres (float — real-world height), " +
+                         "category (string — object type, lowercase), " +
+                         "emits_light (bool — true if this object has a light source), " +
+                         "light_type (string: 'point' or 'spot', only if emits_light), " +
+                         "light_color (array of 3 floats 0-1 RGB, only if emits_light), " +
+                         "light_intensity (float, only if emits_light), " +
+                         "light_range (float metres, only if emits_light), " +
+                         "light_offset (array of 3 floats — bulb position relative to object root, only if emits_light).",
             messages   = new[] { new { role = "user", content } }
         });
 
@@ -242,9 +318,10 @@ public class ARIAOrchestrator : MonoBehaviour
     // Per-object pipeline
     // -------------------------------------------------------------------------
 
-    private async Task ProcessObjectAsync(PlacementInstruction instr)
+    private async Task ProcessObjectAsync(PlacementInstruction instr, byte[] jpeg)
     {
         Debug.Log($"[ARIA] Pipeline start: {instr.prompt}");
+        SetStatus($"Generating: {instr.category}...");
 
         // 1 — Gemini image generation
         byte[] png = await CallGeminiAsync(instr.prompt);
@@ -258,13 +335,13 @@ public class ARIAOrchestrator : MonoBehaviour
         string greyId  = await SubmitHiTEMTaskAsync(token, png, requestType: 1);
         string greyUrl = await PollHiTEMTaskAsync(token, greyId);
         if (greyUrl != null)
-            await SpawnObjectAsync(greyUrl, instr, isPreview: true);
+            await SpawnObjectAsync(greyUrl, instr, isPreview: true, jpeg: null);
 
         // 3b — Full textured mesh replaces the preview
         string texId  = await SubmitHiTEMTaskAsync(token, png, requestType: 2, meshUrl: greyUrl);
         string texUrl = await PollHiTEMTaskAsync(token, texId);
         if (texUrl != null)
-            await SpawnObjectAsync(texUrl, instr, isPreview: false);
+            await SpawnObjectAsync(texUrl, instr, isPreview: false, jpeg: jpeg);
     }
 
     // -------------------------------------------------------------------------
@@ -389,7 +466,6 @@ public class ARIAOrchestrator : MonoBehaviour
                     Debug.LogError($"[ARIA] HiTEM3D task failed: {taskId}");
                     return null;
             }
-            // created / queueing / processing — keep polling
         }
     }
 
@@ -397,7 +473,8 @@ public class ARIAOrchestrator : MonoBehaviour
     // GLTFast spawn + systems integration
     // -------------------------------------------------------------------------
 
-    private async Task SpawnObjectAsync(string glbUrl, PlacementInstruction instr, bool isPreview)
+    private async Task SpawnObjectAsync(
+        string glbUrl, PlacementInstruction instr, bool isPreview, byte[] jpeg)
     {
         using var req = UnityWebRequest.Get(glbUrl);
         await AwaitRequest(req.SendWebRequest());
@@ -411,8 +488,9 @@ public class ARIAOrchestrator : MonoBehaviour
         var root = new GameObject(instr.prompt);
         root.transform.SetParent(spawnRoot != null ? spawnRoot : transform);
 
+        // GLTFast load — using generic Load() to avoid deprecated LoadGltfBinary()
         var  gltf = new GltfImport();
-        bool ok   = await gltf.LoadGltfBinary(req.downloadHandler.data, new Uri(glbUrl));
+        bool ok   = await gltf.Load(req.downloadHandler.data);
         if (!ok)
         {
             Debug.LogError($"[ARIA] GLTFast failed: {instr.prompt}");
@@ -421,18 +499,31 @@ public class ARIAOrchestrator : MonoBehaviour
         }
         await gltf.InstantiateMainSceneAsync(root.transform);
 
-        // Scale to LLM-specified real-world height
-        scaleSystem?.ApplyScale(root, instr.height_metres);
+        // Scale to LLM-inferred real-world height
+        scaleSystem?.ApplyScale(root, instr.height_metres, instr.category);
 
-        // Semantic surface placement
+        // Place on the correct MRUK surface
         placementEngine?.Place(root, instr.surface_label);
 
-        // Shadow receiver on MRUK scene mesh
-        shadowReceiver?.Configure();
+        // Final object only (not preview): run lighting + interaction setup
+        if (!isPreview)
+        {
+            // SH lighting — runs ONCE using the passthrough frame captured at command start
+            // Updates RenderSettings.ambientProbe and sets sceneDirectionalLight direction
+            shEstimator?.EstimateLighting(jpeg, sceneDirectionalLight, root);
 
-        // SH lighting estimator runs at 5 Hz continuously — no per-object call needed
+            // Add reflection probe at object position (updates every frame automatically)
+            AddReflectionProbe(root);
 
-        // Swap preview with final textured mesh
+            // Virtual light source (e.g. lamp spawns with a Unity PointLight)
+            if (instr.emits_light)
+                AddVirtualLight(root, instr);
+
+            // Rigidbody + BoxCollider for grabbable interaction
+            AddPhysicsAndInteraction(root);
+        }
+
+        // Swap preview → final textured mesh
         if (isPreview)
         {
             _previews[instr.prompt] = root;
@@ -450,6 +541,78 @@ public class ARIAOrchestrator : MonoBehaviour
     }
 
     // -------------------------------------------------------------------------
+    // Virtual light source (for lamps, lanterns, candles, etc.)
+    // -------------------------------------------------------------------------
+
+    private static void AddVirtualLight(GameObject root, PlacementInstruction instr)
+    {
+        var lightGO = new GameObject("VirtualLight");
+        lightGO.transform.SetParent(root.transform);
+
+        Vector3 offset = instr.light_offset != null && instr.light_offset.Length == 3
+            ? new Vector3(instr.light_offset[0], instr.light_offset[1], instr.light_offset[2])
+            : new Vector3(0f, instr.height_metres * 0.9f, 0f); // default: near top of object
+        lightGO.transform.localPosition = offset;
+
+        var light       = lightGO.AddComponent<Light>();
+        light.type      = instr.light_type == "spot" ? LightType.Spot : LightType.Point;
+        light.intensity = instr.light_intensity;
+        light.range     = instr.light_range;
+        light.shadows   = LightShadows.Soft;
+        light.shadowStrength = 0.8f;
+
+        if (instr.light_color != null && instr.light_color.Length == 3)
+            light.color = new Color(instr.light_color[0], instr.light_color[1], instr.light_color[2]);
+        else
+            light.color = new Color(1f, 0.85f, 0.6f); // warm white default
+
+        Debug.Log($"[ARIA] Added virtual {light.type} light to \"{root.name}\".");
+    }
+
+    // -------------------------------------------------------------------------
+    // Reflection probe (per-object, realtime)
+    // -------------------------------------------------------------------------
+
+    private static void AddReflectionProbe(GameObject root)
+    {
+        var probeGO = new GameObject("ARIA_ReflectionProbe");
+        probeGO.transform.position = root.transform.position + Vector3.up * 0.5f;
+
+        var probe        = probeGO.AddComponent<ReflectionProbe>();
+        probe.mode       = UnityEngine.Rendering.ReflectionProbeMode.Realtime;
+        probe.refreshMode = UnityEngine.Rendering.ReflectionProbeRefreshMode.EveryFrame;
+        probe.timeSlicingMode = UnityEngine.Rendering.ReflectionProbeTimeSlicingMode.IndividualFaces;
+        probe.resolution = 64;
+        probe.size       = new Vector3(4f, 3f, 4f);
+        probeGO.transform.SetParent(root.transform);
+    }
+
+    // -------------------------------------------------------------------------
+    // Physics + Interaction SDK setup (called once on final spawn)
+    // -------------------------------------------------------------------------
+
+    private static void AddPhysicsAndInteraction(GameObject root)
+    {
+        // Rigidbody — non-kinematic so physics apply, no gravity so it floats in place
+        var rb           = root.AddComponent<Rigidbody>();
+        rb.useGravity    = false;
+        rb.isKinematic   = false;
+        rb.constraints   = RigidbodyConstraints.FreezeRotation;
+
+        // BoxCollider auto-sized to mesh bounds
+        var bounds = CalculateMeshBounds(root);
+        var col    = root.AddComponent<BoxCollider>();
+        col.center = root.transform.InverseTransformPoint(bounds.center);
+        col.size   = bounds.size;
+
+        // HandGrabInteractable is added via the Building Blocks Hand Grab Interaction setup.
+        // Once the scene has OVRInteractionComprehensive, add:
+        // root.AddComponent<Oculus.Interaction.Grabbable>();
+        // root.AddComponent<Oculus.Interaction.HandGrab.HandGrabInteractable>();
+        // (Uncomment when Interaction SDK Building Block is confirmed in scene)
+    }
+
+    // -------------------------------------------------------------------------
     // Utilities
     // -------------------------------------------------------------------------
 
@@ -461,7 +624,7 @@ public class ARIAOrchestrator : MonoBehaviour
         return tcs.Task;
     }
 
-    /// <summary>Strips ```json ... ``` fences that LLMs sometimes add around JSON output.</summary>
+    /// <summary>Strips ```json ... ``` fences that LLMs sometimes add around JSON.</summary>
     private static string StripCodeFences(string s)
     {
         s = s.Trim();
@@ -469,6 +632,22 @@ public class ARIAOrchestrator : MonoBehaviour
         int start = s.IndexOf('\n') + 1;
         int end   = s.LastIndexOf("```");
         return end > start ? s.Substring(start, end - start).Trim() : s;
+    }
+
+    /// <summary>Computes world-space bounding box across all Renderer children.</summary>
+    public static Bounds CalculateMeshBounds(GameObject root)
+    {
+        var renderers = root.GetComponentsInChildren<Renderer>();
+        if (renderers.Length == 0)
+            return new Bounds(root.transform.position, Vector3.one * 0.1f);
+        Bounds b = renderers[0].bounds;
+        foreach (var r in renderers) b.Encapsulate(r.bounds);
+        return b;
+    }
+
+    private void SetStatus(string msg)
+    {
+        OnStatusChanged?.Invoke(msg);
     }
 }
 
@@ -479,10 +658,17 @@ public class ARIAOrchestrator : MonoBehaviour
 [Serializable]
 public class PlacementInstruction
 {
-    public string prompt;
-    public string surface_label;
-    public float  height_metres;
-    public string category;
+    public string   prompt;
+    public string   surface_label;
+    public float    height_metres;
+    public string   category;
+    // Virtual light source fields (optional — only set when emits_light = true)
+    public bool     emits_light;
+    public string   light_type;
+    public float[]  light_color;
+    public float    light_intensity;
+    public float    light_range;
+    public float[]  light_offset;
 }
 
 // Claude
