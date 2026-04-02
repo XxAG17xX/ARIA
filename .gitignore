@@ -53,6 +53,8 @@ sysinfo.txt
 # ARIA — NEVER COMMIT THESE
 config.json
 config.json.meta
+Assets/config.json
+Assets/config.json.meta
 aria_keys.txt
 
 # OS
