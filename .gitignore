@@ -59,6 +59,9 @@ Assets/aria_glb_cache.json
 Assets/aria_glb_cache.json.meta
 aria_keys.txt
 
+# Claude session data (handoff docs, memory — not for GitHub)
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db

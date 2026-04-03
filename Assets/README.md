@@ -36,9 +36,10 @@ Virtual content in MR environments looks synthetic. Wrong lighting direction, no
 ```
 Voice → Claude (spatial reasoning over room scan + passthrough image)
       → Gemini Nano Banana 2 (reference image)
-      → HiTEM3D API (textured GLB mesh)
+      → Claude refinement (reviews image, adjusts dimensions to room context)
+      → HiTEM3D / Tripo3D (textured GLB mesh — switchable in Inspector)
       → GLTFast (runtime loading)
-      → Placement + scale + lighting + shadows + hand interaction
+      → Proportional scale + surface placement + lighting + shadows + hand interaction
 ```
 
 All processing via HTTPS over WiFi. No local server. Works in any room.
@@ -53,7 +54,7 @@ All processing via HTTPS over WiFi. No local server. Works in any room.
 | Room scanning | Meta MRUK |
 | Spatial reasoning | Claude API (claude-sonnet-4-6) |
 | Image generation | Gemini Nano Banana 2 |
-| 3D generation | HiTEM3D API v1.5 |
+| 3D generation | HiTEM3D API v1.5 / Tripo3D (switchable) |
 | Runtime loading | GLTFast |
 | Hand interaction | Meta Interaction SDK |
 | Lighting | Spherical Harmonics (Ramamoorthi & Hanrahan 2001) |
@@ -68,7 +69,8 @@ Create `config.json` in project root (gitignored):
   "claude_key": "YOUR_KEY",
   "gemini_key": "YOUR_KEY",
   "hitem_access_key": "YOUR_KEY",
-  "hitem_secret_key": "YOUR_KEY"
+  "hitem_secret_key": "YOUR_KEY",
+  "tripo_key": "YOUR_KEY"
 }
 ```
 
