@@ -57,7 +57,7 @@ public class ARIADebugUI : MonoBehaviour
         InitStyles();
 
         float panelW = 420f;
-        float panelH = 210f;
+        float panelH = 260f;
         float x      = 20f;
         float y      = Screen.height - panelH - 20f;
 
@@ -105,6 +105,15 @@ public class ARIADebugUI : MonoBehaviour
                 _orchestrator.TestSpawnFromUrl(testGlbUrl, testCategory, testHeight);
             else
                 Debug.LogWarning("[ARIA] Paste a GLB URL into ARIADebugUI.testGlbUrl in the Inspector.");
+        }
+
+        cy += lineH + 6f;
+
+        // Apply lighting retroactively to all spawned objects
+        if (GUI.Button(new Rect(inner, cy, panelW - padding * 2f, lineH + 4f),
+            "Apply Lighting to All Objects", _buttonStyle))
+        {
+            _orchestrator.ApplyLightingToAllSpawned();
         }
 
         cy += lineH + 10f;

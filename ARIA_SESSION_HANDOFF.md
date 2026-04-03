@@ -36,7 +36,7 @@ Assets/Scripts/ARIA/
 Assets/
   ARIA_IMPLEMENTATION_GUIDE.md ← Original spec, read for full design intent
   config.json                  ← API keys (NOT in git). Keys: claude_key, gemini_key,
-                                  hitem_access_key, hitem_secret_key
+                                  hitem_access_key, hitem_secret_key, tripo_key
   aria_glb_cache.json          ← GLB URL cache (NOT in git, auto-created at runtime)
 Assets/Shaders/ARIA/
   ShadowReceiver.shader        ← Custom URP transparent shadow receiver
@@ -65,13 +65,23 @@ Assets/Shaders/ARIA/
 ### HiTEM3D (3D mesh generation)
 - Auth: `POST https://api.hitem3d.ai/open-api/v1/auth/token` with Basic auth (base64 access:secret)
 - Submit: `POST https://api.hitem3d.ai/open-api/v1/submit-task` multipart form
-  - requestType=1 → grey mesh (~90s)
-  - requestType=2 → textured mesh (~2-3min), pass meshUrl from step 1
+  - requestType=3 → all-in-one (geometry+texture), 512 resolution
 - Poll: `GET https://api.hitem3d.ai/open-api/v1/query-task?task_id={id}` every 5s
-  - Status field: check `.ToLower()` for "success"/"failed" (API casing inconsistent)
-  - **"unknown" in logs = still generating, PIPELINE IS WORKING, do not stop**
-  - Timeout: 5 minutes max
-  - Grey mesh typically takes ~90s. Textured ~2-3min. Total ~4-5min per object.
+  - Response field: `data.state` (NOT `data.status`) — "created"/"queueing"/"processing"/"success"/"failed"
+  - Timeout: 10 minutes max. Typically 3-5 min per object.
+
+### Tripo3D (alternative 3D mesh generation — 300 free credits/month)
+- Auth: Bearer token header `Authorization: Bearer tsk_...`
+- Upload: `POST https://api.tripo3d.ai/v2/openapi/upload` multipart → `data.image_token`
+- Create task: `POST https://api.tripo3d.ai/v2/openapi/task` JSON body:
+  ```json
+  {"type": "image_to_model", "file": {"type": "png", "file_token": "..."}, "face_limit": 10000, "texture": true, "pbr": false}
+  ```
+- Poll: `GET https://api.tripo3d.ai/v2/openapi/task/{task_id}` → `data.status`: "queued"/"running"/"success"/"failed"
+- GLB URL: `data.output.model`
+- Cost: ~30 credits per textured model (300 free/month = ~10 models)
+- Typically faster than HiTEM3D (~1-2 min)
+- Switch between providers in Inspector: `meshProvider` dropdown on ARIAOrchestrator
 
 ---
 
@@ -83,22 +93,22 @@ ProcessVoiceCommand(transcript)
   → SerializeMRUKData()              [Quest: real MRUK, Editor: MockMRUKJson()]
   → CallClaudeAsync(jpeg, mruk, cmd) → List<PlacementInstruction>
   → foreach instruction (concurrent):
-      ProcessObjectAsync(instr, jpeg)
+      ProcessObjectAsync(instr, jpeg, mrukJson)
         → [cache check] if category in aria_glb_cache.json → SpawnObjectAsync directly
-        → CallGeminiAsync(prompt) → byte[] png
-        → GetHiTEMTokenAsync() → token
-        → SubmitHiTEMTaskAsync(token, png, requestType:1) → greyId
-        → PollHiTEMTaskAsync(token, greyId) → greyUrl
-        → SpawnObjectAsync(greyUrl, isPreview:true)
-        → SubmitHiTEMTaskAsync(token, png, requestType:2, greyUrl) → texId
-        → PollHiTEMTaskAsync(token, texId) → texUrl
-        → SpawnObjectAsync(texUrl, isPreview:false)
-        → save texUrl to GLB cache
+        → [1/4] CallGeminiAsync(prompt) → byte[] png (reference image)
+        → [2/4] CallClaudeRefinementAsync(instr, png, mrukJson) → refined instr
+              (Claude sees Gemini image + room layout, adjusts dimensions/style)
+              Toggle: enableClaudeRefinement in Inspector (default: true)
+        → [3/4] GetHiTEMTokenAsync() → token
+        → [4/4] SubmitHiTEMTaskAsync(token, png, requestType:3) → taskId
+        → PollHiTEMTaskAsync(token, taskId) → glbUrl
+        → SpawnObjectAsync(glbUrl, isPreview:false)
+        → save glbUrl to GLB cache
 
 SpawnObjectAsync(glbUrl, instr, isPreview, jpeg)
   → UnityWebRequest.Get(glbUrl)
   → GltfImport().Load(bytes) + InstantiateMainSceneAsync()
-  → scaleSystem.ApplyScale(root, instr.height_metres, instr.category)
+  → scaleSystem.ApplyScale(root, height, category, width, depth)  ← proportional scaling
   → placementEngine.Place(root, instr.surface_label)
   → if !isPreview: shEstimator.EstimateLighting(), AddReflectionProbe(), AddVirtualLight(), AddPhysicsAndInteraction()
   → if isPreview: store in _previews dict
@@ -110,9 +120,11 @@ SpawnObjectAsync(glbUrl, instr, isPreview, jpeg)
 ## PlacementInstruction Model (Claude outputs this JSON)
 ```json
 {
-  "prompt": "A tall modern floor lamp...",
+  "prompt": "A tall modern floor lamp with brushed brass finish, warm tone matching hardwood floors...",
   "surface_label": "FLOOR",
   "height_metres": 1.5,
+  "width_metres": 0.3,
+  "depth_metres": 0.3,
   "category": "lamp",
   "emits_light": true,
   "light_type": "point",
@@ -122,6 +134,7 @@ SpawnObjectAsync(glbUrl, instr, isPreview, jpeg)
   "light_offset": [0, 1.4, 0]
 }
 ```
+Note: `width_metres` and `depth_metres` are new — Claude sizes objects proportionally to the room and existing furniture. The refinement pass (step 2/4) can further adjust these after seeing the Gemini reference image.
 
 ---
 
@@ -155,43 +168,50 @@ SpawnObjectAsync(glbUrl, instr, isPreview, jpeg)
 
 ## Current Status (as of 2026-04-03)
 
-### ✅ WORKING
+### ✅ WORKING (confirmed end-to-end)
+- Full pipeline: Voice → Claude → Gemini → HiTEM3D → GLTFast → placed + scaled + lit
 - Config loading (config.json)
 - Claude API → JSON parsing (StripCodeFences handles any response format)
+- Claude contextual reasoning (style/color/material from room + passthrough image)
+- Claude refinement pass (sees Gemini reference image, adjusts dimensions — toggle in Inspector)
 - Gemini image generation (2.5-flash-image stable + 3.1 preview fallback)
-- HiTEM3D auth + submit + poll (status logging every 15s with elapsed time)
-- GLB cache (newly added, not yet battle-tested)
+- HiTEM3D auth + submit + poll (all-in-one requestType=3, 512 resolution)
+- GLTFast spawn (objects appear in scene with correct materials)
+- ScaleInferenceSystem (uniform + proportional width/height/depth scaling)
+- SemanticPlacementEngine (floor 1.5m in front of camera, wall/table/ceiling)
+- SphericalHarmonicsLightingEstimator (editor fallback working)
+- GLB cache (saves credits, instant on cache hit)
 - Shadow receiver (editor: creates ARIA_ShadowFloor plane)
-- ARIADebugUI (Send Command + Mock Room Test buttons, status label)
-- Placement editor fallback (1.5m in front of camera)
+- ARIADebugUI (Send Command + Mock Room Test + Spawn Test GLB buttons)
+- Virtual light spawning (lamps get point/spot lights)
 
-### ⚠️ NOT YET TESTED END-TO-END
-- GLTFast spawn (pipeline was stopped before this stage in all test runs)
-- ScaleInferenceSystem (code complete, not yet reached in testing)
-- SphericalHarmonicsLightingEstimator (code complete, not yet reached)
-- Virtual light spawning
+### ⚠️ NOT YET TESTED
 - On-device MRUK (requires Quest APK)
 - Voice SDK integration (ARIADebugUI bypasses it for now)
+- Meta XR Simulator
+- Proportional scaling with real Claude width/depth values (code ready)
 
 ### ❌ KNOWN ISSUES
-- `gemini-3.1-flash-image-preview` occasionally hangs with no response (60s timeout now fires a clear error instead of silent hang)
-- HiTEM3D status field casing inconsistent — using `.ToLower()` comparison to handle it
+- `gemini-3.1-flash-image-preview` occasionally hangs with no response (60s timeout fires clear error)
+- HiTEM3D all-in-one can take 3-5 min under load — do NOT stop play mode
 
 ---
 
-## Recent Fixes (this session, 2026-04-03)
+## Recent Fixes (2026-04-03)
 1. `StripCodeFences` — finds first `[` or `{` to handle any LLM response wrapping
 2. `max_tokens` 1024 → 2048 — Claude was truncating JSON mid-array
 3. Gemini endpoint — Imagen 3 shutdown → switched to `generateContent` with `gemini-2.5-flash-image`
 4. Gemini response parsing — `inlineData` (camelCase) not `inline_data` — added `[JsonProperty]`
-5. Claude system prompt — capped at 4 objects, furniture only (was returning 14 items incl. floors/walls)
-6. HiTEM3D polling — logs elapsed time every 15s, `.ToLower()` status check, 5min timeout
-7. `UnityWebRequest.timeout` — added to all API calls (Claude:30s, Gemini:60s, HiTEM3D:15s)
-8. GLB cache — skips Gemini+HiTEM3D for already-generated categories
-9. Gemini fallback — tries stable model first, preview second
-10. Floor placement — camera-forward 1.5m instead of random on MRUK floor surface
-11. Concurrent → sequential object processing (to respect rate limits)
-12. Concurrent restored after billing enabled
+5. Claude system prompt — strict object count (only what user asked for)
+6. HiTEM3D — switched to all-in-one (requestType=3), reads `data.state` not `data.status`
+7. HiTEM3D polling — 600s timeout, logs elapsed time every 15s
+8. `UnityWebRequest.timeout` — all API calls (Claude:30s, Gemini:60s, HiTEM3D:15s)
+9. GLB cache — skips Gemini+HiTEM3D for already-generated categories
+10. Gemini fallback — tries stable model first, preview second
+11. Floor placement — camera-forward 1.5m instead of random
+12. **Claude contextual reasoning** — prompt/style/dimensions based on room context + passthrough image
+13. **Claude refinement pass** — sees Gemini reference image, adjusts dimensions before HiTEM3D
+14. **Proportional scaling** — width_metres + depth_metres in PlacementInstruction, non-uniform scale
 
 ---
 
@@ -217,8 +237,8 @@ SpawnObjectAsync(glbUrl, instr, isPreview, jpeg)
 ---
 
 ## Next Steps (priority order)
-1. **Test full pipeline end-to-end** — let it run past HiTEM3D into GLTFast spawn
-2. **Verify object appears in scene** at correct position/scale
+1. **Test refinement pass** — run pipeline, check console for "✎ Refinement:" logs showing dimension adjustments
+2. **Verify proportional scaling** — objects should have non-uniform scale when width/depth differ from height ratio
 3. **Meta XR Simulator** — test with synthetic room data before building APK
 4. **APK build** — push config.json to device via adb, test passthrough + real MRUK
 5. Voice SDK wiring — `VoiceSDKConnector.cs` subscribes to `AppVoiceExperience.VoiceEvents.OnFullTranscription` and calls `orchestrator.ProcessVoiceCommand(transcript)`

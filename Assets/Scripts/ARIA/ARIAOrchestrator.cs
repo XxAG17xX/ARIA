@@ -17,6 +17,8 @@ using Newtonsoft.Json;
 using UnityEngine;
 using UnityEngine.Networking;
 
+public enum MeshProvider { HiTEM3D, Tripo3D }
+
 public class ARIAOrchestrator : MonoBehaviour
 {
     [Header("ARIA Systems")]
@@ -31,11 +33,27 @@ public class ARIAOrchestrator : MonoBehaviour
     [Tooltip("The scene's main directional light. SH estimator will control its direction.")]
     [SerializeField] private Light sceneDirectionalLight;
 
+    [Header("Pipeline Options")]
+    [Tooltip("When enabled, Claude sees the Gemini reference image and refines dimensions/style before HiTEM3D. Adds ~10s per object but improves contextual accuracy.")]
+    [SerializeField] private bool enableClaudeRefinement = true;
+
+    [Tooltip("Enable lighting effects (SH estimation, virtual lights, reflection probes). " +
+             "Disable for demo: show placement/scale first, then toggle on for lighting demo.")]
+    [SerializeField] private bool enableLighting = true;
+
+    [Tooltip("Enable physics (Rigidbody + BoxCollider) and interaction setup on spawned objects.")]
+    [SerializeField] private bool enablePhysics = true;
+
+    [Header("3D Generation Provider")]
+    [Tooltip("Which API to use for 3D mesh generation. Switch to save credits.")]
+    [SerializeField] private MeshProvider meshProvider = MeshProvider.Tripo3D;
+
     // API keys — loaded from config.json at runtime, never hardcoded
     private string _claudeKey;
     private string _geminiKey;
     private string _hitemAccessKey;
     private string _hitemSecretKey;
+    private string _tripoKey;
 
     // Passthrough camera for frame capture (WebCamTexture, Quest 3/3S only)
     private WebCamTexture _webcam;
@@ -112,7 +130,8 @@ public class ARIAOrchestrator : MonoBehaviour
         _geminiKey      = cfg.GetValueOrDefault("gemini_key",       "");
         _hitemAccessKey = cfg.GetValueOrDefault("hitem_access_key", "");
         _hitemSecretKey = cfg.GetValueOrDefault("hitem_secret_key", "");
-        Debug.Log("[ARIA] Config loaded.");
+        _tripoKey       = cfg.GetValueOrDefault("tripo_key",        "");
+        Debug.Log($"[ARIA] Config loaded. Mesh provider: {meshProvider}");
     }
 
     private void LoadGlbCache()
@@ -190,7 +209,7 @@ public class ARIAOrchestrator : MonoBehaviour
         // Launch all object pipelines concurrently — progressive placement
         var tasks = new List<Task>();
         foreach (var instr in instructions)
-            tasks.Add(ProcessObjectAsync(instr, jpeg));
+            tasks.Add(ProcessObjectAsync(instr, jpeg, mrukJson));
 
         await Task.WhenAll(tasks);
         SetStatus("Done.");
@@ -318,20 +337,35 @@ public class ARIAOrchestrator : MonoBehaviour
         {
             model      = "claude-sonnet-4-6",
             max_tokens = 2048,
-            system     = "You are a spatial interior design AI. Respond with valid JSON only. No explanation. " +
-                         "Return ONLY placeable 3D furniture/objects (NOT floors, walls, ceilings, rugs, curtains, or room surfaces). " +
-                         "Maximum 4 objects. Each object must be a distinct piece of furniture or decor. " +
-                         "Return a JSON array where each element has: " +
-                         "prompt (string — description for image generation), " +
-                         "surface_label (string: FLOOR/WALL_FACE/CEILING/TABLE), " +
-                         "height_metres (float — real-world height), " +
-                         "category (string — object type, lowercase), " +
-                         "emits_light (bool — true if this object has a light source), " +
-                         "light_type (string: 'point' or 'spot', only if emits_light), " +
-                         "light_color (array of 3 floats 0-1 RGB, only if emits_light), " +
-                         "light_intensity (float, only if emits_light), " +
-                         "light_range (float metres, only if emits_light), " +
-                         "light_offset (array of 3 floats — bulb position relative to object root, only if emits_light).",
+            system     = "You are a spatial interior design AI for mixed reality. Respond with valid JSON only. No explanation.\n\n" +
+                         "OBJECT SELECTION RULES:\n" +
+                         "- Generate ONLY the objects the user explicitly asked for. Do NOT add extra items.\n" +
+                         "- If the user says 'a bed', return exactly 1 object. 'a lamp and a table' = 2 objects.\n" +
+                         "- ONLY placeable 3D furniture/objects. NOT floors, walls, ceilings, rugs, curtains.\n" +
+                         "- Maximum 4 objects.\n\n" +
+                         "CONTEXTUAL REASONING (CRITICAL):\n" +
+                         "You receive the room layout (dimensions, surfaces, existing furniture) and optionally a passthrough camera image.\n" +
+                         "Use this context to decide:\n" +
+                         "- STYLE: Match the room's aesthetic. Modern room → sleek furniture. Traditional → classic. If the image shows wooden floors and warm tones, suggest warm-toned furniture.\n" +
+                         "- COLOR/MATERIAL: Complement existing room colors visible in the image. Don't clash.\n" +
+                         "- DIMENSIONS: Size objects proportionally to the room. A bed in a 3m-wide room should be narrower than in a 5m room. " +
+                         "A figurine on a table should be proportional to that table's dimensions. A bookshelf in a small room should be compact.\n" +
+                         "- PLACEMENT: Consider what's already in the room to avoid overlap.\n\n" +
+                         "PROMPT FIELD: Write a detailed image-generation prompt describing the object's style, color, material, and proportions. " +
+                         "Include context like 'matching the warm wood tones of the room' or 'compact modern design suitable for a small apartment'.\n\n" +
+                         "Return a JSON array. Each element:\n" +
+                         "- prompt (string — detailed description for image generation, include style/color/material)\n" +
+                         "- surface_label (string: FLOOR/WALL_FACE/CEILING/TABLE)\n" +
+                         "- height_metres (float — real-world height, contextual to room)\n" +
+                         "- width_metres (float — real-world width, proportional to room/surface)\n" +
+                         "- depth_metres (float — real-world depth)\n" +
+                         "- category (string — object type, lowercase)\n" +
+                         "- emits_light (bool)\n" +
+                         "- light_type (string: 'point'/'spot', only if emits_light)\n" +
+                         "- light_color ([R,G,B] 0-1, only if emits_light)\n" +
+                         "- light_intensity (float, only if emits_light)\n" +
+                         "- light_range (float metres, only if emits_light)\n" +
+                         "- light_offset ([x,y,z] relative to root, only if emits_light)",
             messages   = new[] { new { role = "user", content } }
         });
 
@@ -357,10 +391,92 @@ public class ARIAOrchestrator : MonoBehaviour
     }
 
     // -------------------------------------------------------------------------
+    // Claude refinement — sees Gemini reference image + original instruction
+    // -------------------------------------------------------------------------
+
+    private async Task<PlacementInstruction> CallClaudeRefinementAsync(
+        PlacementInstruction original, byte[] referenceImage, string mrukJson)
+    {
+        var content = new List<object>();
+
+        // Send the Gemini reference image
+        content.Add(new
+        {
+            type   = "image",
+            source = new { type = "base64", media_type = "image/png", data = Convert.ToBase64String(referenceImage) }
+        });
+
+        content.Add(new
+        {
+            type = "text",
+            text = $"Room layout:\n{mrukJson}\n\n" +
+                   $"Original placement instruction:\n{JsonConvert.SerializeObject(original)}\n\n" +
+                   "Above is the AI-generated reference image for this object. " +
+                   "Review the image and the room layout. Adjust the dimensions (height_metres, width_metres, depth_metres) " +
+                   "if the reference image suggests different proportions than originally planned. " +
+                   "Also refine the prompt if the image style doesn't match the room context. " +
+                   "Return the FULL updated PlacementInstruction as a single JSON object (not an array)."
+        });
+
+        string body = JsonConvert.SerializeObject(new
+        {
+            model      = "claude-sonnet-4-6",
+            max_tokens = 1024,
+            system     = "You are refining a 3D object placement instruction after seeing its AI-generated reference image. " +
+                         "Return valid JSON only. A single object (not an array). " +
+                         "Keep all original fields. Only adjust dimensions/prompt if the reference image reveals a mismatch " +
+                         "with room proportions or style. If everything looks correct, return the original values unchanged.",
+            messages   = new[] { new { role = "user", content } }
+        });
+
+        using var req = new UnityWebRequest("https://api.anthropic.com/v1/messages", "POST");
+        req.uploadHandler   = new UploadHandlerRaw(Encoding.UTF8.GetBytes(body));
+        req.downloadHandler = new DownloadHandlerBuffer();
+        req.timeout         = 20;
+        req.SetRequestHeader("x-api-key",         _claudeKey);
+        req.SetRequestHeader("anthropic-version", "2023-06-01");
+        req.SetRequestHeader("content-type",      "application/json");
+
+        await AwaitRequest(req.SendWebRequest());
+
+        if (req.result != UnityWebRequest.Result.Success)
+        {
+            Debug.LogWarning($"[ARIA] Claude refinement failed ({req.error}) — using original dimensions.");
+            return original;
+        }
+
+        try
+        {
+            var resp = JsonConvert.DeserializeObject<ClaudeResponse>(req.downloadHandler.text);
+            string json = StripCodeFences(resp.content[0].text);
+            var refined = JsonConvert.DeserializeObject<PlacementInstruction>(json);
+
+            // Log what changed
+            bool changed = false;
+            if (Mathf.Abs(refined.height_metres - original.height_metres) > 0.01f)
+            { Debug.Log($"[ARIA] ✎ Refinement: height {original.height_metres:F2}m → {refined.height_metres:F2}m"); changed = true; }
+            if (Mathf.Abs(refined.width_metres - original.width_metres) > 0.01f)
+            { Debug.Log($"[ARIA] ✎ Refinement: width {original.width_metres:F2}m → {refined.width_metres:F2}m"); changed = true; }
+            if (Mathf.Abs(refined.depth_metres - original.depth_metres) > 0.01f)
+            { Debug.Log($"[ARIA] ✎ Refinement: depth {original.depth_metres:F2}m → {refined.depth_metres:F2}m"); changed = true; }
+            if (refined.prompt != original.prompt)
+            { Debug.Log($"[ARIA] ✎ Refinement: prompt updated"); changed = true; }
+
+            if (!changed) Debug.Log("[ARIA] ✔ Claude refinement: no changes needed.");
+            return refined;
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"[ARIA] Claude refinement parse error: {e.Message} — using original.");
+            return original;
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // Per-object pipeline
     // -------------------------------------------------------------------------
 
-    private async Task ProcessObjectAsync(PlacementInstruction instr, byte[] jpeg)
+    private async Task ProcessObjectAsync(PlacementInstruction instr, byte[] jpeg, string mrukJson)
     {
         string name = instr.category ?? instr.prompt;
         var pipelineStart = DateTime.UtcNow;
@@ -378,32 +494,57 @@ public class ARIAOrchestrator : MonoBehaviour
         }
 
         // ── Full pipeline ───────────────────────────────────────────────────────
-        SetStatus($"[1/3] Generating image: {name}...");
+        SetStatus($"[1/4] Generating image: {name}...");
 
         // 1 — Gemini image generation
         byte[] png = await CallGeminiAsync(instr.prompt);
         if (png == null) { Debug.LogError($"[ARIA] ✖ Gemini failed for: {name}"); return; }
-        Debug.Log($"[ARIA] ✔ [1/3] Image generated for: {name}");
+        Debug.Log($"[ARIA] ✔ [1/4] Image generated for: {name}");
 
-        // 2 — HiTEM3D auth
-        SetStatus($"[2/3] Authenticating 3D API: {name}...");
-        string token = await GetHiTEMTokenAsync();
-        if (token == null) { Debug.LogError($"[ARIA] ✖ HiTEM3D auth failed for: {name}"); return; }
-        Debug.Log($"[ARIA] ✔ [2/3] 3D API authenticated");
+        // 2 — Claude refinement (optional) — sees reference image + room layout
+        if (enableClaudeRefinement)
+        {
+            SetStatus($"[2/4] Claude refining dimensions: {name}...");
+            Debug.Log($"[ARIA] ⏳ [2/4] Claude reviewing reference image for \"{name}\"...");
+            instr = await CallClaudeRefinementAsync(instr, png, mrukJson);
+            Debug.Log($"[ARIA] ✔ [2/4] Refinement complete for: {name} " +
+                      $"(h={instr.height_metres:F2} w={instr.width_metres:F2} d={instr.depth_metres:F2})");
+        }
 
-        // 3 — All-in-one generation (requestType=3: geometry + texture in one call)
-        //     Uses 512 resolution for cheapest/fastest testing. Upgrade later.
-        SetStatus($"[3/3] Generating 3D model: {name} (~3-5 min, this is normal — do not stop!)");
-        Debug.Log($"[ARIA] ⏳ [3/3] Submitting to HiTEM3D (all-in-one, 512) for {name}. DO NOT STOP.");
-        string taskId = await SubmitHiTEMTaskAsync(token, png, requestType: 3);
-        string glbUrl = await PollHiTEMTaskAsync(token, taskId, name, stage: "all-in-one");
+        // 3+4 — 3D mesh generation (provider-dependent)
+        string glbUrl;
+        if (meshProvider == MeshProvider.Tripo3D)
+        {
+            SetStatus($"[3/4] Uploading to Tripo3D: {name}...");
+            string fileToken = await TripoUploadImageAsync(png);
+            if (fileToken == null) { Debug.LogError($"[ARIA] ✖ Tripo upload failed for: {name}"); return; }
+            Debug.Log($"[ARIA] ✔ [3/4] Image uploaded to Tripo3D");
+
+            SetStatus($"[4/4] Generating 3D model (Tripo3D): {name} (~1-2 min)...");
+            Debug.Log($"[ARIA] ⏳ [4/4] Submitting to Tripo3D for {name}.");
+            string taskId = await TripoCreateTaskAsync(fileToken);
+            glbUrl = await TripoPollTaskAsync(taskId, name);
+        }
+        else // HiTEM3D
+        {
+            SetStatus($"[3/4] Authenticating HiTEM3D: {name}...");
+            string token = await GetHiTEMTokenAsync();
+            if (token == null) { Debug.LogError($"[ARIA] ✖ HiTEM3D auth failed for: {name}"); return; }
+            Debug.Log($"[ARIA] ✔ [3/4] HiTEM3D authenticated");
+
+            SetStatus($"[4/4] Generating 3D model (HiTEM3D): {name} (~3-5 min, do not stop!)");
+            Debug.Log($"[ARIA] ⏳ [4/4] Submitting to HiTEM3D (all-in-one, 512) for {name}. DO NOT STOP.");
+            string taskId = await SubmitHiTEMTaskAsync(token, png, requestType: 3);
+            glbUrl = await PollHiTEMTaskAsync(token, taskId, name, stage: "all-in-one");
+        }
+
         if (glbUrl == null)
         {
-            Debug.LogError($"[ARIA] ✖ HiTEM3D generation failed/timed out for: {name}");
+            Debug.LogError($"[ARIA] ✖ 3D generation failed/timed out for: {name}");
             return;
         }
 
-        Debug.Log($"[ARIA] ✔ [3/3] 3D model ready for: {name} — spawning...");
+        Debug.Log($"[ARIA] ✔ [4/4] 3D model ready for: {name} — spawning...");
         await SpawnObjectAsync(glbUrl, instr, isPreview: false, jpeg: jpeg);
         _glbCache[cacheKey] = glbUrl;
         SaveGlbCache();
@@ -615,6 +756,140 @@ public class ARIAOrchestrator : MonoBehaviour
     }
 
     // -------------------------------------------------------------------------
+    // Tripo3D pipeline: upload image → create task → poll → GLB URL
+    // Cheapest settings: no PBR, lowest face count, draft texture
+    // Docs: https://platform.tripo3d.ai/docs/generation
+    // -------------------------------------------------------------------------
+
+    private async Task<string> TripoUploadImageAsync(byte[] png)
+    {
+        var form = new List<IMultipartFormSection>
+        {
+            new MultipartFormFileSection("file", png, "image.png", "image/png")
+        };
+
+        using var req = UnityWebRequest.Post("https://api.tripo3d.ai/v2/openapi/upload", form);
+        req.timeout = 30;
+        req.SetRequestHeader("Authorization", $"Bearer {_tripoKey}");
+
+        await AwaitRequest(req.SendWebRequest());
+
+        if (req.result != UnityWebRequest.Result.Success)
+        {
+            Debug.LogError($"[ARIA] Tripo upload error: {req.error}\n{req.downloadHandler.text}");
+            return null;
+        }
+
+        var resp = JsonConvert.DeserializeObject<TripoUploadResponse>(req.downloadHandler.text);
+        string token = resp?.data?.image_token;
+        Debug.Log($"[ARIA] Tripo upload OK — token: {(token != null ? token.Substring(0, Mathf.Min(20, token.Length)) + "..." : "null")}");
+        return token;
+    }
+
+    private async Task<string> TripoCreateTaskAsync(string fileToken)
+    {
+        // Cheapest config: draft quality, low face count, no PBR
+        string body = JsonConvert.SerializeObject(new
+        {
+            type = "image_to_model",
+            file = new { type = "png", file_token = fileToken },
+            model_version   = "default",
+            face_limit      = 10000,       // bare minimum for testing
+            texture          = true,        // need texture for visual demo
+            pbr              = false,       // skip PBR maps (saves credits)
+            auto_size        = true
+        });
+
+        using var req = new UnityWebRequest("https://api.tripo3d.ai/v2/openapi/task", "POST");
+        req.uploadHandler   = new UploadHandlerRaw(Encoding.UTF8.GetBytes(body));
+        req.downloadHandler = new DownloadHandlerBuffer();
+        req.timeout         = 30;
+        req.SetRequestHeader("Authorization", $"Bearer {_tripoKey}");
+        req.SetRequestHeader("Content-Type", "application/json");
+
+        await AwaitRequest(req.SendWebRequest());
+
+        if (req.result != UnityWebRequest.Result.Success)
+        {
+            Debug.LogError($"[ARIA] Tripo task submit error: {req.error}\n{req.downloadHandler.text}");
+            return null;
+        }
+
+        var resp = JsonConvert.DeserializeObject<TripoTaskResponse>(req.downloadHandler.text);
+        string taskId = resp?.data?.task_id;
+        Debug.Log($"[ARIA] Tripo task created: {taskId}");
+        return taskId;
+    }
+
+    private async Task<string> TripoPollTaskAsync(string taskId, string objectName = "")
+    {
+        if (taskId == null) return null;
+
+        var  startTime  = DateTime.UtcNow;
+        int  timeoutSec = 300; // 5 min max
+        int  lastLog    = -1;
+
+        Debug.Log($"[ARIA] Tripo3D polling for \"{objectName}\" [{taskId}]...");
+
+        while (true)
+        {
+            await Task.Delay(5000);
+
+            int elapsed = (int)(DateTime.UtcNow - startTime).TotalSeconds;
+            if (elapsed >= timeoutSec)
+            {
+                Debug.LogError($"[ARIA] Tripo3D timed out after {timeoutSec}s for \"{objectName}\"");
+                return null;
+            }
+
+            using var req = new UnityWebRequest(
+                $"https://api.tripo3d.ai/v2/openapi/task/{taskId}", "GET");
+            req.downloadHandler = new DownloadHandlerBuffer();
+            req.timeout         = 15;
+            req.SetRequestHeader("Authorization", $"Bearer {_tripoKey}");
+
+            await AwaitRequest(req.SendWebRequest());
+
+            if (req.result != UnityWebRequest.Result.Success)
+            {
+                Debug.LogError($"[ARIA] Tripo poll error: {req.error}");
+                return null;
+            }
+
+            string rawJson = req.downloadHandler.text;
+            var    resp     = JsonConvert.DeserializeObject<TripoQueryResponse>(rawJson);
+            string status   = resp?.data?.status ?? "(no status)";
+
+            // Log every 15s
+            if (elapsed / 15 != lastLog / 15)
+            {
+                if (lastLog < 0)
+                    Debug.Log($"[ARIA] Tripo FIRST POLL raw:\n{rawJson}");
+                Debug.Log($"[ARIA] ⏳ Tripo3D \"{objectName}\" — {elapsed}s elapsed. Status: \"{status}\"");
+                SetStatus($"Tripo3D: {objectName} — {elapsed}s (status: {status})");
+                lastLog = elapsed;
+            }
+
+            switch (status.ToLower())
+            {
+                case "success":
+                    string glbUrl = resp.data?.output?.model;
+                    if (string.IsNullOrEmpty(glbUrl))
+                    {
+                        Debug.LogError($"[ARIA] ✖ Tripo success but no model URL! Raw:\n{rawJson}");
+                        return null;
+                    }
+                    Debug.Log($"[ARIA] ✔ Tripo3D DONE for \"{objectName}\" in {elapsed}s!");
+                    return glbUrl;
+                case "failed":
+                    Debug.LogError($"[ARIA] ✖ Tripo3D FAILED for \"{objectName}\". Raw:\n{rawJson}");
+                    return null;
+                // "queued", "running" = still working
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
     // GLTFast spawn + systems integration
     // -------------------------------------------------------------------------
 
@@ -644,8 +919,9 @@ public class ARIAOrchestrator : MonoBehaviour
         }
         await gltf.InstantiateMainSceneAsync(root.transform);
 
-        // Scale to LLM-inferred real-world height
-        scaleSystem?.ApplyScale(root, instr.height_metres, instr.category);
+        // Scale to LLM-inferred real-world dimensions (height + contextual width/depth)
+        scaleSystem?.ApplyScale(root, instr.height_metres, instr.category,
+                                instr.width_metres, instr.depth_metres);
 
         // Place on the correct MRUK surface
         placementEngine?.Place(root, instr.surface_label);
@@ -653,19 +929,29 @@ public class ARIAOrchestrator : MonoBehaviour
         // Final object only (not preview): run lighting + interaction setup
         if (!isPreview)
         {
-            // SH lighting — runs ONCE using the passthrough frame captured at command start
-            // Updates RenderSettings.ambientProbe and sets sceneDirectionalLight direction
-            shEstimator?.EstimateLighting(jpeg, sceneDirectionalLight, root);
+            if (enableLighting)
+            {
+                // SH lighting — runs ONCE using the passthrough frame captured at command start
+                shEstimator?.EstimateLighting(jpeg, sceneDirectionalLight, root);
 
-            // Add reflection probe at object position (updates every frame automatically)
-            AddReflectionProbe(root);
+                // Add reflection probe at object position
+                AddReflectionProbe(root);
 
-            // Virtual light source (e.g. lamp spawns with a Unity PointLight)
-            if (instr.emits_light)
-                AddVirtualLight(root, instr);
+                // Virtual light source (e.g. lamp spawns with a Unity PointLight)
+                if (instr.emits_light)
+                    AddVirtualLight(root, instr);
 
-            // Rigidbody + BoxCollider for grabbable interaction
-            AddPhysicsAndInteraction(root);
+                Debug.Log($"[ARIA] Lighting applied to \"{instr.prompt}\"");
+            }
+            else
+            {
+                Debug.Log($"[ARIA] Lighting SKIPPED (toggle off) for \"{instr.prompt}\"");
+            }
+
+            if (enablePhysics)
+            {
+                AddPhysicsAndInteraction(root);
+            }
         }
 
         // Swap preview → final textured mesh
@@ -683,6 +969,29 @@ public class ARIAOrchestrator : MonoBehaviour
         }
 
         Debug.Log($"[ARIA] Spawned \"{instr.prompt}\" (preview={isPreview})");
+    }
+
+    // -------------------------------------------------------------------------
+    // Retroactive lighting — call from debug UI to apply lighting to all spawned objects
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Applies lighting (SH, reflection probes) to all children of spawnRoot.
+    /// Called from ARIADebugUI when "Enable Lighting" is toggled on mid-demo.
+    /// </summary>
+    public void ApplyLightingToAllSpawned()
+    {
+        Transform root = spawnRoot != null ? spawnRoot : transform;
+        int count = 0;
+        foreach (Transform child in root)
+        {
+            shEstimator?.EstimateLighting(null, sceneDirectionalLight, child.gameObject);
+            if (child.Find("ARIA_ReflectionProbe") == null)
+                AddReflectionProbe(child.gameObject);
+            count++;
+        }
+        Debug.Log($"[ARIA] Applied lighting to {count} spawned object(s).");
+        SetStatus($"Lighting applied to {count} object(s).");
     }
 
     // -------------------------------------------------------------------------
@@ -850,6 +1159,8 @@ public class PlacementInstruction
     public string   prompt;
     public string   surface_label;
     public float    height_metres;
+    public float    width_metres;    // contextual width (e.g. bed width relative to room)
+    public float    depth_metres;    // contextual depth
     public string   category;
     // Virtual light source fields (optional — only set when emits_light = true)
     public bool     emits_light;
@@ -892,4 +1203,22 @@ public class PlacementInstruction
     public string id;
     public string cover_url;
     public string url;        // GLB download URL (valid for 1 hour)
+}
+
+// Tripo3D
+[Serializable] public class TripoUploadResponse { public TripoUploadData data; }
+[Serializable] public class TripoUploadData     { public string image_token;   }
+[Serializable] public class TripoTaskResponse   { public TripoTaskData   data; public int code; }
+[Serializable] public class TripoTaskData       { public string task_id;       }
+[Serializable] public class TripoQueryResponse  { public TripoQueryData  data; public int code; }
+[Serializable] public class TripoQueryData
+{
+    public string task_id;
+    public string status;     // "queued", "running", "success", "failed"
+    public TripoOutput output;
+}
+[Serializable] public class TripoOutput
+{
+    public string model;      // GLB download URL
+    public string pbr_model;  // PBR variant (we don't use this)
 }

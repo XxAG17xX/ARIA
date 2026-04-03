@@ -59,20 +59,21 @@ public class ScaleInferenceSystem : MonoBehaviour
     /// <summary>
     /// Scales <paramref name="obj"/> so its bounding-box height equals
     /// <paramref name="targetHeightMetres"/>, then resizes any BoxCollider.
+    /// Optionally uses width/depth targets for proportional (non-uniform) scaling.
     /// </summary>
-    /// <param name="obj">The root GameObject of the spawned GLB.</param>
-    /// <param name="targetHeightMetres">Height from Claude's placement JSON.</param>
-    /// <param name="category">Object category (e.g. "lamp") for canonical lookup.</param>
-    public void ApplyScale(GameObject obj, float targetHeightMetres, string category = null)
+    public void ApplyScale(GameObject obj, float targetHeightMetres, string category = null,
+                           float targetWidthMetres = 0f, float targetDepthMetres = 0f)
     {
         if (obj == null) return;
 
         // Use Claude's height. If it seems wrong, fall back to canonical.
         float targetH = ResolveTargetHeight(targetHeightMetres, category);
 
-        // Get native bounding box before any scaling (localScale may already be non-1)
+        // Get native bounding box before any scaling
         Bounds native = ARIAOrchestrator.CalculateMeshBounds(obj);
         float  nativeH = native.size.y;
+        float  nativeW = native.size.x;
+        float  nativeD = native.size.z;
 
         if (nativeH < 0.0001f)
         {
@@ -80,10 +81,25 @@ public class ScaleInferenceSystem : MonoBehaviour
             return;
         }
 
-        float scaleFactor = targetH / nativeH;
+        // Determine scale per axis
+        float scaleY = targetH / nativeH;
+        float scaleX = scaleY; // default: uniform from height
+        float scaleZ = scaleY;
 
-        // Clamp to sane range
-        scaleFactor = Mathf.Clamp(scaleFactor, MinScale, MaxScale);
+        // If Claude provided width/depth, use non-uniform scaling
+        bool proportional = targetWidthMetres > 0.01f || targetDepthMetres > 0.01f;
+        if (proportional)
+        {
+            if (targetWidthMetres > 0.01f && nativeW > 0.0001f)
+                scaleX = targetWidthMetres / nativeW;
+            if (targetDepthMetres > 0.01f && nativeD > 0.0001f)
+                scaleZ = targetDepthMetres / nativeD;
+        }
+
+        // Clamp each axis
+        scaleX = Mathf.Clamp(scaleX, MinScale, MaxScale);
+        scaleY = Mathf.Clamp(scaleY, MinScale, MaxScale);
+        scaleZ = Mathf.Clamp(scaleZ, MinScale, MaxScale);
 
         // Sanity-check against room height (if known)
         if (roomHeightMetres > 0.1f)
@@ -91,19 +107,24 @@ public class ScaleInferenceSystem : MonoBehaviour
             float maxAllowedH = roomHeightMetres * 0.8f;
             if (targetH > maxAllowedH)
             {
-                scaleFactor = (maxAllowedH / nativeH);
-                scaleFactor = Mathf.Clamp(scaleFactor, MinScale, MaxScale);
+                scaleY = maxAllowedH / nativeH;
+                scaleY = Mathf.Clamp(scaleY, MinScale, MaxScale);
                 Debug.LogWarning($"[ScaleInference] \"{obj.name}\" clamped to 80% of room height.");
             }
         }
 
-        obj.transform.localScale = Vector3.one * scaleFactor;
+        obj.transform.localScale = proportional
+            ? new Vector3(scaleX, scaleY, scaleZ)
+            : Vector3.one * scaleY;
 
         // Resize any existing BoxCollider to new bounds
         ResizeCollider(obj);
 
-        Debug.Log($"[ScaleInference] \"{obj.name}\": native={nativeH:F3}m, " +
-                  $"target={targetH:F3}m, scale={scaleFactor:F3}");
+        string scaleStr = proportional
+            ? $"scale=({scaleX:F3}, {scaleY:F3}, {scaleZ:F3})"
+            : $"scale={scaleY:F3}";
+        Debug.Log($"[ScaleInference] \"{obj.name}\": native=({nativeW:F3}×{nativeH:F3}×{nativeD:F3})m, " +
+                  $"target=({targetWidthMetres:F2}×{targetH:F2}×{targetDepthMetres:F2})m, {scaleStr}");
     }
 
     // -------------------------------------------------------------------------
