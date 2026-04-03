@@ -9,6 +9,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Text;
 using System.Threading.Tasks;
 using GLTFast;
@@ -156,8 +157,17 @@ public class ARIAOrchestrator : MonoBehaviour
         }
     }
 
+    private const int MaxCacheEntries = 10;
+
     private void SaveGlbCache()
     {
+        // Evict oldest entries when cache exceeds limit
+        while (_glbCache.Count > MaxCacheEntries)
+        {
+            string oldest = _glbCache.Keys.First();
+            _glbCache.Remove(oldest);
+            Debug.Log($"[ARIA] Cache full — evicted oldest entry: \"{oldest}\"");
+        }
         try { File.WriteAllText(GlbCachePath, JsonConvert.SerializeObject(_glbCache, Formatting.Indented)); }
         catch (Exception e) { Debug.LogWarning($"[ARIA] GLB cache save failed: {e.Message}"); }
     }
@@ -1059,11 +1069,19 @@ public class ARIAOrchestrator : MonoBehaviour
         col.center = root.transform.InverseTransformPoint(bounds.center);
         col.size   = bounds.size;
 
-        // HandGrabInteractable is added via the Building Blocks Hand Grab Interaction setup.
-        // Once the scene has OVRInteractionComprehensive, add:
-        // root.AddComponent<Oculus.Interaction.Grabbable>();
-        // root.AddComponent<Oculus.Interaction.HandGrab.HandGrabInteractable>();
-        // (Uncomment when Interaction SDK Building Block is confirmed in scene)
+        // Hand grab — requires Interaction SDK Building Block in scene (OVRInteractionComprehensive)
+#if UNITY_ANDROID && !UNITY_EDITOR
+        try
+        {
+            root.AddComponent(System.Type.GetType("Oculus.Interaction.Grabbable, Oculus.Interaction.Runtime"));
+            root.AddComponent(System.Type.GetType("Oculus.Interaction.HandGrab.HandGrabInteractable, Oculus.Interaction.Runtime"));
+            Debug.Log($"[ARIA] Hand grab enabled on {root.name}");
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogWarning($"[ARIA] Hand grab setup skipped: {e.Message}");
+        }
+#endif
     }
 
     // -------------------------------------------------------------------------
@@ -1117,36 +1135,6 @@ public class ARIAOrchestrator : MonoBehaviour
     }
 
     // -------------------------------------------------------------------------
-    // Test helper — spawns directly from a GLB URL, bypassing all APIs
-    // -------------------------------------------------------------------------
-
-    /// <summary>
-    /// Spawns a GLB directly from a URL with sensible defaults.
-    /// Use from ARIADebugUI to test the spawn pipeline without spending any API credits.
-    /// </summary>
-    public async void TestSpawnFromUrl(string glbUrl, string category = "test", float heightMetres = 0.75f, string surfaceLabel = "FLOOR")
-    {
-        if (string.IsNullOrWhiteSpace(glbUrl))
-        {
-            Debug.LogWarning("[ARIA] TestSpawnFromUrl: no URL provided.");
-            return;
-        }
-
-        var instr = new PlacementInstruction
-        {
-            prompt        = $"test_{category}",
-            surface_label = surfaceLabel,
-            height_metres = heightMetres,
-            category      = category,
-            emits_light   = false
-        };
-
-        Debug.Log($"[ARIA] TEST SPAWN — bypassing all APIs. URL: {glbUrl}");
-        SetStatus("Test spawn: downloading GLB...");
-        await SpawnObjectAsync(glbUrl, instr, isPreview: false, jpeg: null);
-        SetStatus("Test spawn complete.");
-        Debug.Log("[ARIA] TEST SPAWN complete — check hierarchy for spawned object.");
-    }
 }
 
 // =============================================================================

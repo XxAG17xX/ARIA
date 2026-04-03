@@ -20,15 +20,11 @@ public class ARIADebugUI : MonoBehaviour
     [SerializeField] private bool showDebugUI = true;
     [SerializeField] private int  fontSize    = 16;
 
-    [Header("Test Spawn (paste a GLB URL from HiTEM3D CSV — no API calls)")]
-    [SerializeField] private string testGlbUrl      = "";
-    [SerializeField] private string testCategory    = "stool";
-    [SerializeField] private float  testHeight      = 0.75f;
-    [SerializeField] private bool   autoSpawnOnPlay = false;
-
     private ARIAOrchestrator _orchestrator;
+    private VoiceSDKConnector _voiceConnector;
     private string           _inputText = "make this corner a reading nook";
     private string           _status    = "Ready.";
+    private string           _partialTranscript = "";
     private GUIStyle         _panelStyle;
     private GUIStyle         _labelStyle;
     private GUIStyle         _buttonStyle;
@@ -39,14 +35,14 @@ public class ARIADebugUI : MonoBehaviour
     {
         _orchestrator = GetComponent<ARIAOrchestrator>();
         _orchestrator.OnStatusChanged += s => _status = s;
-    }
 
-    private void Start()
-    {
-        if (autoSpawnOnPlay && !string.IsNullOrWhiteSpace(testGlbUrl))
+        _voiceConnector = GetComponent<VoiceSDKConnector>();
+        if (_voiceConnector != null)
         {
-            _status = "Auto-spawning test GLB...";
-            _orchestrator.TestSpawnFromUrl(testGlbUrl, testCategory, testHeight);
+            _voiceConnector.OnPartialTranscript += t => _partialTranscript = t;
+            _voiceConnector.OnFinalTranscript   += t => _partialTranscript = "";
+            _voiceConnector.OnListeningChanged  += listening =>
+                _status = listening ? "Listening..." : "Ready.";
         }
     }
 
@@ -57,7 +53,7 @@ public class ARIADebugUI : MonoBehaviour
         InitStyles();
 
         float panelW = 420f;
-        float panelH = 260f;
+        float panelH = 210f;
         float x      = 20f;
         float y      = Screen.height - panelH - 20f;
 
@@ -96,19 +92,6 @@ public class ARIADebugUI : MonoBehaviour
 
         cy += lineH + 6f;
 
-        // Test spawn button (uses Inspector-set testGlbUrl — no API calls)
-        bool hasTestUrl = !string.IsNullOrWhiteSpace(testGlbUrl);
-        if (GUI.Button(new Rect(inner, cy, panelW - padding * 2f, lineH + 4f),
-            hasTestUrl ? $"Spawn Test GLB [{testCategory}]" : "Spawn Test GLB (paste URL in Inspector)", _buttonStyle))
-        {
-            if (hasTestUrl)
-                _orchestrator.TestSpawnFromUrl(testGlbUrl, testCategory, testHeight);
-            else
-                Debug.LogWarning("[ARIA] Paste a GLB URL into ARIADebugUI.testGlbUrl in the Inspector.");
-        }
-
-        cy += lineH + 6f;
-
         // Apply lighting retroactively to all spawned objects
         if (GUI.Button(new Rect(inner, cy, panelW - padding * 2f, lineH + 4f),
             "Apply Lighting to All Objects", _buttonStyle))
@@ -117,6 +100,14 @@ public class ARIADebugUI : MonoBehaviour
         }
 
         cy += lineH + 10f;
+
+        // Live transcript (from Voice SDK on Quest)
+        if (!string.IsNullOrEmpty(_partialTranscript))
+        {
+            GUI.Label(new Rect(inner, cy, panelW - padding * 2f, lineH),
+                $"\"{_partialTranscript}\"", _labelStyle);
+            cy += lineH + 2f;
+        }
 
         // Status
         GUI.Label(new Rect(inner, cy, panelW - padding * 2f, lineH * 2f),
