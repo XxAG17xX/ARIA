@@ -20,6 +20,12 @@ public class ARIADebugUI : MonoBehaviour
     [SerializeField] private bool showDebugUI = true;
     [SerializeField] private int  fontSize    = 16;
 
+    [Header("Test Spawn (paste a GLB URL from HiTEM3D CSV — no API calls)")]
+    [SerializeField] private string testGlbUrl      = "";
+    [SerializeField] private string testCategory    = "stool";
+    [SerializeField] private float  testHeight      = 0.75f;
+    [SerializeField] private bool   autoSpawnOnPlay = false;
+
     private ARIAOrchestrator _orchestrator;
     private string           _inputText = "make this corner a reading nook";
     private string           _status    = "Ready.";
@@ -35,6 +41,15 @@ public class ARIADebugUI : MonoBehaviour
         _orchestrator.OnStatusChanged += s => _status = s;
     }
 
+    private void Start()
+    {
+        if (autoSpawnOnPlay && !string.IsNullOrWhiteSpace(testGlbUrl))
+        {
+            _status = "Auto-spawning test GLB...";
+            _orchestrator.TestSpawnFromUrl(testGlbUrl, testCategory, testHeight);
+        }
+    }
+
     private void OnGUI()
     {
         if (!showDebugUI) return;
@@ -42,7 +57,7 @@ public class ARIADebugUI : MonoBehaviour
         InitStyles();
 
         float panelW = 420f;
-        float panelH = 175f;
+        float panelH = 210f;
         float x      = 20f;
         float y      = Screen.height - panelH - 20f;
 
@@ -78,6 +93,19 @@ public class ARIADebugUI : MonoBehaviour
             SendCommand();
         if (GUI.Button(new Rect(inner + btnW + 8f, cy, btnW, lineH + 4f), "Mock Room Test", _buttonStyle))
             SendCommand("put a reading lamp in the corner and a small side table");
+
+        cy += lineH + 6f;
+
+        // Test spawn button (uses Inspector-set testGlbUrl — no API calls)
+        bool hasTestUrl = !string.IsNullOrWhiteSpace(testGlbUrl);
+        if (GUI.Button(new Rect(inner, cy, panelW - padding * 2f, lineH + 4f),
+            hasTestUrl ? $"Spawn Test GLB [{testCategory}]" : "Spawn Test GLB (paste URL in Inspector)", _buttonStyle))
+        {
+            if (hasTestUrl)
+                _orchestrator.TestSpawnFromUrl(testGlbUrl, testCategory, testHeight);
+            else
+                Debug.LogWarning("[ARIA] Paste a GLB URL into ARIADebugUI.testGlbUrl in the Inspector.");
+        }
 
         cy += lineH + 10f;
 

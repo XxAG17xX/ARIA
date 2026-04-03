@@ -43,6 +43,16 @@ public class ARIAOrchestrator : MonoBehaviour
     // Tracks grey-mesh previews so they can be swapped when the textured mesh arrives
     private readonly Dictionary<string, GameObject> _previews = new();
 
+    // GLB cache: category → textured GLB URL — persists between play sessions so we
+    // skip Gemini + HiTEM3D for categories we've already generated (saves credits)
+    private Dictionary<string, string> _glbCache = new();
+    private static string GlbCachePath =>
+#if UNITY_EDITOR
+        Path.GetFullPath(Path.Combine(Application.dataPath, "aria_glb_cache.json"));
+#else
+        Path.Combine(Application.persistentDataPath, "aria_glb_cache.json");
+#endif
+
     // Status callback for ARIADebugUI
     public event Action<string> OnStatusChanged;
 
@@ -53,6 +63,7 @@ public class ARIAOrchestrator : MonoBehaviour
     private void Awake()
     {
         LoadConfig();
+        LoadGlbCache();
     }
 
     private void Start()
@@ -102,6 +113,34 @@ public class ARIAOrchestrator : MonoBehaviour
         _hitemAccessKey = cfg.GetValueOrDefault("hitem_access_key", "");
         _hitemSecretKey = cfg.GetValueOrDefault("hitem_secret_key", "");
         Debug.Log("[ARIA] Config loaded.");
+    }
+
+    private void LoadGlbCache()
+    {
+        try
+        {
+            if (File.Exists(GlbCachePath))
+            {
+                _glbCache = JsonConvert.DeserializeObject<Dictionary<string, string>>(
+                    File.ReadAllText(GlbCachePath)) ?? new();
+                Debug.Log($"[ARIA] GLB cache loaded — {_glbCache.Count} cached model(s): [{string.Join(", ", _glbCache.Keys)}]");
+            }
+            else
+            {
+                Debug.Log("[ARIA] No GLB cache found — will build one as models generate.");
+            }
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning($"[ARIA] GLB cache load failed: {e.Message}");
+            _glbCache = new();
+        }
+    }
+
+    private void SaveGlbCache()
+    {
+        try { File.WriteAllText(GlbCachePath, JsonConvert.SerializeObject(_glbCache, Formatting.Indented)); }
+        catch (Exception e) { Debug.LogWarning($"[ARIA] GLB cache save failed: {e.Message}"); }
     }
 
     private static string GetConfigPath()
@@ -278,8 +317,10 @@ public class ARIAOrchestrator : MonoBehaviour
         string body = JsonConvert.SerializeObject(new
         {
             model      = "claude-sonnet-4-6",
-            max_tokens = 1024,
+            max_tokens = 2048,
             system     = "You are a spatial interior design AI. Respond with valid JSON only. No explanation. " +
+                         "Return ONLY placeable 3D furniture/objects (NOT floors, walls, ceilings, rugs, curtains, or room surfaces). " +
+                         "Maximum 4 objects. Each object must be a distinct piece of furniture or decor. " +
                          "Return a JSON array where each element has: " +
                          "prompt (string — description for image generation), " +
                          "surface_label (string: FLOOR/WALL_FACE/CEILING/TABLE), " +
@@ -297,6 +338,7 @@ public class ARIAOrchestrator : MonoBehaviour
         using var req = new UnityWebRequest("https://api.anthropic.com/v1/messages", "POST");
         req.uploadHandler   = new UploadHandlerRaw(Encoding.UTF8.GetBytes(body));
         req.downloadHandler = new DownloadHandlerBuffer();
+        req.timeout         = 30; // 30s — Claude rarely takes more than 10s
         req.SetRequestHeader("x-api-key",         _claudeKey);
         req.SetRequestHeader("anthropic-version", "2023-06-01");
         req.SetRequestHeader("content-type",      "application/json");
@@ -320,28 +362,55 @@ public class ARIAOrchestrator : MonoBehaviour
 
     private async Task ProcessObjectAsync(PlacementInstruction instr, byte[] jpeg)
     {
-        Debug.Log($"[ARIA] Pipeline start: {instr.prompt}");
-        SetStatus($"Generating: {instr.category}...");
+        string name = instr.category ?? instr.prompt;
+        var pipelineStart = DateTime.UtcNow;
+        Debug.Log($"[ARIA] ═══ STARTING: {name} ═══");
+
+        // ── Cache hit: skip Gemini + HiTEM3D entirely ──────────────────────────
+        string cacheKey = name.ToLower().Trim();
+        if (_glbCache.TryGetValue(cacheKey, out string cachedUrl))
+        {
+            Debug.Log($"[ARIA] ✔ CACHE HIT for \"{name}\" — skipping Gemini + HiTEM3D, using cached GLB.");
+            SetStatus($"Spawning from cache: {name}");
+            await SpawnObjectAsync(cachedUrl, instr, isPreview: false, jpeg: jpeg);
+            Debug.Log($"[ARIA] ═══ COMPLETE (cached): {name} ═══");
+            return;
+        }
+
+        // ── Full pipeline ───────────────────────────────────────────────────────
+        SetStatus($"[1/3] Generating image: {name}...");
 
         // 1 — Gemini image generation
         byte[] png = await CallGeminiAsync(instr.prompt);
-        if (png == null) { Debug.LogError($"[ARIA] Gemini failed: {instr.prompt}"); return; }
+        if (png == null) { Debug.LogError($"[ARIA] ✖ Gemini failed for: {name}"); return; }
+        Debug.Log($"[ARIA] ✔ [1/3] Image generated for: {name}");
 
         // 2 — HiTEM3D auth
+        SetStatus($"[2/3] Authenticating 3D API: {name}...");
         string token = await GetHiTEMTokenAsync();
-        if (token == null) { Debug.LogError("[ARIA] HiTEM3D auth failed."); return; }
+        if (token == null) { Debug.LogError($"[ARIA] ✖ HiTEM3D auth failed for: {name}"); return; }
+        Debug.Log($"[ARIA] ✔ [2/3] 3D API authenticated");
 
-        // 3a — Staged: grey mesh first (~20 s) for perceived speed
-        string greyId  = await SubmitHiTEMTaskAsync(token, png, requestType: 1);
-        string greyUrl = await PollHiTEMTaskAsync(token, greyId);
-        if (greyUrl != null)
-            await SpawnObjectAsync(greyUrl, instr, isPreview: true, jpeg: null);
+        // 3 — All-in-one generation (requestType=3: geometry + texture in one call)
+        //     Uses 512 resolution for cheapest/fastest testing. Upgrade later.
+        SetStatus($"[3/3] Generating 3D model: {name} (~3-5 min, this is normal — do not stop!)");
+        Debug.Log($"[ARIA] ⏳ [3/3] Submitting to HiTEM3D (all-in-one, 512) for {name}. DO NOT STOP.");
+        string taskId = await SubmitHiTEMTaskAsync(token, png, requestType: 3);
+        string glbUrl = await PollHiTEMTaskAsync(token, taskId, name, stage: "all-in-one");
+        if (glbUrl == null)
+        {
+            Debug.LogError($"[ARIA] ✖ HiTEM3D generation failed/timed out for: {name}");
+            return;
+        }
 
-        // 3b — Full textured mesh replaces the preview
-        string texId  = await SubmitHiTEMTaskAsync(token, png, requestType: 2, meshUrl: greyUrl);
-        string texUrl = await PollHiTEMTaskAsync(token, texId);
-        if (texUrl != null)
-            await SpawnObjectAsync(texUrl, instr, isPreview: false, jpeg: jpeg);
+        Debug.Log($"[ARIA] ✔ [3/3] 3D model ready for: {name} — spawning...");
+        await SpawnObjectAsync(glbUrl, instr, isPreview: false, jpeg: jpeg);
+        _glbCache[cacheKey] = glbUrl;
+        SaveGlbCache();
+        Debug.Log($"[ARIA] ✔ Cached GLB for \"{name}\" — future runs will be instant.");
+
+        int totalSec = (int)(DateTime.UtcNow - pipelineStart).TotalSeconds;
+        Debug.Log($"[ARIA] ═══ COMPLETE: {name} — total time {totalSec}s ═══");
     }
 
     // -------------------------------------------------------------------------
@@ -351,30 +420,68 @@ public class ARIAOrchestrator : MonoBehaviour
     private async Task<byte[]> CallGeminiAsync(string objectPrompt)
     {
         string prompt = $"{objectPrompt}, single object, white background, studio lighting, photorealistic";
-        string body   = JsonConvert.SerializeObject(new
+        byte[] bodyBytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(new
         {
-            instances  = new[] { new { prompt } },
-            parameters = new { sampleCount = 1 }
-        });
+            contents         = new[] { new { parts = new[] { new { text = prompt } } } },
+            generationConfig = new { responseModalities = new[] { "IMAGE" }, imageConfig = new { aspectRatio = "1:1" } }
+        }));
 
-        string url = "https://generativelanguage.googleapis.com/v1beta/models/" +
-                     $"imagen-3.0-generate-002:predict?key={_geminiKey}";
+        // Stable model first, preview as fallback
+        string[] models = { "gemini-2.5-flash-image", "gemini-3.1-flash-image-preview" };
 
-        using var req = new UnityWebRequest(url, "POST");
-        req.uploadHandler   = new UploadHandlerRaw(Encoding.UTF8.GetBytes(body));
-        req.downloadHandler = new DownloadHandlerBuffer();
-        req.SetRequestHeader("content-type", "application/json");
-
-        await AwaitRequest(req.SendWebRequest());
-
-        if (req.result != UnityWebRequest.Result.Success)
+        foreach (string model in models)
         {
-            Debug.LogError($"[ARIA] Gemini error: {req.error}\n{req.downloadHandler.text}");
-            return null;
+            string url = $"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={_geminiKey}";
+            Debug.Log($"[ARIA] Calling Gemini model: {model}");
+
+            // Retry up to 2 times on 429
+            for (int attempt = 0; attempt < 2; attempt++)
+            {
+                using var req = new UnityWebRequest(url, "POST");
+                req.uploadHandler   = new UploadHandlerRaw(bodyBytes);
+                req.downloadHandler = new DownloadHandlerBuffer();
+                req.timeout         = 60;
+                req.SetRequestHeader("content-type", "application/json");
+
+                await AwaitRequest(req.SendWebRequest());
+
+                if (req.responseCode == 429)
+                {
+                    int wait = (attempt + 1) * 10;
+                    Debug.LogWarning($"[ARIA] Gemini 429 on {model}. Waiting {wait}s...");
+                    await Task.Delay(wait * 1000);
+                    continue;
+                }
+
+                if (req.result != UnityWebRequest.Result.Success)
+                {
+                    Debug.LogWarning($"[ARIA] Gemini {model} failed ({req.responseCode}): {req.downloadHandler.text}");
+                    break; // try next model
+                }
+
+                var resp = JsonConvert.DeserializeObject<GeminiResponse>(req.downloadHandler.text);
+                if (resp?.candidates == null || resp.candidates.Count == 0)
+                {
+                    Debug.LogWarning($"[ARIA] Gemini {model} returned no candidates — trying next model.");
+                    break;
+                }
+
+                foreach (var part in resp.candidates[0].content.parts)
+                {
+                    if (part.inline_data != null && !string.IsNullOrEmpty(part.inline_data.data))
+                    {
+                        Debug.Log($"[ARIA] ✔ Gemini image received from {model}");
+                        return Convert.FromBase64String(part.inline_data.data);
+                    }
+                }
+
+                Debug.LogWarning($"[ARIA] Gemini {model} response had no image data — trying next model.");
+                break;
+            }
         }
 
-        var resp = JsonConvert.DeserializeObject<GeminiResponse>(req.downloadHandler.text);
-        return Convert.FromBase64String(resp.predictions[0].bytesBase64Encoded);
+        Debug.LogError("[ARIA] All Gemini models failed.");
+        return null;
     }
 
     // -------------------------------------------------------------------------
@@ -389,6 +496,7 @@ public class ARIAOrchestrator : MonoBehaviour
         using var req = new UnityWebRequest("https://api.hitem3d.ai/open-api/v1/auth/token", "POST");
         req.uploadHandler   = new UploadHandlerRaw(Array.Empty<byte>());
         req.downloadHandler = new DownloadHandlerBuffer();
+        req.timeout         = 15;
         req.SetRequestHeader("Authorization", $"Basic {creds}");
         req.SetRequestHeader("content-type",  "application/json");
 
@@ -413,7 +521,7 @@ public class ARIAOrchestrator : MonoBehaviour
             new MultipartFormDataSection("request_type", requestType.ToString()),
             new MultipartFormDataSection("model",        "hitem3dv1.5"),
             new MultipartFormDataSection("format",       "2"),
-            new MultipartFormDataSection("resolution",   "1024")
+            new MultipartFormDataSection("resolution",   "512")
         };
 
         if (meshUrl != null)
@@ -434,17 +542,35 @@ public class ARIAOrchestrator : MonoBehaviour
         return resp?.data?.task_id;
     }
 
-    private async Task<string> PollHiTEMTaskAsync(string token, string taskId)
+    private async Task<string> PollHiTEMTaskAsync(string token, string taskId, string objectName = "", string stage = "")
     {
         if (taskId == null) return null;
 
+        var    startTime    = DateTime.UtcNow;
+        string shortId      = taskId.Length > 8 ? taskId.Substring(0, 8) : taskId;
+        int    pollInterval = 5000;  // ms between polls
+        int    timeoutSec   = 600;   // 10 min max — HiTEM3D can take 5–8 min under load
+        int    lastLoggedSec = -1;   // only log every 15s to avoid spam
+
+        Debug.Log($"[ARIA] HiTEM3D {stage} submitted for \"{objectName}\" [{shortId}...] — pipeline is WORKING, waiting up to {timeoutSec/60} min...");
+        SetStatus($"{stage}: {objectName} [{shortId}...]");
+
         while (true)
         {
-            await Task.Delay(5000);
+            await Task.Delay(pollInterval);
+
+            int elapsedSec = (int)(DateTime.UtcNow - startTime).TotalSeconds;
+
+            if (elapsedSec >= timeoutSec)
+            {
+                Debug.LogError($"[ARIA] HiTEM3D timed out after {timeoutSec}s [{shortId}...]");
+                return null;
+            }
 
             using var req = new UnityWebRequest(
                 $"https://api.hitem3d.ai/open-api/v1/query-task?task_id={taskId}", "GET");
             req.downloadHandler = new DownloadHandlerBuffer();
+            req.timeout         = 15;
             req.SetRequestHeader("Authorization", $"Bearer {token}");
 
             await AwaitRequest(req.SendWebRequest());
@@ -455,16 +581,35 @@ public class ARIAOrchestrator : MonoBehaviour
                 return null;
             }
 
-            var    resp   = JsonConvert.DeserializeObject<HiTEMQueryResponse>(req.downloadHandler.text);
-            string status = resp?.data?.status ?? "unknown";
-            Debug.Log($"[ARIA] HiTEM3D [{taskId}] → {status}");
+            string rawJson = req.downloadHandler.text;
+            var    resp     = JsonConvert.DeserializeObject<HiTEMQueryResponse>(rawJson);
+            string state    = resp?.data?.state ?? "(no state)";
 
-            switch (status)
+            // Log every 15 seconds — include raw JSON on first poll for debugging
+            if (elapsedSec / 15 != lastLoggedSec / 15)
             {
-                case "success": return resp.data.url;
+                if (lastLoggedSec < 0)
+                    Debug.Log($"[ARIA] HiTEM3D FIRST POLL raw:\n{rawJson}");
+                Debug.Log($"[ARIA] ⏳ HiTEM3D {stage} for \"{objectName}\" — {elapsedSec}s elapsed. State: \"{state}\"");
+                SetStatus($"{stage}: {objectName} — {elapsedSec}s elapsed (state: {state})");
+                lastLoggedSec = elapsedSec;
+            }
+
+            switch (state.ToLower())
+            {
+                case "success":
+                    if (string.IsNullOrEmpty(resp.data.url))
+                    {
+                        Debug.LogError($"[ARIA] ✖ HiTEM3D state=success but url is empty! Raw:\n{rawJson}");
+                        return null;
+                    }
+                    Debug.Log($"[ARIA] ✔ HiTEM3D {stage} DONE for \"{objectName}\" in {elapsedSec}s! URL: {resp.data.url}");
+                    SetStatus($"{stage} done: {objectName}");
+                    return resp.data.url;
                 case "failed":
-                    Debug.LogError($"[ARIA] HiTEM3D task failed: {taskId}");
+                    Debug.LogError($"[ARIA] ✖ HiTEM3D {stage} FAILED for \"{objectName}\" after {elapsedSec}s. Raw:\n{rawJson}");
                     return null;
+                // "created", "queueing", "processing" = still working, keep polling
             }
         }
     }
@@ -624,14 +769,26 @@ public class ARIAOrchestrator : MonoBehaviour
         return tcs.Task;
     }
 
-    /// <summary>Strips ```json ... ``` fences that LLMs sometimes add around JSON.</summary>
+    /// <summary>Strips ```json ... ``` fences that LLMs sometimes add around JSON.
+    /// Falls back to finding the first '[' or '{' so any wrapping format is handled.</summary>
     private static string StripCodeFences(string s)
     {
         s = s.Trim();
-        if (!s.StartsWith("```")) return s;
-        int start = s.IndexOf('\n') + 1;
-        int end   = s.LastIndexOf("```");
-        return end > start ? s.Substring(start, end - start).Trim() : s;
+
+        // Find the first JSON-start character, skipping any fence/preamble
+        int jsonStart = -1;
+        for (int i = 0; i < s.Length; i++)
+        {
+            if (s[i] == '[' || s[i] == '{') { jsonStart = i; break; }
+        }
+        if (jsonStart > 0) s = s.Substring(jsonStart);
+
+        // Trim trailing fence or whitespace after the last JSON-close character
+        int jsonEnd = s.LastIndexOfAny(new[] { ']', '}' });
+        if (jsonEnd >= 0 && jsonEnd < s.Length - 1)
+            s = s.Substring(0, jsonEnd + 1);
+
+        return s.Trim();
     }
 
     /// <summary>Computes world-space bounding box across all Renderer children.</summary>
@@ -648,6 +805,38 @@ public class ARIAOrchestrator : MonoBehaviour
     private void SetStatus(string msg)
     {
         OnStatusChanged?.Invoke(msg);
+    }
+
+    // -------------------------------------------------------------------------
+    // Test helper — spawns directly from a GLB URL, bypassing all APIs
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Spawns a GLB directly from a URL with sensible defaults.
+    /// Use from ARIADebugUI to test the spawn pipeline without spending any API credits.
+    /// </summary>
+    public async void TestSpawnFromUrl(string glbUrl, string category = "test", float heightMetres = 0.75f, string surfaceLabel = "FLOOR")
+    {
+        if (string.IsNullOrWhiteSpace(glbUrl))
+        {
+            Debug.LogWarning("[ARIA] TestSpawnFromUrl: no URL provided.");
+            return;
+        }
+
+        var instr = new PlacementInstruction
+        {
+            prompt        = $"test_{category}",
+            surface_label = surfaceLabel,
+            height_metres = heightMetres,
+            category      = category,
+            emits_light   = false
+        };
+
+        Debug.Log($"[ARIA] TEST SPAWN — bypassing all APIs. URL: {glbUrl}");
+        SetStatus("Test spawn: downloading GLB...");
+        await SpawnObjectAsync(glbUrl, instr, isPreview: false, jpeg: null);
+        SetStatus("Test spawn complete.");
+        Debug.Log("[ARIA] TEST SPAWN complete — check hierarchy for spawned object.");
     }
 }
 
@@ -675,14 +864,32 @@ public class PlacementInstruction
 [Serializable] public class ClaudeResponse   { public List<ClaudeContent>    content;     }
 [Serializable] public class ClaudeContent    { public string type; public string text;    }
 
-// Gemini
-[Serializable] public class GeminiResponse   { public List<GeminiPrediction> predictions; }
-[Serializable] public class GeminiPrediction { public string bytesBase64Encoded;          }
+// Gemini (generateContent response — fields are camelCase in the API)
+[Serializable] public class GeminiResponse    { public List<GeminiCandidate> candidates;         }
+[Serializable] public class GeminiCandidate   { public GeminiContent content;                    }
+[Serializable] public class GeminiContent     { public List<GeminiPart> parts;                   }
+[Serializable] public class GeminiPart
+{
+    public string text;
+    [JsonProperty("inlineData")] public GeminiInlineData inline_data;
+}
+[Serializable] public class GeminiInlineData
+{
+    [JsonProperty("mimeType")] public string mime_type;
+    public string data;
+}
 
 // HiTEM3D
 [Serializable] public class HiTEMAuthResponse  { public HiTEMAuthData   data; }
 [Serializable] public class HiTEMAuthData       { public string accessToken;   }
 [Serializable] public class HiTEMSubmitResponse { public HiTEMSubmitData data; }
 [Serializable] public class HiTEMSubmitData     { public string task_id;       }
-[Serializable] public class HiTEMQueryResponse  { public HiTEMQueryData  data; }
-[Serializable] public class HiTEMQueryData      { public string status; public string url; }
+[Serializable] public class HiTEMQueryResponse  { public HiTEMQueryData  data; public string msg; }
+[Serializable] public class HiTEMQueryData
+{
+    public string task_id;
+    public string state;      // "created", "queueing", "processing", "success", "failed"
+    public string id;
+    public string cover_url;
+    public string url;        // GLB download URL (valid for 1 hour)
+}

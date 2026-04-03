@@ -78,6 +78,27 @@ public class SemanticPlacementEngine : MonoBehaviour
 
     private void PlaceOnFloor(GameObject obj, MRUKRoom room)
     {
+        // Prefer a position 1.5m in front of the camera on the floor,
+        // so "place a chair" lands where the user is looking, not randomly.
+        Camera cam = Camera.main;
+        if (cam != null)
+        {
+            Vector3 forward = cam.transform.forward;
+            forward.y = 0f;
+            forward.Normalize();
+            Vector3 target = cam.transform.position + forward * 1.5f;
+
+            // Project onto floor height (y=0 in most MRUK rooms, or use floor anchor y)
+            var floorAnchor = room.Anchors.FirstOrDefault(
+                a => a.HasAnyLabel(MRUKAnchor.SceneLabels.FLOOR));
+            float floorY = floorAnchor != null ? floorAnchor.transform.position.y : 0f;
+
+            obj.transform.position = new Vector3(target.x, floorY, target.z);
+            obj.transform.rotation = Quaternion.identity;
+            return;
+        }
+
+        // Fallback: random on floor surface
         bool found = room.GenerateRandomPositionOnSurface(
             MRUK.SurfaceType.FACING_UP,
             floorClearanceRadius,
@@ -87,13 +108,9 @@ public class SemanticPlacementEngine : MonoBehaviour
 
         if (!found)
         {
-            // Fallback: floor anchor centre
             var floorAnchor = room.Anchors.FirstOrDefault(
                 a => a.HasAnyLabel(MRUKAnchor.SceneLabels.FLOOR));
-            if (floorAnchor != null)
-                pos = floorAnchor.transform.position;
-            else
-                pos = Vector3.zero;
+            pos = floorAnchor != null ? floorAnchor.transform.position : Vector3.zero;
         }
 
         obj.transform.position = pos;
