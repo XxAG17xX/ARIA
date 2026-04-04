@@ -32,10 +32,13 @@ public class ARIADebugUI : MonoBehaviour
     private bool   _countdownActive;
     private float  _countdownEnd;
     private string _pendingCommand;
+    private System.Action _pendingAction; // for demo spawns
     private const float CountdownSeconds = 3f;
 
     // VR Canvas UI elements (Quest)
     private Canvas     _vrCanvas;
+    private GameObject _canvasGO;
+    private bool       _menuVisible;
     private GameObject _mainPanel;
     private GameObject _countdownPanel;
     private Text       _statusText;
@@ -78,7 +81,18 @@ public class ARIADebugUI : MonoBehaviour
         if (!showDebugUI) return;
 
         if (IsRunningOnQuest())
+        {
             CreateVRCanvas();
+            // Suppress Quest boundary for MR passthrough (user sees real world)
+            SuppressBoundary();
+        }
+    }
+
+    private static void SuppressBoundary()
+    {
+#if UNITY_ANDROID && !UNITY_EDITOR
+        OVRManager.boundary.SetVisible(false);
+#endif
     }
 
     // Gaze pointer state
@@ -89,8 +103,17 @@ public class ARIADebugUI : MonoBehaviour
 
     private void Update()
     {
-        // Gaze-based VR pointer (look at button + trigger to click)
-        if (IsRunningOnQuest() && _vrCanvas != null)
+        // Left Y button toggles menu (like Quest OS menu)
+        if (IsRunningOnQuest() && _canvasGO != null)
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            if (OVRInput.GetDown(OVRInput.Button.Four)) // Y button on left controller
+                ToggleMenu();
+#endif
+        }
+
+        // Gaze-based VR pointer (only when menu is visible)
+        if (IsRunningOnQuest() && _vrCanvas != null && _menuVisible)
             UpdateGazePointer();
 
         if (!_countdownActive) return;
@@ -110,8 +133,18 @@ public class ARIADebugUI : MonoBehaviour
             _countdownActive = false;
             if (_countdownPanel != null) _countdownPanel.SetActive(false);
             if (_mainPanel != null) _mainPanel.SetActive(true);
-            SetStatus("Capturing & sending...");
-            _orchestrator.ProcessVoiceCommand(_pendingCommand);
+
+            if (_pendingAction != null)
+            {
+                SetStatus("Spawning...");
+                _pendingAction.Invoke();
+                _pendingAction = null;
+            }
+            else
+            {
+                SetStatus("Capturing & sending...");
+                _orchestrator.ProcessVoiceCommand(_pendingCommand);
+            }
         }
     }
 
@@ -208,7 +241,8 @@ public class ARIADebugUI : MonoBehaviour
         }
 
         // Canvas: world-space, 600x520 px at 0.001 scale = 0.6m x 0.52m real
-        var canvasGO = new GameObject("ARIA_VR_UI");
+        _canvasGO = new GameObject("ARIA_VR_UI");
+        var canvasGO = _canvasGO;
         _vrCanvas = canvasGO.AddComponent<Canvas>();
         _vrCanvas.renderMode = RenderMode.WorldSpace;
         canvasGO.AddComponent<CanvasScaler>();
@@ -223,26 +257,18 @@ public class ARIADebugUI : MonoBehaviour
             canvasGO.AddComponent<GraphicRaycaster>();
 
         var canvasRT = canvasGO.GetComponent<RectTransform>();
-        canvasRT.sizeDelta = new Vector2(600, 720);
+        canvasRT.sizeDelta = new Vector2(600, 800);
         canvasGO.transform.localScale = Vector3.one * 0.001f;
 
-        // Position 1.5m in front of user at eye height
+        // Start hidden — press left Y button to summon in front of you
         Camera cam = Camera.main;
-        if (cam != null)
-        {
-            Vector3 fwd = cam.transform.forward;
-            fwd.y = 0f;
-            if (fwd.sqrMagnitude < 0.001f) fwd = Vector3.forward;
-            else fwd.Normalize();
-            canvasGO.transform.position = cam.transform.position + fwd * 1.5f;
-            canvasGO.transform.rotation = Quaternion.LookRotation(fwd);
-        }
+        canvasGO.SetActive(false);
 
         // ── Main panel ──────────────────────────────────────────────────────
         _mainPanel = MakePanel(canvasGO.transform, "MainPanel",
-            Vector2.zero, new Vector2(600, 720), new Color(0f, 0f, 0f, 0.75f));
+            Vector2.zero, new Vector2(600, 800), new Color(0f, 0f, 0f, 0.75f));
 
-        float y = 330f; // start from top
+        float y = 370f; // start from top
 
         MakeLabel(_mainPanel.transform, "Title", "ARIA — Look at target, then tap:",
             new Vector2(0, y), new Vector2(560, 36), 22, FontStyle.Bold, Color.white);
@@ -278,16 +304,25 @@ public class ARIADebugUI : MonoBehaviour
 
         MakeButton(_mainPanel.transform, "DemoBed", "Spawn Bed (floor)",
             new Vector2(-145, y), new Vector2(270, 48),
-            () => _orchestrator.SpawnBundledGlb("bed.glb", "FLOOR", 0.5f, "bed", 1.4f, 2.0f));
+            () => StartCountdownForAction("Bed on floor",
+                () => _orchestrator.SpawnBundledGlb("bed.glb", "FLOOR", 0.5f, "bed", 1.4f, 2.0f)));
         MakeButton(_mainPanel.transform, "DemoLamp", "Spawn Lamp (floor)",
             new Vector2(145, y), new Vector2(270, 48),
-            () => _orchestrator.SpawnBundledGlb("lamp.glb", "FLOOR", 1.5f, "lamp"));
+            () => StartCountdownForAction("Lamp on floor",
+                () => _orchestrator.SpawnBundledGlb("lamp.glb", "FLOOR", 1.5f, "lamp")));
         y -= 58f;
 
         MakeButton(_mainPanel.transform, "DemoWall", "Spawn Wall Art (wall)",
             new Vector2(0, y), new Vector2(560, 48),
-            () => _orchestrator.SpawnBundledGlb("wall_art.glb", "WALL_FACE", 0.6f, "wall_art", 0.8f, 0.05f));
+            () => StartCountdownForAction("Wall art on wall",
+                () => _orchestrator.SpawnBundledGlb("wall_art.glb", "WALL_FACE", 0.6f, "wall_art", 0.8f, 0.05f)));
         y -= 58f;
+
+        // Toggle EffectMesh visibility
+        MakeButton(_mainPanel.transform, "BtnEffectMesh", "Toggle Room Wireframe",
+            new Vector2(0, y), new Vector2(560, 44),
+            () => ToggleEffectMesh());
+        y -= 52f;
 
         // Transcript
         _transcriptText = MakeLabel(_mainPanel.transform, "Transcript", "",
@@ -301,7 +336,7 @@ public class ARIADebugUI : MonoBehaviour
 
         // ── Countdown overlay (hidden) ──────────────────────────────────────
         _countdownPanel = MakePanel(canvasGO.transform, "CountdownPanel",
-            Vector2.zero, new Vector2(600, 720), new Color(0f, 0f, 0f, 0.9f));
+            Vector2.zero, new Vector2(600, 800), new Color(0f, 0f, 0f, 0.9f));
 
         _countdownNumText = MakeLabel(_countdownPanel.transform, "CNum", "3",
             new Vector2(0, 60), new Vector2(300, 180), 120, FontStyle.Bold,
@@ -403,6 +438,55 @@ public class ARIADebugUI : MonoBehaviour
     // Shared helpers
     // -------------------------------------------------------------------------
 
+    private void ToggleMenu()
+    {
+        _menuVisible = !_menuVisible;
+        _canvasGO.SetActive(_menuVisible);
+
+        if (_menuVisible)
+        {
+            // Place in front of user at current head position (stays in world space)
+            Camera cam = Camera.main;
+            if (cam != null)
+            {
+                Vector3 fwd = cam.transform.forward;
+                fwd.y = 0f;
+                if (fwd.sqrMagnitude < 0.001f) fwd = Vector3.forward;
+                else fwd.Normalize();
+                _canvasGO.transform.position = cam.transform.position + fwd * 1.2f;
+                _canvasGO.transform.rotation = Quaternion.LookRotation(fwd);
+            }
+        }
+
+        // Hide/show reticle with menu
+        if (_reticle != null) _reticle.SetActive(_menuVisible);
+    }
+
+    private bool _effectMeshHidden;
+
+    private void ToggleEffectMesh()
+    {
+#if UNITY_ANDROID && !UNITY_EDITOR
+        _effectMeshHidden = !_effectMeshHidden;
+
+        // EffectMesh spawns child GameObjects with renderers at runtime —
+        // find ALL renderers in the EffectMesh hierarchy AND the MRUK room objects
+        var effectMesh = FindFirstObjectByType<Meta.XR.MRUtilityKit.EffectMesh>();
+        if (effectMesh != null)
+        {
+            // Toggle the EffectMesh GameObject's children (spawned surface meshes)
+            foreach (Transform child in effectMesh.transform)
+                child.gameObject.SetActive(!_effectMeshHidden);
+        }
+
+        // Also toggle the HideMesh property on the EffectMesh component itself
+        if (effectMesh != null)
+            effectMesh.HideMesh = _effectMeshHidden;
+
+        SetStatus(_effectMeshHidden ? "Room wireframe OFF" : "Room wireframe ON");
+#endif
+    }
+
     private void SetStatus(string s)
     {
         _status = s;
@@ -413,14 +497,28 @@ public class ARIADebugUI : MonoBehaviour
     {
         if (_countdownActive) return;
         _pendingCommand = command;
+        _pendingAction = null;
         _countdownActive = true;
         _countdownEnd = Time.time + CountdownSeconds;
-        SetStatus("Look at your target...");
+        BeginCountdownUI(command);
+    }
 
-        // VR Canvas: show countdown, hide main
+    private void StartCountdownForAction(string label, System.Action action)
+    {
+        if (_countdownActive) return;
+        _pendingAction = action;
+        _pendingCommand = null;
+        _countdownActive = true;
+        _countdownEnd = Time.time + CountdownSeconds;
+        BeginCountdownUI(label);
+    }
+
+    private void BeginCountdownUI(string label)
+    {
+        SetStatus("Look at your target...");
         if (_countdownPanel != null)
         {
-            _countdownCmdText.text = $"\"{command}\"";
+            _countdownCmdText.text = $"\"{label}\"";
             _countdownPanel.SetActive(true);
             _mainPanel.SetActive(false);
         }

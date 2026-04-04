@@ -128,6 +128,11 @@ public class SemanticPlacementEngine : MonoBehaviour
             Debug.Log($"[SemanticPlacement] Floor: found clear position for {obj.name} at {bestPos}");
         }
 
+        // Offset so object bottom sits ON the floor, not center-at-floor
+        Bounds placedBounds = GetObjectBounds(obj);
+        float bottomOffset = placedBounds.extents.y; // half-height
+        bestPos.y = floorY + bottomOffset;
+
         obj.transform.position = bestPos;
         obj.transform.rotation = Quaternion.LookRotation(-forward, Vector3.up);
     }
@@ -147,6 +152,9 @@ public class SemanticPlacementEngine : MonoBehaviour
             pos = floorAnchor != null ? floorAnchor.transform.position : Vector3.zero;
         }
 
+        // Lift so bottom sits on floor
+        Bounds b = GetObjectBounds(obj);
+        pos.y += b.extents.y;
         obj.transform.position = pos;
         obj.transform.rotation = Quaternion.identity;
     }
@@ -404,7 +412,8 @@ public class SemanticPlacementEngine : MonoBehaviour
                 obj.transform.rotation = Quaternion.identity;
                 break;
             default: // FLOOR, TABLE, etc.
-                obj.transform.position = new Vector3(basePos.x, 0f, basePos.z);
+                float halfH = GetObjectBounds(obj).extents.y;
+                obj.transform.position = new Vector3(basePos.x, halfH, basePos.z);
                 obj.transform.rotation = Quaternion.identity;
                 break;
         }

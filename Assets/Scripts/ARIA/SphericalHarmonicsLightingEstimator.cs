@@ -50,6 +50,13 @@ public class SphericalHarmonicsLightingEstimator : MonoBehaviour
     private bool _defaultStateSaved;
     private bool _ariaLightingActive;
 
+    // Saved ARIA state so we can toggle back
+    private SphericalHarmonicsL2 _ariaProbe;
+    private Quaternion _ariaLightRotation;
+    private float _ariaLightIntensity;
+    private Color _ariaLightColor;
+    private bool _ariaStateSaved;
+
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
@@ -76,6 +83,15 @@ public class SphericalHarmonicsLightingEstimator : MonoBehaviour
         else
             ApplyEditorFallbackProbe(sceneDirectionalLight);
 
+        // Save ARIA state so toggle can restore it
+        _ariaProbe = RenderSettings.ambientProbe;
+        if (sceneDirectionalLight != null)
+        {
+            _ariaLightRotation = sceneDirectionalLight.transform.rotation;
+            _ariaLightIntensity = sceneDirectionalLight.intensity;
+            _ariaLightColor = sceneDirectionalLight.color;
+        }
+        _ariaStateSaved = true;
         _ariaLightingActive = true;
     }
 
@@ -91,7 +107,17 @@ public class SphericalHarmonicsLightingEstimator : MonoBehaviour
 
         if (_ariaLightingActive)
         {
-            // Re-enable ARIA lighting — detected lights on
+            // Restore ARIA lighting — probe, directional light, detected lights
+            if (_ariaStateSaved)
+            {
+                RenderSettings.ambientProbe = _ariaProbe;
+                if (sceneDirectionalLight != null)
+                {
+                    sceneDirectionalLight.transform.rotation = _ariaLightRotation;
+                    sceneDirectionalLight.intensity = _ariaLightIntensity;
+                    sceneDirectionalLight.color = _ariaLightColor;
+                }
+            }
             foreach (var go in _detectedLightObjects)
                 if (go != null) go.SetActive(true);
             Debug.Log("[SHEstimator] Comparison: ARIA lighting ON");
@@ -324,11 +350,12 @@ public class SphericalHarmonicsLightingEstimator : MonoBehaviour
             var light = lightGO.AddComponent<Light>();
             light.type = LightType.Point;
             light.color = cluster.color;
-            light.intensity = detectedLightIntensity * cluster.brightness;
-            light.range = detectedLightRange;
+            light.intensity = detectedLightIntensity * cluster.brightness * 0.6f; // softer to avoid blobs
+            light.range = detectedLightRange * 1.5f; // wider coverage
             light.shadows = LightShadows.Soft;
-            light.shadowStrength = 0.6f;
-            light.shadowResolution = UnityEngine.Rendering.LightShadowResolution.Medium;
+            light.shadowStrength = 0.4f;
+            light.shadowBias = 0.05f;
+            light.shadowNormalBias = 0.4f;
 
             _detectedLightObjects.Add(lightGO);
             Debug.Log($"[SHEstimator] Detected light at {lightWorldPos} (brightness: {cluster.brightness:F2}, color: {cluster.color})");

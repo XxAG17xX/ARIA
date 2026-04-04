@@ -1107,7 +1107,9 @@ public class ARIAOrchestrator : MonoBehaviour
             category      = category ?? Path.GetFileNameWithoutExtension(filename)
         };
 
-        await SpawnFromGlbBytes(glbBytes, instr, null);
+        // Capture passthrough frame for SH lighting (even on demo spawn)
+        byte[] jpeg = await CapturePassthroughFrameAsync();
+        await SpawnFromGlbBytes(glbBytes, instr, jpeg);
         SetStatus($"Spawned: {instr.category}");
     }
 
