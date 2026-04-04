@@ -167,46 +167,47 @@ public class SemanticPlacementEngine : MonoBehaviour
         Vector3 userPos = cam != null ? cam.transform.position : Vector3.zero;
         Vector3 userFwd = cam != null ? cam.transform.forward : Vector3.forward;
 
-        // Raycast from user gaze to find the wall they're looking at
-        var labelFilter = new LabelFilter(MRUKAnchor.SceneLabels.WALL_FACE);
+        // Primary: Physics.Raycast from gaze to hit EffectMesh wall colliders
+        // This gives us the EXACT point on the wall where the user is looking
         Ray gazeRay = new Ray(userPos, userFwd);
 
+        if (Physics.Raycast(gazeRay, out RaycastHit hit, 10f))
+        {
+            float halfDepth = GetObjectHalfDepth(obj);
+            Vector3 wallNormal = hit.normal;
+            Vector3 finalPos = hit.point + wallNormal * (halfDepth + wallOffset);
+
+            obj.transform.position = finalPos;
+            obj.transform.rotation = Quaternion.LookRotation(wallNormal, Vector3.up);
+            Debug.Log($"[SemanticPlacement] Wall: placed {obj.name} at gaze hit {hit.point} (Y={hit.point.y:F2}m)");
+            return;
+        }
+
+        // Fallback: MRUK GetBestPoseFromRaycast
+        var labelFilter = new LabelFilter(MRUKAnchor.SceneLabels.WALL_FACE);
         Pose bestPose = room.GetBestPoseFromRaycast(gazeRay, 10f, labelFilter,
             out MRUKAnchor hitAnchor, out Vector3 surfaceNormal);
 
         if (hitAnchor != null)
         {
             float halfDepth = GetObjectHalfDepth(obj);
-            // Offset from wall so object doesn't clip
             Vector3 finalPos = bestPose.position + surfaceNormal * (halfDepth + wallOffset);
+            // Use the user's gaze Y instead of anchor center Y
+            finalPos.y = userPos.y + userFwd.y * Vector3.Distance(userPos, finalPos);
+            // Clamp Y to stay within wall bounds
+            float floorY = GetFloorHeight(room);
+            var ceilAnchor = room.Anchors.FirstOrDefault(a => a.HasAnyLabel(MRUKAnchor.SceneLabels.CEILING));
+            float ceilingY = ceilAnchor != null ? ceilAnchor.transform.position.y : 2.8f;
+            Bounds b = GetObjectBounds(obj);
+            finalPos.y = Mathf.Clamp(finalPos.y, floorY + b.extents.y, ceilingY - b.extents.y);
 
-            // Check if this wall spot is clear (no RGB lights, shelves, etc.)
-            Bounds objBounds = GetObjectBounds(obj);
-            if (!room.IsPositionInSceneVolume(finalPos))
-            {
-                obj.transform.position = finalPos;
-                obj.transform.rotation = Quaternion.LookRotation(surfaceNormal, Vector3.up);
-                Debug.Log($"[SemanticPlacement] Wall: placed {obj.name} via gaze raycast");
-                return;
-            }
-
-            // Gaze hit is blocked — slide along wall to find clear spot
-            Vector3 wallRight = Vector3.Cross(surfaceNormal, Vector3.up).normalized;
-            for (int i = 1; i <= maxPlacementAttempts; i++)
-            {
-                float offset = (i / 2) * objectSpacing * (i % 2 == 0 ? 1f : -1f);
-                Vector3 candidate = finalPos + wallRight * offset;
-                if (room.IsPositionInRoom(candidate) && !room.IsPositionInSceneVolume(candidate))
-                {
-                    obj.transform.position = candidate;
-                    obj.transform.rotation = Quaternion.LookRotation(surfaceNormal, Vector3.up);
-                    Debug.Log($"[SemanticPlacement] Wall: slid {obj.name} to clear spot (offset {offset:F2}m)");
-                    return;
-                }
-            }
+            obj.transform.position = finalPos;
+            obj.transform.rotation = Quaternion.LookRotation(surfaceNormal, Vector3.up);
+            Debug.Log($"[SemanticPlacement] Wall: placed {obj.name} via MRUK at Y={finalPos.y:F2}m");
+            return;
         }
 
-        // Fallback: closest wall anchor
+        // Last fallback: closest wall anchor at gaze height
         var wallAnchor = room.Anchors
             .Where(a => a.HasAnyLabel(MRUKAnchor.SceneLabels.WALL_FACE))
             .OrderBy(a => Vector3.Distance(a.transform.position, userPos))
@@ -216,7 +217,9 @@ public class SemanticPlacementEngine : MonoBehaviour
         {
             Vector3 wallNormal = wallAnchor.transform.forward;
             float halfD = GetObjectHalfDepth(obj);
-            obj.transform.position = wallAnchor.transform.position + wallNormal * (halfD + wallOffset);
+            Vector3 pos = wallAnchor.transform.position + wallNormal * (halfD + wallOffset);
+            pos.y = userPos.y; // place at eye height
+            obj.transform.position = pos;
             obj.transform.rotation = Quaternion.LookRotation(wallNormal, Vector3.up);
             Debug.Log($"[SemanticPlacement] Wall: fallback to closest anchor for {obj.name}");
         }

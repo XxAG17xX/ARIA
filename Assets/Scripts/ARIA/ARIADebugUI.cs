@@ -273,7 +273,7 @@ public class ARIADebugUI : MonoBehaviour
             canvasGO.AddComponent<GraphicRaycaster>();
 
         var canvasRT = canvasGO.GetComponent<RectTransform>();
-        canvasRT.sizeDelta = new Vector2(600, 880);
+        canvasRT.sizeDelta = new Vector2(600, 950);
         canvasGO.transform.localScale = Vector3.one * 0.001f;
 
         // Start hidden — press left Y button to summon in front of you
@@ -282,9 +282,9 @@ public class ARIADebugUI : MonoBehaviour
 
         // ── Main panel ──────────────────────────────────────────────────────
         _mainPanel = MakePanel(canvasGO.transform, "MainPanel",
-            Vector2.zero, new Vector2(600, 880), new Color(0f, 0f, 0f, 0.75f));
+            Vector2.zero, new Vector2(600, 950), new Color(0f, 0f, 0f, 0.75f));
 
-        float y = 410f; // start from top
+        float y = 445f; // start from top
 
         MakeLabel(_mainPanel.transform, "Title", "ARIA — Look at target, then tap:",
             new Vector2(0, y), new Vector2(560, 36), 22, FontStyle.Bold, Color.white);
@@ -340,6 +340,13 @@ public class ARIADebugUI : MonoBehaviour
                 () => _orchestrator.SpawnBundledGlb("wall_art.glb", "WALL_FACE", 0.6f, "wall_art", 0.8f, 0.05f)));
         y -= 58f;
 
+        // Adjust with Claude — user looks at target, then presses
+        MakeButton(_mainPanel.transform, "BtnAdjust", "Adjust with Claude (look first!)",
+            new Vector2(0, y), new Vector2(560, 48),
+            () => StartCountdownForAction("Claude adjustment",
+                () => _orchestrator.AdjustLastSpawnWithClaude()));
+        y -= 58f;
+
         // Toggle EffectMesh visibility
         MakeButton(_mainPanel.transform, "BtnEffectMesh", "Toggle Room Wireframe",
             new Vector2(0, y), new Vector2(560, 44),
@@ -358,7 +365,7 @@ public class ARIADebugUI : MonoBehaviour
 
         // ── Countdown overlay (hidden) ──────────────────────────────────────
         _countdownPanel = MakePanel(canvasGO.transform, "CountdownPanel",
-            Vector2.zero, new Vector2(600, 880), new Color(0f, 0f, 0f, 0.9f));
+            Vector2.zero, new Vector2(600, 950), new Color(0f, 0f, 0f, 0.9f));
 
         _countdownNumText = MakeLabel(_countdownPanel.transform, "CNum", "3",
             new Vector2(0, 60), new Vector2(300, 180), 120, FontStyle.Bold,

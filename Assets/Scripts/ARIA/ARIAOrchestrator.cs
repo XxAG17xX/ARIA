@@ -1126,60 +1126,84 @@ public class ARIAOrchestrator : MonoBehaviour
             category      = category ?? Path.GetFileNameWithoutExtension(filename)
         };
 
-        // Capture passthrough frame for SH lighting + post-spawn refinement
-        byte[] jpeg = await CapturePassthroughFrameAsync();
-        await SpawnFromGlbBytes(glbBytes, instr, jpeg);
-        SetStatus($"Spawned: {instr.category} — refining with Claude...");
+        // Spawn with MRUK-only placement (no Claude, no photo yet)
+        await SpawnFromGlbBytes(glbBytes, instr, null);
+        SetStatus($"Spawned: {instr.category}. Look at target, tap 'Adjust with Claude'.");
+    }
 
-        // Post-spawn Claude refinement: send passthrough + MRUK, adjust scale/position
-        if (enableClaudeRefinement && !string.IsNullOrEmpty(_claudeKey))
+    // -------------------------------------------------------------------------
+    // User-triggered Claude adjustment — look at target, then press button
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Captures passthrough from current gaze, sends to Claude with MRUK data,
+    /// and adjusts the most recently spawned object's scale/position.
+    /// Called by "Adjust with Claude" button AFTER user positions their gaze.
+    /// </summary>
+    public async void AdjustLastSpawnWithClaude()
+    {
+        Transform root = spawnRoot != null ? spawnRoot : transform;
+        if (root.childCount == 0)
         {
-            SetStatus($"Claude refining {instr.category}...");
-            Debug.Log($"[ARIA] Sending passthrough + MRUK to Claude for post-spawn refinement...");
+            SetStatus("Nothing to adjust — spawn something first.");
+            return;
+        }
 
-            string mrukJson = SerializeMRUKData();
-            var refined = await CallClaudeRefinementAsync(instr, jpeg, mrukJson);
+        if (string.IsNullOrEmpty(_claudeKey))
+        {
+            SetStatus("Claude API key missing — check config.json");
+            return;
+        }
 
-            // Find the spawned object and re-apply scale + placement if Claude changed anything
-            Transform root = spawnRoot != null ? spawnRoot : transform;
-            Transform spawned = null;
-            foreach (Transform child in root)
-                if (child.name == instr.prompt) spawned = child;
+        // Get the most recently spawned object
+        Transform lastSpawn = root.GetChild(root.childCount - 1);
+        string objName = lastSpawn.name;
 
-            if (spawned != null)
-            {
-                bool changed = Mathf.Abs(refined.height_metres - instr.height_metres) > 0.02f ||
-                               Mathf.Abs(refined.width_metres - instr.width_metres) > 0.02f ||
-                               Mathf.Abs(refined.depth_metres - instr.depth_metres) > 0.02f;
-                if (changed)
-                {
-                    scaleSystem?.ApplyScale(spawned.gameObject, refined.height_metres, refined.category,
-                                            refined.width_metres, refined.depth_metres);
-                    placementEngine?.Place(spawned.gameObject, refined.surface_label ?? instr.surface_label);
+        SetStatus($"Capturing view for Claude...");
+        byte[] jpeg = await CapturePassthroughFrameAsync();
+        if (jpeg == null)
+        {
+            SetStatus("Passthrough capture failed.");
+            return;
+        }
 
-                    // Re-fit to available space after Claude adjusted
+        SetStatus($"Claude analyzing {objName}...");
+        string mrukJson = SerializeMRUKData();
+
+        var instr = new PlacementInstruction
+        {
+            prompt = objName,
+            category = objName,
+            surface_label = "FLOOR", // will be refined by Claude
+            height_metres = lastSpawn.localScale.y,
+            width_metres = lastSpawn.localScale.x,
+            depth_metres = lastSpawn.localScale.z
+        };
+
+        var refined = await CallClaudeRefinementAsync(instr, jpeg, mrukJson);
+
+        bool changed = Mathf.Abs(refined.height_metres - instr.height_metres) > 0.02f ||
+                       Mathf.Abs(refined.width_metres - instr.width_metres) > 0.02f ||
+                       Mathf.Abs(refined.depth_metres - instr.depth_metres) > 0.02f ||
+                       (refined.surface_label != null && refined.surface_label != instr.surface_label);
+
+        if (changed)
+        {
+            scaleSystem?.ApplyScale(lastSpawn.gameObject, refined.height_metres, refined.category,
+                                    refined.width_metres, refined.depth_metres);
+            placementEngine?.Place(lastSpawn.gameObject, refined.surface_label ?? instr.surface_label);
+
 #if UNITY_ANDROID && !UNITY_EDITOR
-                    var fitRoom2 = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
-                    if (fitRoom2 != null)
-                        placementEngine?.FitToAvailableSpace(spawned.gameObject, fitRoom2);
+            var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
+            if (fitRoom != null)
+                placementEngine?.FitToAvailableSpace(lastSpawn.gameObject, fitRoom);
 #endif
-                    SetStatus($"Claude adjusted {instr.category}: " +
-                              $"h={refined.height_metres:F2}m w={refined.width_metres:F2}m");
-                    Debug.Log($"[ARIA] Post-spawn refinement applied to \"{instr.category}\"");
-                }
-                else
-                {
-                    SetStatus($"Claude: {instr.category} dimensions OK.");
-                    Debug.Log($"[ARIA] Post-spawn refinement: no changes needed for \"{instr.category}\"");
-                }
-            }
+            SetStatus($"Claude adjusted {objName}: h={refined.height_metres:F2}m " +
+                      $"surface={refined.surface_label}");
         }
         else
         {
-            string reason = string.IsNullOrEmpty(_claudeKey) ? "no API key" :
-                            !enableClaudeRefinement ? "refinement disabled" : "unknown";
-            SetStatus($"Done: {instr.category} (no Claude: {reason})");
-            Debug.Log($"[ARIA] Claude refinement skipped: {reason}");
+            SetStatus($"Claude: {objName} looks good, no changes.");
         }
     }
 
