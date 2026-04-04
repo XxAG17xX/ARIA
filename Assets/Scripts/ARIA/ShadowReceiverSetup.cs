@@ -58,9 +58,6 @@ public class ShadowReceiverSetup : MonoBehaviour
 #if UNITY_ANDROID && !UNITY_EDITOR
     private void ConfigureEffectMesh()
     {
-        // Find EffectMesh component — either the assigned object or search in scene
-        MRUKAnchor effectMeshComp = null;
-
         if (effectMeshObject != null)
         {
             // Try the assigned object first

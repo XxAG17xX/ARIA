@@ -168,6 +168,10 @@ public class ScaleInferenceSystem : MonoBehaviour
 
         Bounds b  = ARIAOrchestrator.CalculateMeshBounds(obj);
         col.center = obj.transform.InverseTransformPoint(b.center);
-        col.size   = b.size; // world-space size, but InverseTransformPoint handles localScale
+        var ls = obj.transform.localScale;
+        col.size = new Vector3(
+            ls.x > 0.0001f ? b.size.x / ls.x : b.size.x,
+            ls.y > 0.0001f ? b.size.y / ls.y : b.size.y,
+            ls.z > 0.0001f ? b.size.z / ls.z : b.size.z);
     }
 }

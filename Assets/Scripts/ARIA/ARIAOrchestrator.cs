@@ -45,6 +45,10 @@ public class ARIAOrchestrator : MonoBehaviour
     [Tooltip("Enable physics (Rigidbody + BoxCollider) and interaction setup on spawned objects.")]
     [SerializeField] private bool enablePhysics = true;
 
+    [Tooltip("Enable PBR materials (metallic/roughness maps) on Tripo3D models. " +
+             "Costs more credits but shiny/metallic objects look correct.")]
+    [SerializeField] private bool enablePBR = false;
+
     [Header("3D Generation Provider")]
     [Tooltip("Which API to use for 3D mesh generation. Switch to save credits.")]
     [SerializeField] private MeshProvider meshProvider = MeshProvider.Tripo3D;
@@ -62,8 +66,8 @@ public class ARIAOrchestrator : MonoBehaviour
     // Tracks grey-mesh previews so they can be swapped when the textured mesh arrives
     private readonly Dictionary<string, GameObject> _previews = new();
 
-    // GLB cache: category → textured GLB URL — persists between play sessions so we
-    // skip Gemini + HiTEM3D for categories we've already generated (saves credits)
+    // GLB cache: category → local file path — saves actual GLB bytes so we never
+    // re-download or re-generate. Tripo/HiTEM URLs expire, local files don't.
     private Dictionary<string, string> _glbCache = new();
     private static string GlbCachePath =>
 #if UNITY_EDITOR
@@ -71,6 +75,19 @@ public class ARIAOrchestrator : MonoBehaviour
 #else
         Path.Combine(Application.persistentDataPath, "aria_glb_cache.json");
 #endif
+    private static string GlbCacheDir
+    {
+        get
+        {
+#if UNITY_EDITOR
+            string dir = Path.GetFullPath(Path.Combine(Application.dataPath, "ARIA_GLBCache"));
+#else
+            string dir = Path.Combine(Application.persistentDataPath, "glb_cache");
+#endif
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            return dir;
+        }
+    }
 
     // Status callback for ARIADebugUI
     public event Action<string> OnStatusChanged;
@@ -81,9 +98,31 @@ public class ARIAOrchestrator : MonoBehaviour
 
     private void Awake()
     {
+#if UNITY_ANDROID && !UNITY_EDITOR
+        StartCoroutine(CopyConfigThenLoad());
+#else
         LoadConfig();
+#endif
         LoadGlbCache();
     }
+
+#if UNITY_ANDROID && !UNITY_EDITOR
+    private System.Collections.IEnumerator CopyConfigThenLoad()
+    {
+        string dest = Path.Combine(Application.persistentDataPath, "config.json");
+        if (!File.Exists(dest))
+        {
+            string src = Path.Combine(Application.streamingAssetsPath, "config.json");
+            using var req = UnityWebRequest.Get(src);
+            yield return req.SendWebRequest();
+            if (req.result == UnityWebRequest.Result.Success)
+                File.WriteAllText(dest, req.downloadHandler.text);
+            else
+                Debug.LogError($"[ARIA] Failed to copy config from StreamingAssets: {req.error}");
+        }
+        LoadConfig();
+    }
+#endif
 
     private void Start()
     {
@@ -492,13 +531,13 @@ public class ARIAOrchestrator : MonoBehaviour
         var pipelineStart = DateTime.UtcNow;
         Debug.Log($"[ARIA] ═══ STARTING: {name} ═══");
 
-        // ── Cache hit: skip Gemini + HiTEM3D entirely ──────────────────────────
+        // ── Cache hit: load from local file, zero API calls ─────────────────────
         string cacheKey = name.ToLower().Trim();
-        if (_glbCache.TryGetValue(cacheKey, out string cachedUrl))
+        if (_glbCache.TryGetValue(cacheKey, out string cachedPath) && File.Exists(cachedPath))
         {
-            Debug.Log($"[ARIA] ✔ CACHE HIT for \"{name}\" — skipping Gemini + HiTEM3D, using cached GLB.");
+            Debug.Log($"[ARIA] ✔ CACHE HIT for \"{name}\" — loading local GLB: {cachedPath}");
             SetStatus($"Spawning from cache: {name}");
-            await SpawnObjectAsync(cachedUrl, instr, isPreview: false, jpeg: jpeg);
+            await SpawnFromLocalGlb(cachedPath, instr, jpeg);
             Debug.Log($"[ARIA] ═══ COMPLETE (cached): {name} ═══");
             return;
         }
@@ -554,11 +593,26 @@ public class ARIAOrchestrator : MonoBehaviour
             return;
         }
 
-        Debug.Log($"[ARIA] ✔ [4/4] 3D model ready for: {name} — spawning...");
-        await SpawnObjectAsync(glbUrl, instr, isPreview: false, jpeg: jpeg);
-        _glbCache[cacheKey] = glbUrl;
+        Debug.Log($"[ARIA] ✔ [4/4] 3D model ready for: {name} — downloading & caching...");
+
+        // Download GLB bytes and save locally so we never need the URL again
+        using var dlReq = UnityWebRequest.Get(glbUrl);
+        await AwaitRequest(dlReq.SendWebRequest());
+        if (dlReq.result != UnityWebRequest.Result.Success)
+        {
+            Debug.LogError($"[ARIA] GLB download error: {dlReq.error}");
+            return;
+        }
+        byte[] glbBytes = dlReq.downloadHandler.data;
+
+        // Save to local cache file
+        string localPath = Path.Combine(GlbCacheDir, $"{cacheKey.Replace(' ', '_')}.glb");
+        File.WriteAllBytes(localPath, glbBytes);
+        _glbCache[cacheKey] = localPath;
         SaveGlbCache();
-        Debug.Log($"[ARIA] ✔ Cached GLB for \"{name}\" — future runs will be instant.");
+        Debug.Log($"[ARIA] ✔ Cached GLB locally: {localPath} ({glbBytes.Length / 1024}KB)");
+
+        await SpawnFromGlbBytes(glbBytes, instr, jpeg);
 
         int totalSec = (int)(DateTime.UtcNow - pipelineStart).TotalSeconds;
         Debug.Log($"[ARIA] ═══ COMPLETE: {name} — total time {totalSec}s ═══");
@@ -806,7 +860,7 @@ public class ARIAOrchestrator : MonoBehaviour
             model_version   = "default",
             face_limit      = 10000,       // bare minimum for testing
             texture          = true,        // need texture for visual demo
-            pbr              = false,       // skip PBR maps (saves credits)
+            pbr              = enablePBR,    // PBR maps for metallic/shiny objects (costs more credits)
             auto_size        = true
         });
 
@@ -903,24 +957,19 @@ public class ARIAOrchestrator : MonoBehaviour
     // GLTFast spawn + systems integration
     // -------------------------------------------------------------------------
 
-    private async Task SpawnObjectAsync(
-        string glbUrl, PlacementInstruction instr, bool isPreview, byte[] jpeg)
+    private async Task SpawnFromLocalGlb(string localPath, PlacementInstruction instr, byte[] jpeg)
     {
-        using var req = UnityWebRequest.Get(glbUrl);
-        await AwaitRequest(req.SendWebRequest());
+        byte[] glbBytes = File.ReadAllBytes(localPath);
+        await SpawnFromGlbBytes(glbBytes, instr, jpeg);
+    }
 
-        if (req.result != UnityWebRequest.Result.Success)
-        {
-            Debug.LogError($"[ARIA] GLB download error: {req.error}");
-            return;
-        }
-
+    private async Task SpawnFromGlbBytes(byte[] glbBytes, PlacementInstruction instr, byte[] jpeg)
+    {
         var root = new GameObject(instr.prompt);
         root.transform.SetParent(spawnRoot != null ? spawnRoot : transform);
 
-        // GLTFast load — using generic Load() to avoid deprecated LoadGltfBinary()
         var  gltf = new GltfImport();
-        bool ok   = await gltf.Load(req.downloadHandler.data);
+        bool ok   = await gltf.Load(glbBytes);
         if (!ok)
         {
             Debug.LogError($"[ARIA] GLTFast failed: {instr.prompt}");
@@ -929,56 +978,137 @@ public class ARIAOrchestrator : MonoBehaviour
         }
         await gltf.InstantiateMainSceneAsync(root.transform);
 
-        // Scale to LLM-inferred real-world dimensions (height + contextual width/depth)
+        // Fix pink materials — replace any missing/magenta shaders with URP/Lit
+        FixPinkMaterials(root);
+
+        // Scale to LLM-inferred real-world dimensions
         scaleSystem?.ApplyScale(root, instr.height_metres, instr.category,
                                 instr.width_metres, instr.depth_metres);
 
         // Place on the correct MRUK surface
         placementEngine?.Place(root, instr.surface_label);
 
-        // Final object only (not preview): run lighting + interaction setup
-        if (!isPreview)
+        // Lighting + interaction setup
+        if (enableLighting)
         {
-            if (enableLighting)
-            {
-                // SH lighting — runs ONCE using the passthrough frame captured at command start
-                shEstimator?.EstimateLighting(jpeg, sceneDirectionalLight, root);
-
-                // Add reflection probe at object position
-                AddReflectionProbe(root);
-
-                // Virtual light source (e.g. lamp spawns with a Unity PointLight)
-                if (instr.emits_light)
-                    AddVirtualLight(root, instr);
-
-                Debug.Log($"[ARIA] Lighting applied to \"{instr.prompt}\"");
-            }
-            else
-            {
-                Debug.Log($"[ARIA] Lighting SKIPPED (toggle off) for \"{instr.prompt}\"");
-            }
-
-            if (enablePhysics)
-            {
-                AddPhysicsAndInteraction(root);
-            }
+            shEstimator?.EstimateLighting(jpeg, sceneDirectionalLight, root);
+            AddReflectionProbe(root);
+            if (instr.emits_light) AddVirtualLight(root, instr);
+            Debug.Log($"[ARIA] Lighting applied to \"{instr.prompt}\"");
         }
 
-        // Swap preview → final textured mesh
-        if (isPreview)
+        if (enablePhysics)
+            AddPhysicsAndInteraction(root);
+
+        if (_previews.TryGetValue(instr.prompt, out var preview))
         {
-            _previews[instr.prompt] = root;
-        }
-        else
-        {
-            if (_previews.TryGetValue(instr.prompt, out var preview))
-            {
-                Destroy(preview);
-                _previews.Remove(instr.prompt);
-            }
+            Destroy(preview);
+            _previews.Remove(instr.prompt);
         }
 
-        Debug.Log($"[ARIA] Spawned \"{instr.prompt}\" (preview={isPreview})");
+        Debug.Log($"[ARIA] Spawned \"{instr.prompt}\"");
+    }
+
+    /// <summary>
+    /// Replaces pink/magenta materials (missing shader) with URP/Lit fallback.
+    /// GLTFast shader graphs get stripped from Android builds — this catches them.
+    /// </summary>
+    private static void FixPinkMaterials(GameObject root)
+    {
+        Shader urpLit = Shader.Find("Universal Render Pipeline/Lit");
+        Shader urpSimpleLit = Shader.Find("Universal Render Pipeline/Simple Lit");
+        Shader fallback = urpLit != null ? urpLit : urpSimpleLit;
+
+        if (fallback == null)
+        {
+            Debug.LogWarning("[ARIA] No URP/Lit shader found for material fix.");
+            return;
+        }
+
+        int fixed_count = 0;
+        foreach (var r in root.GetComponentsInChildren<Renderer>())
+        {
+            var mats = r.materials; // clone array
+            for (int i = 0; i < mats.Length; i++)
+            {
+                if (mats[i] == null || mats[i].shader == null ||
+                    mats[i].shader.name == "Hidden/InternalErrorShader" ||
+                    mats[i].shader.name.Contains("Error"))
+                {
+                    // Pink material — replace with URP/Lit keeping texture if possible
+                    var newMat = new Material(fallback);
+                    if (mats[i] != null)
+                    {
+                        // Try to preserve the main texture
+                        if (mats[i].HasProperty("_MainTex") && mats[i].mainTexture != null)
+                            newMat.mainTexture = mats[i].mainTexture;
+                        if (mats[i].HasProperty("_BaseMap") && mats[i].GetTexture("_BaseMap") != null)
+                            newMat.SetTexture("_BaseMap", mats[i].GetTexture("_BaseMap"));
+                        if (mats[i].HasProperty("_Color"))
+                            newMat.color = mats[i].color;
+                        if (mats[i].HasProperty("_BaseColor"))
+                            newMat.SetColor("_BaseColor", mats[i].GetColor("_BaseColor"));
+                    }
+                    mats[i] = newMat;
+                    fixed_count++;
+                }
+            }
+            r.materials = mats;
+        }
+
+        if (fixed_count > 0)
+            Debug.Log($"[ARIA] Fixed {fixed_count} pink material(s) → URP/Lit");
+    }
+
+    // -------------------------------------------------------------------------
+    // Demo spawn — load pre-bundled GLBs from StreamingAssets (zero API calls)
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Spawns a pre-bundled GLB from StreamingAssets/GLBCache/{filename}.
+    /// Zero API calls — for demo/presentation use.
+    /// </summary>
+    public async void SpawnBundledGlb(string filename, string surfaceLabel, float height,
+        string category = null, float width = 0f, float depth = 0f)
+    {
+        SetStatus($"Loading bundled: {filename}...");
+        string path = Path.Combine(Application.streamingAssetsPath, "GLBCache", filename);
+
+        byte[] glbBytes;
+
+#if UNITY_ANDROID && !UNITY_EDITOR
+        // On Android, StreamingAssets is inside the APK — need UnityWebRequest
+        using var req = UnityWebRequest.Get(path);
+        await AwaitRequest(req.SendWebRequest());
+        if (req.result != UnityWebRequest.Result.Success)
+        {
+            Debug.LogError($"[ARIA] Bundled GLB load failed: {req.error}");
+            SetStatus("Failed to load bundled model.");
+            return;
+        }
+        glbBytes = req.downloadHandler.data;
+#else
+        if (!File.Exists(path))
+        {
+            Debug.LogError($"[ARIA] Bundled GLB not found: {path}");
+            SetStatus("Bundled model not found.");
+            return;
+        }
+        glbBytes = File.ReadAllBytes(path);
+#endif
+
+        var instr = new PlacementInstruction
+        {
+            prompt        = category ?? Path.GetFileNameWithoutExtension(filename),
+            surface_label = surfaceLabel,
+            height_metres = height,
+            width_metres  = width,
+            depth_metres  = depth,
+            category      = category ?? Path.GetFileNameWithoutExtension(filename)
+        };
+
+        await SpawnFromGlbBytes(glbBytes, instr, null);
+        SetStatus($"Spawned: {instr.category}");
     }
 
     // -------------------------------------------------------------------------
@@ -1002,6 +1132,17 @@ public class ARIAOrchestrator : MonoBehaviour
         }
         Debug.Log($"[ARIA] Applied lighting to {count} spawned object(s).");
         SetStatus($"Lighting applied to {count} object(s).");
+    }
+
+    /// <summary>
+    /// Toggles between ARIA lighting and default Unity lighting for demo comparison.
+    /// </summary>
+    public bool ToggleLightingComparison()
+    {
+        if (shEstimator == null) return true;
+        bool ariaActive = shEstimator.ToggleComparison(sceneDirectionalLight);
+        SetStatus(ariaActive ? "ARIA lighting ON" : "Default lighting (no ARIA)");
+        return ariaActive;
     }
 
     // -------------------------------------------------------------------------
@@ -1057,17 +1198,20 @@ public class ARIAOrchestrator : MonoBehaviour
 
     private static void AddPhysicsAndInteraction(GameObject root)
     {
-        // Rigidbody — non-kinematic so physics apply, no gravity so it floats in place
+        // Rigidbody — kinematic so objects stay exactly where placed (no drift/wobble)
         var rb           = root.AddComponent<Rigidbody>();
         rb.useGravity    = false;
-        rb.isKinematic   = false;
-        rb.constraints   = RigidbodyConstraints.FreezeRotation;
+        rb.isKinematic   = true;
 
-        // BoxCollider auto-sized to mesh bounds
+        // BoxCollider auto-sized to mesh bounds (convert world→local space)
         var bounds = CalculateMeshBounds(root);
         var col    = root.AddComponent<BoxCollider>();
         col.center = root.transform.InverseTransformPoint(bounds.center);
-        col.size   = bounds.size;
+        var ls = root.transform.localScale;
+        col.size = new Vector3(
+            ls.x > 0.0001f ? bounds.size.x / ls.x : bounds.size.x,
+            ls.y > 0.0001f ? bounds.size.y / ls.y : bounds.size.y,
+            ls.z > 0.0001f ? bounds.size.z / ls.z : bounds.size.z);
 
         // Hand grab — requires Interaction SDK Building Block in scene (OVRInteractionComprehensive)
 #if UNITY_ANDROID && !UNITY_EDITOR

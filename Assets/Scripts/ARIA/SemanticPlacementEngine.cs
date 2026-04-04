@@ -104,8 +104,8 @@ public class SemanticPlacementEngine : MonoBehaviour
         // Primary: raycast from user gaze onto the floor
         Vector3 forward = cam.transform.forward;
         forward.y = 0f;
-        forward.Normalize();
-        if (forward == Vector3.zero) forward = Vector3.forward;
+        if (forward.sqrMagnitude < 0.001f) forward = Vector3.forward;
+        else forward.Normalize();
 
         float floorY = GetFloorHeight(room);
         Vector3 gazeTarget = cam.transform.position + forward * 1.5f;
@@ -388,8 +388,8 @@ public class SemanticPlacementEngine : MonoBehaviour
 
         Vector3 forward = cam.transform.forward;
         forward.y       = 0f;
-        if (forward == Vector3.zero) forward = Vector3.forward;
-        forward.Normalize();
+        if (forward.sqrMagnitude < 0.001f) forward = Vector3.forward;
+        else forward.Normalize();
 
         Vector3 basePos = cam.transform.position + forward * 1.5f;
 
