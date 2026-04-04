@@ -1134,6 +1134,9 @@ public class ARIAOrchestrator : MonoBehaviour
         // Post-spawn Claude refinement: send passthrough + MRUK, adjust scale/position
         if (enableClaudeRefinement && !string.IsNullOrEmpty(_claudeKey))
         {
+            SetStatus($"Claude refining {instr.category}...");
+            Debug.Log($"[ARIA] Sending passthrough + MRUK to Claude for post-spawn refinement...");
+
             string mrukJson = SerializeMRUKData();
             var refined = await CallClaudeRefinementAsync(instr, jpeg, mrukJson);
 
@@ -1153,16 +1156,31 @@ public class ARIAOrchestrator : MonoBehaviour
                     scaleSystem?.ApplyScale(spawned.gameObject, refined.height_metres, refined.category,
                                             refined.width_metres, refined.depth_metres);
                     placementEngine?.Place(spawned.gameObject, refined.surface_label ?? instr.surface_label);
+
+                    // Re-fit to available space after Claude adjusted
+#if UNITY_ANDROID && !UNITY_EDITOR
+                    var fitRoom2 = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
+                    if (fitRoom2 != null)
+                        placementEngine?.FitToAvailableSpace(spawned.gameObject, fitRoom2);
+#endif
+                    SetStatus($"Claude adjusted {instr.category}: " +
+                              $"h={refined.height_metres:F2}m w={refined.width_metres:F2}m");
                     Debug.Log($"[ARIA] Post-spawn refinement applied to \"{instr.category}\"");
                 }
                 else
                 {
+                    SetStatus($"Claude: {instr.category} dimensions OK.");
                     Debug.Log($"[ARIA] Post-spawn refinement: no changes needed for \"{instr.category}\"");
                 }
             }
         }
-
-        SetStatus($"Done: {instr.category}");
+        else
+        {
+            string reason = string.IsNullOrEmpty(_claudeKey) ? "no API key" :
+                            !enableClaudeRefinement ? "refinement disabled" : "unknown";
+            SetStatus($"Done: {instr.category} (no Claude: {reason})");
+            Debug.Log($"[ARIA] Claude refinement skipped: {reason}");
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1247,8 +1265,9 @@ public class ARIAOrchestrator : MonoBehaviour
                 AddReflectionProbe(child.gameObject);
             count++;
         }
-        Debug.Log($"[ARIA] Applied lighting to {count} spawned object(s).");
-        SetStatus($"Lighting applied to {count} object(s).");
+        string summary = shEstimator != null ? shEstimator.GetLightingSummary() : "";
+        Debug.Log($"[ARIA] Applied lighting to {count} spawned object(s). {summary}");
+        SetStatus($"Lighting: {count} obj(s). {summary}");
     }
 
     /// <summary>

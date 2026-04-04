@@ -24,8 +24,9 @@ using Meta.XR.MRUtilityKit;
 public class SphericalHarmonicsLightingEstimator : MonoBehaviour
 {
     [Header("Multi-light detection")]
-    [Tooltip("Minimum brightness (0-1) for a pixel to be considered a light source.")]
-    [SerializeField] private float brightThreshold = 0.75f;
+    [Tooltip("Minimum brightness (0-1) for a pixel to be considered a light source. " +
+             "Quest passthrough is often underexposed — use lower values (0.4-0.6).")]
+    [SerializeField] private float brightThreshold = 0.5f;
 
     [Tooltip("Maximum number of detected room lights to spawn.")]
     [SerializeField] private int maxDetectedLights = 4;
@@ -141,6 +142,27 @@ public class SphericalHarmonicsLightingEstimator : MonoBehaviour
     }
 
     public bool IsARIALightingActive => _ariaLightingActive;
+    public int DetectedLightCount => _detectedLightObjects.Count;
+
+    /// <summary>Returns a human-readable summary of the last lighting estimation.</summary>
+    public string GetLightingSummary()
+    {
+        if (_detectedLightObjects.Count == 0)
+            return "No lights detected. Try lowering threshold or scanning again.";
+
+        string summary = $"{_detectedLightObjects.Count} light(s) detected: ";
+        foreach (var go in _detectedLightObjects)
+        {
+            if (go == null) continue;
+            var light = go.GetComponent<Light>();
+            if (light != null)
+            {
+                string colorName = light.color.r > light.color.b ? "warm" : "cool";
+                summary += $"[{colorName} {light.intensity:F1}] ";
+            }
+        }
+        return summary;
+    }
 
     /// <summary>
     /// Adds a per-object directional light aimed from the nearest detected ceiling light
