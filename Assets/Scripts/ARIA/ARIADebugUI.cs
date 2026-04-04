@@ -109,8 +109,8 @@ public class ARIADebugUI : MonoBehaviour
 
     private void Update()
     {
-        // Left Y button toggles menu (like Quest OS menu)
-        if (IsRunningOnQuest() && _canvasGO != null)
+        // Left Y button toggles menu — but NOT during room scan
+        if (IsRunningOnQuest() && _canvasGO != null && !_scanActive)
         {
 #if UNITY_ANDROID && !UNITY_EDITOR
             if (OVRInput.GetDown(OVRInput.Button.Four)) // Y button on left controller
@@ -118,12 +118,16 @@ public class ARIADebugUI : MonoBehaviour
 #endif
         }
 
-        // Room scan: trigger captures photo for current direction
+        // Room scan: ANY trigger or A/B button captures photo
         if (_scanActive && IsRunningOnQuest())
         {
 #if UNITY_ANDROID && !UNITY_EDITOR
             if (OVRInput.GetDown(OVRInput.Button.PrimaryIndexTrigger) ||
-                OVRInput.GetDown(OVRInput.Button.One))
+                OVRInput.GetDown(OVRInput.Button.SecondaryIndexTrigger) ||
+                OVRInput.GetDown(OVRInput.Button.One) ||   // A
+                OVRInput.GetDown(OVRInput.Button.Two) ||   // B
+                OVRInput.GetDown(OVRInput.Button.Three) || // X
+                OVRInput.GetDown(OVRInput.Button.Four))    // Y
                 CaptureRoomScanPhoto();
 #endif
         }
