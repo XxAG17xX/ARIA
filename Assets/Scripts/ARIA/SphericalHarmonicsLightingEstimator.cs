@@ -142,6 +142,64 @@ public class SphericalHarmonicsLightingEstimator : MonoBehaviour
 
     public bool IsARIALightingActive => _ariaLightingActive;
 
+    /// <summary>
+    /// Adds a per-object directional light aimed from the nearest detected ceiling light
+    /// toward the object. Creates realistic shadows matching the real room's light direction.
+    /// Call after EstimateLighting() and after the object is placed.
+    /// </summary>
+    public void AddPerObjectLight(GameObject obj)
+    {
+        if (obj == null || _detectedLightObjects.Count == 0) return;
+
+        // Find the nearest detected ceiling light to this object
+        Vector3 objPos = obj.transform.position;
+        GameObject nearest = null;
+        float nearestDist = float.MaxValue;
+        foreach (var lightGO in _detectedLightObjects)
+        {
+            if (lightGO == null) continue;
+            float dist = Vector3.Distance(lightGO.transform.position, objPos);
+            if (dist < nearestDist) { nearestDist = dist; nearest = lightGO; }
+        }
+
+        if (nearest == null) return;
+
+        // Create a directional light as child of the object, aimed FROM the ceiling light
+        var localLightGO = new GameObject("ARIA_ObjectLight");
+        localLightGO.transform.SetParent(obj.transform);
+        localLightGO.transform.position = objPos + Vector3.up * 2f; // above the object
+
+        // Point FROM the detected light TOWARD the object
+        Vector3 lightDir = (objPos - nearest.transform.position).normalized;
+        localLightGO.transform.rotation = Quaternion.LookRotation(lightDir);
+
+        var light = localLightGO.AddComponent<Light>();
+        light.type = LightType.Directional;
+
+        // Match color from the detected ceiling light
+        var sourceLightComp = nearest.GetComponent<Light>();
+        if (sourceLightComp != null)
+        {
+            light.color = sourceLightComp.color;
+            light.intensity = sourceLightComp.intensity * 0.5f; // softer than room light
+        }
+        else
+        {
+            light.color = new Color(1f, 0.9f, 0.7f); // warm default
+            light.intensity = 0.8f;
+        }
+
+        light.shadows = LightShadows.Soft;
+        light.shadowStrength = 0.5f;
+        light.shadowBias = 0.05f;
+        light.shadowNormalBias = 0.4f;
+        // Limit shadow distance for performance on Quest
+        light.shadowNearPlane = 0.1f;
+        light.cullingMask = ~0; // light everything
+
+        Debug.Log($"[SHEstimator] Per-object directional light on \"{obj.name}\" from ceiling light at {nearest.transform.position}");
+    }
+
     // -------------------------------------------------------------------------
     // SH estimation from JPEG pixels
     // -------------------------------------------------------------------------

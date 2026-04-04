@@ -455,17 +455,28 @@ public class ARIAOrchestrator : MonoBehaviour
             source = new { type = "base64", media_type = "image/png", data = Convert.ToBase64String(referenceImage) }
         });
 
-        content.Add(new
-        {
-            type = "text",
-            text = $"Room layout:\n{mrukJson}\n\n" +
-                   $"Original placement instruction:\n{JsonConvert.SerializeObject(original)}\n\n" +
-                   "Above is the AI-generated reference image for this object. " +
-                   "Review the image and the room layout. Adjust the dimensions (height_metres, width_metres, depth_metres) " +
-                   "if the reference image suggests different proportions than originally planned. " +
-                   "Also refine the prompt if the image style doesn't match the room context. " +
-                   "Return the FULL updated PlacementInstruction as a single JSON object (not an array)."
-        });
+        // Detect whether this is a passthrough image (JPEG from camera) or a Gemini reference (PNG)
+        bool isPassthrough = referenceImage != null && referenceImage.Length > 2 &&
+                             referenceImage[0] == 0xFF && referenceImage[1] == 0xD8; // JPEG magic bytes
+
+        string contextText = isPassthrough
+            ? $"Room layout:\n{mrukJson}\n\n" +
+              $"Current placement:\n{JsonConvert.SerializeObject(original)}\n\n" +
+              "Above is the LIVE passthrough camera image of the real room where this object was just placed. " +
+              "The object is a pre-loaded demo model. Using the room context (visible furniture, surfaces, scale of real objects, " +
+              "lighting conditions, style), adjust the dimensions so the object fits naturally. " +
+              "If the surface_label is TABLE, the object should be miniature/figurine-sized to fit on the table. " +
+              "If FLOOR, scale to real-world furniture size. Consider what's visible in the room to avoid overlap. " +
+              "Return the FULL updated PlacementInstruction as a single JSON object (not an array)."
+            : $"Room layout:\n{mrukJson}\n\n" +
+              $"Original placement instruction:\n{JsonConvert.SerializeObject(original)}\n\n" +
+              "Above is the AI-generated reference image for this object. " +
+              "Review the image and the room layout. Adjust the dimensions (height_metres, width_metres, depth_metres) " +
+              "if the reference image suggests different proportions than originally planned. " +
+              "Also refine the prompt if the image style doesn't match the room context. " +
+              "Return the FULL updated PlacementInstruction as a single JSON object (not an array).";
+
+        content.Add(new { type = "text", text = contextText });
 
         string body = JsonConvert.SerializeObject(new
         {
@@ -992,6 +1003,7 @@ public class ARIAOrchestrator : MonoBehaviour
         if (enableLighting)
         {
             shEstimator?.EstimateLighting(jpeg, sceneDirectionalLight, root);
+            shEstimator?.AddPerObjectLight(root); // per-object directional from nearest ceiling light
             AddReflectionProbe(root);
             if (instr.emits_light) AddVirtualLight(root, instr);
             Debug.Log($"[ARIA] Lighting applied to \"{instr.prompt}\"");
@@ -1107,10 +1119,43 @@ public class ARIAOrchestrator : MonoBehaviour
             category      = category ?? Path.GetFileNameWithoutExtension(filename)
         };
 
-        // Capture passthrough frame for SH lighting (even on demo spawn)
+        // Capture passthrough frame for SH lighting + post-spawn refinement
         byte[] jpeg = await CapturePassthroughFrameAsync();
         await SpawnFromGlbBytes(glbBytes, instr, jpeg);
-        SetStatus($"Spawned: {instr.category}");
+        SetStatus($"Spawned: {instr.category} — refining with Claude...");
+
+        // Post-spawn Claude refinement: send passthrough + MRUK, adjust scale/position
+        if (enableClaudeRefinement && !string.IsNullOrEmpty(_claudeKey))
+        {
+            string mrukJson = SerializeMRUKData();
+            var refined = await CallClaudeRefinementAsync(instr, jpeg, mrukJson);
+
+            // Find the spawned object and re-apply scale + placement if Claude changed anything
+            Transform root = spawnRoot != null ? spawnRoot : transform;
+            Transform spawned = null;
+            foreach (Transform child in root)
+                if (child.name == instr.prompt) spawned = child;
+
+            if (spawned != null)
+            {
+                bool changed = Mathf.Abs(refined.height_metres - instr.height_metres) > 0.02f ||
+                               Mathf.Abs(refined.width_metres - instr.width_metres) > 0.02f ||
+                               Mathf.Abs(refined.depth_metres - instr.depth_metres) > 0.02f;
+                if (changed)
+                {
+                    scaleSystem?.ApplyScale(spawned.gameObject, refined.height_metres, refined.category,
+                                            refined.width_metres, refined.depth_metres);
+                    placementEngine?.Place(spawned.gameObject, refined.surface_label ?? instr.surface_label);
+                    Debug.Log($"[ARIA] Post-spawn refinement applied to \"{instr.category}\"");
+                }
+                else
+                {
+                    Debug.Log($"[ARIA] Post-spawn refinement: no changes needed for \"{instr.category}\"");
+                }
+            }
+        }
+
+        SetStatus($"Done: {instr.category}");
     }
 
     // -------------------------------------------------------------------------
@@ -1121,13 +1166,27 @@ public class ARIAOrchestrator : MonoBehaviour
     /// Applies lighting (SH, reflection probes) to all children of spawnRoot.
     /// Called from ARIADebugUI when "Enable Lighting" is toggled on mid-demo.
     /// </summary>
-    public void ApplyLightingToAllSpawned()
+    public async void ApplyLightingToAllSpawned()
     {
+        // Capture fresh passthrough frame for current lighting conditions
+        byte[] jpeg = await CapturePassthroughFrameAsync();
+
         Transform root = spawnRoot != null ? spawnRoot : transform;
         int count = 0;
+        bool firstChild = true;
         foreach (Transform child in root)
         {
-            shEstimator?.EstimateLighting(null, sceneDirectionalLight, child.gameObject);
+            // Only run SH estimation once (first child) — it's global
+            if (firstChild)
+            {
+                shEstimator?.EstimateLighting(jpeg, sceneDirectionalLight, child.gameObject);
+                firstChild = false;
+            }
+
+            // Per-object directional light from nearest detected ceiling light
+            if (child.Find("ARIA_ObjectLight") == null)
+                shEstimator?.AddPerObjectLight(child.gameObject);
+
             if (child.Find("ARIA_ReflectionProbe") == null)
                 AddReflectionProbe(child.gameObject);
             count++;
