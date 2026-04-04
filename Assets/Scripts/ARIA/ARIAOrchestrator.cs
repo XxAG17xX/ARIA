@@ -1159,6 +1159,45 @@ public class ARIAOrchestrator : MonoBehaviour
     }
 
     // -------------------------------------------------------------------------
+    // Room lighting scan — 4-photo 360° capture for accurate SH estimation
+    // -------------------------------------------------------------------------
+
+    private byte[][] _roomScanPhotos;
+    private float[]  _roomScanHeadings;
+    private int      _roomScanCount;
+    public bool HasRoomScan => _roomScanCount >= 4;
+
+    /// <summary>Initialise storage for a new 4-photo room scan.</summary>
+    public void BeginRoomLightingScan()
+    {
+        _roomScanPhotos = new byte[4][];
+        _roomScanHeadings = new float[4];
+        _roomScanCount = 0;
+        Debug.Log("[ARIA] Room lighting scan started.");
+    }
+
+    /// <summary>Capture and store one photo for the room scan.</summary>
+    public async Task<bool> CaptureRoomScanPhoto(int phase)
+    {
+        byte[] jpeg = await CapturePassthroughFrameAsync();
+        if (jpeg == null || jpeg.Length == 0)
+        {
+            Debug.LogWarning($"[ARIA] Room scan photo {phase} capture failed.");
+            return false;
+        }
+
+        Camera cam = Camera.main;
+        float heading = cam != null ? cam.transform.eulerAngles.y : phase * 90f;
+
+        _roomScanPhotos[phase] = jpeg;
+        _roomScanHeadings[phase] = heading;
+        _roomScanCount = phase + 1;
+
+        Debug.Log($"[ARIA] Room scan photo {phase} captured (heading: {heading:F1}°, {jpeg.Length / 1024}KB)");
+        return true;
+    }
+
+    // -------------------------------------------------------------------------
     // Retroactive lighting — call from debug UI to apply lighting to all spawned objects
     // -------------------------------------------------------------------------
 
@@ -1168,25 +1207,35 @@ public class ARIAOrchestrator : MonoBehaviour
     /// </summary>
     public async void ApplyLightingToAllSpawned()
     {
-        // Capture fresh passthrough frame for current lighting conditions
-        byte[] jpeg = await CapturePassthroughFrameAsync();
-
         Transform root = spawnRoot != null ? spawnRoot : transform;
         int count = 0;
-        bool firstChild = true;
+
+        // Use room scan data if available (4-photo 360°), otherwise single frame
+        if (HasRoomScan && shEstimator != null)
+        {
+            shEstimator.EstimateFromRoomScan(_roomScanPhotos, _roomScanHeadings,
+                                              sceneDirectionalLight);
+            Debug.Log("[ARIA] Applied 4-photo room scan lighting.");
+        }
+        else
+        {
+            byte[] jpeg = await CapturePassthroughFrameAsync();
+            bool firstChild = true;
+            foreach (Transform child in root)
+            {
+                if (firstChild)
+                {
+                    shEstimator?.EstimateLighting(jpeg, sceneDirectionalLight, child.gameObject);
+                    firstChild = false;
+                }
+            }
+            Debug.Log("[ARIA] Applied single-frame lighting (no room scan).");
+        }
+
         foreach (Transform child in root)
         {
-            // Only run SH estimation once (first child) — it's global
-            if (firstChild)
-            {
-                shEstimator?.EstimateLighting(jpeg, sceneDirectionalLight, child.gameObject);
-                firstChild = false;
-            }
-
-            // Per-object directional light from nearest detected ceiling light
             if (child.Find("ARIA_ObjectLight") == null)
                 shEstimator?.AddPerObjectLight(child.gameObject);
-
             if (child.Find("ARIA_ReflectionProbe") == null)
                 AddReflectionProbe(child.gameObject);
             count++;

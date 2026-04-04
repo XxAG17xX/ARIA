@@ -35,6 +35,12 @@ public class ARIADebugUI : MonoBehaviour
     private System.Action _pendingAction; // for demo spawns
     private const float CountdownSeconds = 3f;
 
+    // Room lighting scan state
+    private bool _scanActive;
+    private int  _scanPhase; // 0=forward, 1=right, 2=back, 3=left
+    private static readonly string[] ScanDirections = { "FORWARD", "RIGHT", "BACK", "LEFT" };
+    private static readonly string[] ScanArrows     = { "^", ">", "v", "<" };
+
     // VR Canvas UI elements (Quest)
     private Canvas     _vrCanvas;
     private GameObject _canvasGO;
@@ -112,8 +118,18 @@ public class ARIADebugUI : MonoBehaviour
 #endif
         }
 
-        // Gaze-based VR pointer (only when menu is visible)
-        if (IsRunningOnQuest() && _vrCanvas != null && _menuVisible)
+        // Room scan: trigger captures photo for current direction
+        if (_scanActive && IsRunningOnQuest())
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            if (OVRInput.GetDown(OVRInput.Button.PrimaryIndexTrigger) ||
+                OVRInput.GetDown(OVRInput.Button.One))
+                CaptureRoomScanPhoto();
+#endif
+        }
+
+        // Gaze-based VR pointer (only when menu is visible, not during scan)
+        if (IsRunningOnQuest() && _vrCanvas != null && _menuVisible && !_scanActive)
             UpdateGazePointer();
 
         if (!_countdownActive) return;
@@ -257,7 +273,7 @@ public class ARIADebugUI : MonoBehaviour
             canvasGO.AddComponent<GraphicRaycaster>();
 
         var canvasRT = canvasGO.GetComponent<RectTransform>();
-        canvasRT.sizeDelta = new Vector2(600, 800);
+        canvasRT.sizeDelta = new Vector2(600, 880);
         canvasGO.transform.localScale = Vector3.one * 0.001f;
 
         // Start hidden — press left Y button to summon in front of you
@@ -266,9 +282,9 @@ public class ARIADebugUI : MonoBehaviour
 
         // ── Main panel ──────────────────────────────────────────────────────
         _mainPanel = MakePanel(canvasGO.transform, "MainPanel",
-            Vector2.zero, new Vector2(600, 800), new Color(0f, 0f, 0f, 0.75f));
+            Vector2.zero, new Vector2(600, 880), new Color(0f, 0f, 0f, 0.75f));
 
-        float y = 370f; // start from top
+        float y = 410f; // start from top
 
         MakeLabel(_mainPanel.transform, "Title", "ARIA — Look at target, then tap:",
             new Vector2(0, y), new Vector2(560, 36), 22, FontStyle.Bold, Color.white);
@@ -286,6 +302,12 @@ public class ARIADebugUI : MonoBehaviour
         MakeButton(_mainPanel.transform, "Cmd3", quickCommand3,
             new Vector2(0, y), new Vector2(560, 55), () => StartCountdown(quickCommand3));
         y -= 75f;
+
+        // Room scan button
+        MakeButton(_mainPanel.transform, "BtnScan", "Scan Room Lighting (4 photos)",
+            new Vector2(0, y), new Vector2(560, 50),
+            () => StartRoomLightingScan());
+        y -= 58f;
 
         // Lighting row
         MakeButton(_mainPanel.transform, "BtnLight", "Apply Lighting",
@@ -336,7 +358,7 @@ public class ARIADebugUI : MonoBehaviour
 
         // ── Countdown overlay (hidden) ──────────────────────────────────────
         _countdownPanel = MakePanel(canvasGO.transform, "CountdownPanel",
-            Vector2.zero, new Vector2(600, 800), new Color(0f, 0f, 0f, 0.9f));
+            Vector2.zero, new Vector2(600, 880), new Color(0f, 0f, 0f, 0.9f));
 
         _countdownNumText = MakeLabel(_countdownPanel.transform, "CNum", "3",
             new Vector2(0, 60), new Vector2(300, 180), 120, FontStyle.Bold,
@@ -460,6 +482,56 @@ public class ARIADebugUI : MonoBehaviour
 
         // Hide/show reticle with menu
         if (_reticle != null) _reticle.SetActive(_menuVisible);
+    }
+
+    // -------------------------------------------------------------------------
+    // Room lighting scan — 4-photo 360° capture
+    // -------------------------------------------------------------------------
+
+    private void StartRoomLightingScan()
+    {
+        _orchestrator.BeginRoomLightingScan();
+        _scanActive = true;
+        _scanPhase = 0;
+
+        // Hide main panel, show scan overlay using countdown panel
+        if (_mainPanel != null) _mainPanel.SetActive(false);
+        if (_countdownPanel != null)
+        {
+            _countdownPanel.SetActive(true);
+            _countdownNumText.text = ScanArrows[0];
+            _countdownCmdText.text = $"Look {ScanDirections[0]} and pull trigger (1/4)";
+        }
+        SetStatus("Room scan: look FORWARD...");
+    }
+
+    private async void CaptureRoomScanPhoto()
+    {
+        bool ok = await _orchestrator.CaptureRoomScanPhoto(_scanPhase);
+        if (!ok)
+        {
+            SetStatus("Photo capture failed — try again.");
+            return;
+        }
+
+        _scanPhase++;
+
+        if (_scanPhase >= 4)
+        {
+            // Scan complete
+            _scanActive = false;
+            if (_countdownPanel != null) _countdownPanel.SetActive(false);
+            if (_mainPanel != null) _mainPanel.SetActive(true);
+            SetStatus("Room scan complete! Tap 'Apply Lighting' to use it.");
+            Debug.Log("[ARIA] Room lighting scan complete — 4 photos captured.");
+            return;
+        }
+
+        // Show next direction
+        if (_countdownNumText != null) _countdownNumText.text = ScanArrows[_scanPhase];
+        if (_countdownCmdText != null)
+            _countdownCmdText.text = $"Look {ScanDirections[_scanPhase]} and pull trigger ({_scanPhase + 1}/4)";
+        SetStatus($"Room scan: look {ScanDirections[_scanPhase]}...");
     }
 
     private bool _effectMeshHidden;

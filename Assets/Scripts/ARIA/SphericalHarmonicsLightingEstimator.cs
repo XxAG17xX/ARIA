@@ -230,6 +230,281 @@ public class SphericalHarmonicsLightingEstimator : MonoBehaviour
     }
 
     // -------------------------------------------------------------------------
+    // 4-photo room scan estimation (360° coverage)
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Estimates lighting from 4 passthrough photos taken at different headings.
+    /// Combines SH probes from all photos for full 360° ambient coverage.
+    /// Detects lights across all photos for complete room light map.
+    /// </summary>
+    public void EstimateFromRoomScan(byte[][] photos, float[] headings, Light sceneDirectionalLight)
+    {
+        // Save default state
+        if (!_defaultStateSaved && sceneDirectionalLight != null)
+        {
+            _defaultProbe = RenderSettings.ambientProbe;
+            _defaultLightRotation = sceneDirectionalLight.transform.rotation;
+            _defaultLightIntensity = sceneDirectionalLight.intensity;
+            _defaultLightColor = sceneDirectionalLight.color;
+            _defaultStateSaved = true;
+        }
+
+        // Clean up previous detected lights
+        foreach (var go in _detectedLightObjects)
+            if (go != null) Destroy(go);
+        _detectedLightObjects.Clear();
+
+        var combinedSH = new SphericalHarmonicsL2();
+        combinedSH.Clear();
+        int totalSamples = 0;
+        Color totalColor = Color.black;
+        Vector3 weightedLightDir = Vector3.zero;
+        float totalBrightness = 0f;
+
+        float cameraFOV = 60f; // approximate Quest 3 horizontal FOV per eye
+        Camera cam = Camera.main;
+        if (cam != null) cameraFOV = cam.fieldOfView;
+
+        for (int i = 0; i < photos.Length; i++)
+        {
+            if (photos[i] == null || photos[i].Length == 0) continue;
+
+            var tex = new Texture2D(2, 2, TextureFormat.RGB24, false);
+            if (!tex.LoadImage(photos[i])) { Destroy(tex); continue; }
+
+            float headingRad = headings[i] * Mathf.Deg2Rad;
+
+            // Compute SH with world-space directions based on heading
+            SphericalHarmonicsL2 photoSH = ComputeSHWithHeading(tex, headingRad, cameraFOV);
+
+            // Accumulate SH coefficients
+            for (int c = 0; c < 3; c++)
+                for (int k = 0; k < 9; k++)
+                    combinedSH[c, k] += photoSH[c, k];
+            totalSamples++;
+
+            // Accumulate average color
+            Color avgCol = AverageFrameColor(tex);
+            totalColor += avgCol;
+
+            // Detect bright clusters in this photo → project to 3D world positions
+            DetectAndSpawnRoomLightsWithHeading(tex, headingRad);
+
+            // Weighted light direction from brightness distribution
+            Vector3 photoDir = EstimateDirectionFromBrightnessWithHeading(tex, headingRad);
+            float photoBrightness = avgCol.grayscale;
+            weightedLightDir += photoDir * photoBrightness;
+            totalBrightness += photoBrightness;
+
+            Destroy(tex);
+            Debug.Log($"[SHEstimator] Room scan photo {i}: heading={headings[i]:F0}°, brightness={photoBrightness:F2}");
+        }
+
+        if (totalSamples == 0)
+        {
+            Debug.LogWarning("[SHEstimator] No valid room scan photos — using fallback.");
+            ApplyEditorFallbackProbe(sceneDirectionalLight);
+            return;
+        }
+
+        // Average the SH coefficients
+        float inv = 1f / totalSamples;
+        for (int c = 0; c < 3; c++)
+            for (int k = 0; k < 9; k++)
+                combinedSH[c, k] *= inv;
+
+        ApplySH(combinedSH);
+
+        // Set directional light from brightness-weighted direction across all photos
+        if (sceneDirectionalLight != null && totalBrightness > 0.01f)
+        {
+            Vector3 lightDir = (weightedLightDir / totalBrightness).normalized;
+            if (lightDir.sqrMagnitude < 0.5f) lightDir = new Vector3(0f, -0.8f, 0.2f);
+            sceneDirectionalLight.transform.rotation = Quaternion.LookRotation(lightDir);
+            Color avgColor = totalColor / totalSamples;
+            sceneDirectionalLight.color = Color.Lerp(Color.white, avgColor, 0.5f);
+        }
+
+        // Save ARIA state for toggle
+        _ariaProbe = RenderSettings.ambientProbe;
+        if (sceneDirectionalLight != null)
+        {
+            _ariaLightRotation = sceneDirectionalLight.transform.rotation;
+            _ariaLightIntensity = sceneDirectionalLight.intensity;
+            _ariaLightColor = sceneDirectionalLight.color;
+        }
+        _ariaStateSaved = true;
+        _ariaLightingActive = true;
+
+        Debug.Log($"[SHEstimator] Room scan complete: {totalSamples} photos, {_detectedLightObjects.Count} lights detected.");
+    }
+
+    /// <summary>Compute SH coefficients with pixel directions rotated by camera heading.</summary>
+    private static SphericalHarmonicsL2 ComputeSHWithHeading(Texture2D tex, float headingRad, float fovDeg)
+    {
+        float[,] shR = new float[3, 9];
+        int sampleCount = 0;
+        float halfFovRad = fovDeg * 0.5f * Mathf.Deg2Rad;
+
+        for (int row = 0; row < 4; row++)
+        {
+            for (int col = 0; col < 4; col++)
+            {
+                float u = (col + 0.5f) / 4f;
+                float v = (row + 0.5f) / 4f;
+
+                // Map UV to direction relative to camera, then rotate by heading
+                float localAzimuth = (u - 0.5f) * halfFovRad * 2f;
+                float elevation = (v - 0.5f) * halfFovRad; // vertical
+
+                float worldAzimuth = localAzimuth + headingRad;
+
+                float cosEl = Mathf.Cos(elevation);
+                float sinEl = Mathf.Sin(elevation);
+                Vector3 dir = new Vector3(
+                    cosEl * Mathf.Sin(worldAzimuth),
+                    sinEl,
+                    cosEl * Mathf.Cos(worldAzimuth)).normalized;
+
+                Color pixel = tex.GetPixelBilinear(u, v);
+                float[] channels = { pixel.r, pixel.g, pixel.b };
+                float x = dir.x, y = dir.y, z = dir.z;
+
+                for (int c = 0; c < 3; c++)
+                {
+                    float val = channels[c];
+                    shR[c, 0] += val * 0.282095f;
+                    shR[c, 1] += val * 0.488603f * y;
+                    shR[c, 2] += val * 0.488603f * z;
+                    shR[c, 3] += val * 0.488603f * x;
+                    shR[c, 4] += val * 1.092548f * (x * y);
+                    shR[c, 5] += val * 1.092548f * (y * z);
+                    shR[c, 6] += val * 0.315392f * (3f * z * z - 1f);
+                    shR[c, 7] += val * 1.092548f * (x * z);
+                    shR[c, 8] += val * 0.546274f * (x * x - y * y);
+                }
+                sampleCount++;
+            }
+        }
+
+        if (sampleCount > 0)
+        {
+            float inv = 1f / sampleCount;
+            for (int c = 0; c < 3; c++)
+                for (int k = 0; k < 9; k++)
+                    shR[c, k] *= inv;
+        }
+
+        var sh = new SphericalHarmonicsL2();
+        sh.Clear();
+        for (int c = 0; c < 3; c++)
+            for (int k = 0; k < 9; k++)
+                sh[c, k] = shR[c, k];
+        return sh;
+    }
+
+    /// <summary>Detect bright clusters in a photo and spawn lights using heading for 3D projection.</summary>
+    private void DetectAndSpawnRoomLightsWithHeading(Texture2D tex, float headingRad)
+    {
+        int gridSize = 16;
+        Camera cam = Camera.main;
+        if (cam == null) return;
+
+        float roomHeight = 2.8f;
+#if UNITY_ANDROID && !UNITY_EDITOR
+        var room = MRUK.Instance?.GetCurrentRoom();
+        if (room != null)
+        {
+            var ceil = room.Anchors.FirstOrDefault(a => a.HasAnyLabel(MRUKAnchor.SceneLabels.CEILING));
+            if (ceil != null) roomHeight = ceil.transform.position.y;
+        }
+#endif
+
+        for (int gy = 0; gy < gridSize; gy++)
+        {
+            for (int gx = 0; gx < gridSize; gx++)
+            {
+                float u = (gx + 0.5f) / gridSize;
+                float v = (gy + 0.5f) / gridSize;
+                Color pixel = tex.GetPixelBilinear(u, v);
+
+                if (pixel.grayscale < brightThreshold) continue;
+                if (_detectedLightObjects.Count >= maxDetectedLights) return;
+
+                // Map UV + heading to world direction
+                float fov = cam.fieldOfView;
+                float localAz = (u - 0.5f) * fov * Mathf.Deg2Rad;
+                float el = (v - 0.5f) * fov * Mathf.Deg2Rad;
+                float worldAz = localAz + headingRad;
+
+                Vector3 dir = new Vector3(
+                    Mathf.Cos(el) * Mathf.Sin(worldAz),
+                    Mathf.Sin(el),
+                    Mathf.Cos(el) * Mathf.Cos(worldAz)).normalized;
+
+                // Project to ceiling
+                Ray ray = new Ray(cam.transform.position, dir);
+                float t = (roomHeight - ray.origin.y) / ray.direction.y;
+                Vector3 lightPos = t > 0f ? ray.origin + ray.direction * t
+                                          : cam.transform.position + Vector3.up * roomHeight;
+
+                // Check distance from existing detected lights
+                bool tooClose = false;
+                foreach (var existing in _detectedLightObjects)
+                {
+                    if (existing != null && Vector3.Distance(existing.transform.position, lightPos) < 1f)
+                    { tooClose = true; break; }
+                }
+                if (tooClose) continue;
+
+                var lightGO = new GameObject($"ARIA_DetectedLight_{_detectedLightObjects.Count}");
+                lightGO.transform.position = lightPos;
+                var light = lightGO.AddComponent<Light>();
+                light.type = LightType.Point;
+                light.color = pixel;
+                light.intensity = detectedLightIntensity * pixel.grayscale * 0.6f;
+                light.range = detectedLightRange * 1.5f;
+                light.shadows = LightShadows.Soft;
+                light.shadowStrength = 0.4f;
+                light.shadowBias = 0.05f;
+                light.shadowNormalBias = 0.4f;
+
+                _detectedLightObjects.Add(lightGO);
+            }
+        }
+    }
+
+    private static Vector3 EstimateDirectionFromBrightnessWithHeading(Texture2D tex, float headingRad)
+    {
+        int w = tex.width, h = tex.height;
+        float leftB = 0f, rightB = 0f, topB = 0f, bottomB = 0f;
+        int sw = Mathf.Max(1, w / 8), sh = Mathf.Max(1, h / 8);
+
+        for (int y = 0; y < sh; y++)
+        {
+            for (int x = 0; x < sw; x++)
+            {
+                leftB   += tex.GetPixel(x, h / 2 + y).grayscale;
+                rightB  += tex.GetPixel(w - 1 - x, h / 2 + y).grayscale;
+                topB    += tex.GetPixel(w / 2 + x, h - 1 - y).grayscale;
+                bottomB += tex.GetPixel(w / 2 + x, y).grayscale;
+            }
+        }
+
+        // Horizontal bias rotated by heading
+        float lr = (rightB - leftB) / Mathf.Max(rightB + leftB, 0.01f);
+        float tb = (topB - bottomB) / Mathf.Max(topB + bottomB, 0.01f);
+
+        float cosH = Mathf.Cos(headingRad), sinH = Mathf.Sin(headingRad);
+        Vector3 dir = new Vector3(
+            sinH * 0.5f + lr * cosH * 0.3f,
+            -0.7f + tb * 0.3f,
+            cosH * 0.5f - lr * sinH * 0.3f);
+        return dir.normalized;
+    }
+
+    // -------------------------------------------------------------------------
     // SH computation (Ramamoorthi & Hanrahan 2001)
     // -------------------------------------------------------------------------
 
