@@ -422,6 +422,85 @@ public class SemanticPlacementEngine : MonoBehaviour
     }
 
     // -------------------------------------------------------------------------
+    // Auto-fit: shrink object to fit available MRUK space
+    // -------------------------------------------------------------------------
+
+#if UNITY_ANDROID && !UNITY_EDITOR
+    /// <summary>
+    /// Measures available clearance around the object using MRUK room data
+    /// and shrinks the object if it clips walls, ceiling, or furniture.
+    /// Called AFTER Place() so the object is already positioned.
+    /// </summary>
+    public void FitToAvailableSpace(GameObject obj, MRUKRoom room)
+    {
+        if (obj == null || room == null) return;
+
+        Bounds b = GetObjectBounds(obj);
+        Vector3 objPos = obj.transform.position;
+        float currentScale = obj.transform.localScale.x; // assume uniform
+
+        // Measure clearance in each direction from object center
+        float clearX = MeasureClearance(room, objPos, Vector3.right, b.extents.x * 2f);
+        float clearZ = MeasureClearance(room, objPos, Vector3.forward, b.extents.z * 2f);
+
+        // Get ceiling height for Y constraint
+        float floorY = GetFloorHeight(room);
+        var ceilAnchor = room.Anchors.FirstOrDefault(
+            a => a.HasAnyLabel(MRUKAnchor.SceneLabels.CEILING));
+        float ceilingY = ceilAnchor != null ? ceilAnchor.transform.position.y : 2.8f;
+        float clearY = ceilingY - floorY;
+
+        // Object dimensions in world space
+        float objW = b.size.x;
+        float objH = b.size.y;
+        float objD = b.size.z;
+
+        // Calculate how much we need to shrink to fit
+        float scaleX = clearX > 0.1f && objW > clearX ? clearX / objW : 1f;
+        float scaleY = clearY > 0.1f && objH > clearY ? (clearY * 0.85f) / objH : 1f; // 85% of room height max
+        float scaleZ = clearZ > 0.1f && objD > clearZ ? clearZ / objD : 1f;
+
+        float shrinkFactor = Mathf.Min(scaleX, scaleY, scaleZ);
+
+        if (shrinkFactor < 0.95f) // only shrink if significantly too big
+        {
+            shrinkFactor = Mathf.Max(shrinkFactor, 0.1f); // never shrink below 10%
+            obj.transform.localScale *= shrinkFactor;
+
+            // Re-place on floor after shrinking (recalculate Y)
+            Bounds newBounds = GetObjectBounds(obj);
+            Vector3 pos = obj.transform.position;
+            pos.y = floorY + newBounds.extents.y;
+            obj.transform.position = pos;
+
+            Debug.Log($"[SemanticPlacement] FitToSpace: shrunk \"{obj.name}\" by {shrinkFactor:F2}x " +
+                      $"(clearance: X={clearX:F2}m Z={clearZ:F2}m Y={clearY:F2}m)");
+        }
+        else
+        {
+            // Just fix Y position (bottom on floor)
+            Bounds newBounds = GetObjectBounds(obj);
+            Vector3 pos = obj.transform.position;
+            pos.y = floorY + newBounds.extents.y;
+            obj.transform.position = pos;
+        }
+    }
+
+    /// <summary>Measures clearance from position in a direction using physics + MRUK.</summary>
+    private static float MeasureClearance(MRUKRoom room, Vector3 from, Vector3 dir, float maxDist)
+    {
+        // Physics raycast to find nearest collider (walls, furniture from EffectMesh)
+        if (Physics.Raycast(from, dir, out RaycastHit hit, maxDist * 2f))
+            return hit.distance;
+        if (Physics.Raycast(from, -dir, out RaycastHit hitNeg, maxDist * 2f))
+            return hitNeg.distance;
+
+        // Fallback: room dimensions
+        return maxDist;
+    }
+#endif
+
+    // -------------------------------------------------------------------------
     // Geometry helpers
     // -------------------------------------------------------------------------
 

@@ -118,16 +118,12 @@ public class ARIADebugUI : MonoBehaviour
 #endif
         }
 
-        // Room scan: ANY trigger or A/B button captures photo
+        // Room scan: left trigger captures photo
         if (_scanActive && IsRunningOnQuest())
         {
 #if UNITY_ANDROID && !UNITY_EDITOR
-            if (OVRInput.GetDown(OVRInput.Button.PrimaryIndexTrigger) ||
-                OVRInput.GetDown(OVRInput.Button.SecondaryIndexTrigger) ||
-                OVRInput.GetDown(OVRInput.Button.One) ||   // A
-                OVRInput.GetDown(OVRInput.Button.Two) ||   // B
-                OVRInput.GetDown(OVRInput.Button.Three) || // X
-                OVRInput.GetDown(OVRInput.Button.Four))    // Y
+            if (OVRInput.GetDown(OVRInput.Button.SecondaryIndexTrigger) || // left trigger
+                OVRInput.GetDown(OVRInput.Button.Three))                   // X button (left)
                 CaptureRoomScanPhoto();
 #endif
         }
@@ -214,8 +210,8 @@ public class ARIADebugUI : MonoBehaviour
 
         // Trigger / A button = click
 #if UNITY_ANDROID && !UNITY_EDITOR
-        bool triggerDown = OVRInput.GetDown(OVRInput.Button.PrimaryIndexTrigger) ||
-                           OVRInput.GetDown(OVRInput.Button.One); // A button
+        bool triggerDown = OVRInput.GetDown(OVRInput.Button.SecondaryIndexTrigger) || // left trigger
+                           OVRInput.GetDown(OVRInput.Button.Three); // X button (left)
 #else
         bool triggerDown = Input.GetMouseButtonDown(0);
 #endif

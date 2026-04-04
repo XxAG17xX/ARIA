@@ -999,6 +999,13 @@ public class ARIAOrchestrator : MonoBehaviour
         // Place on the correct MRUK surface
         placementEngine?.Place(root, instr.surface_label);
 
+        // Auto-fit: shrink if object clips walls/ceiling/furniture
+#if UNITY_ANDROID && !UNITY_EDITOR
+        var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
+        if (fitRoom != null)
+            placementEngine?.FitToAvailableSpace(root, fitRoom);
+#endif
+
         // Lighting + interaction setup
         if (enableLighting)
         {

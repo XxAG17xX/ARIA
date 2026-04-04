@@ -323,7 +323,9 @@ public class SphericalHarmonicsLightingEstimator : MonoBehaviour
             if (lightDir.sqrMagnitude < 0.5f) lightDir = new Vector3(0f, -0.8f, 0.2f);
             sceneDirectionalLight.transform.rotation = Quaternion.LookRotation(lightDir);
             Color avgColor = totalColor / totalSamples;
-            sceneDirectionalLight.color = Color.Lerp(Color.white, avgColor, 0.5f);
+            sceneDirectionalLight.color = Color.Lerp(Color.white, avgColor, 0.4f);
+            // Keep intensity at least as bright as default (passthrough is often darker)
+            sceneDirectionalLight.intensity = Mathf.Max(sceneDirectionalLight.intensity, 1.0f);
         }
 
         // Save ARIA state for toggle
@@ -571,8 +573,19 @@ public class SphericalHarmonicsLightingEstimator : MonoBehaviour
         return sh;
     }
 
-    private static void ApplySH(SphericalHarmonicsL2 sh)
+    [Tooltip("Boost factor for SH probe intensity. Passthrough images are often underexposed. " +
+             "2.0 = double brightness. Adjust to match perceived room brightness.")]
+    [SerializeField] private float probeIntensityBoost = 2.5f;
+
+    private void ApplySH(SphericalHarmonicsL2 sh)
     {
+        // Boost SH coefficients to compensate for underexposed passthrough
+        if (probeIntensityBoost > 1.01f)
+        {
+            for (int c = 0; c < 3; c++)
+                for (int k = 0; k < 9; k++)
+                    sh[c, k] *= probeIntensityBoost;
+        }
         RenderSettings.ambientProbe = sh;
         RenderSettings.ambientMode  = AmbientMode.Skybox;
     }
@@ -776,7 +789,7 @@ public class SphericalHarmonicsLightingEstimator : MonoBehaviour
     // Editor fallback
     // -------------------------------------------------------------------------
 
-    private static void ApplyEditorFallbackProbe(Light directionalLight)
+    private void ApplyEditorFallbackProbe(Light directionalLight)
     {
         var sh = new SphericalHarmonicsL2();
         sh.Clear();
