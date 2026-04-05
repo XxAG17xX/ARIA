@@ -76,12 +76,42 @@ public class VoiceSDKConnector : MonoBehaviour
 #endif
     }
 
+    // One-shot recording mode: records voice, calls callback with transcript, then stops
+    private System.Action<string> _oneShotCallback;
+    private bool _oneShotMode;
+    public bool IsListening
+    {
+        get
+        {
+#if !UNITY_EDITOR
+            return _voice != null && _voice.MicActive;
+#else
+            return false;
+#endif
+        }
+    }
+
     /// <summary>Call from a controller button or hand gesture to start listening.</summary>
     public void StartListening()
     {
 #if !UNITY_EDITOR
         if (_voice != null && !_voice.MicActive)
             _voice.Activate();
+#endif
+    }
+
+    /// <summary>Record one voice command, call the callback with the transcript, then stop.</summary>
+    public void RecordOneShot(System.Action<string> callback)
+    {
+        _oneShotCallback = callback;
+        _oneShotMode = true;
+#if !UNITY_EDITOR
+        if (_voice != null)
+        {
+            Debug.Log("[ARIA] Voice one-shot: recording for adjustment...");
+            OnListeningChanged?.Invoke(true);
+            _voice.Activate();
+        }
 #endif
     }
 
@@ -110,6 +140,18 @@ public class VoiceSDKConnector : MonoBehaviour
 
         Debug.Log($"[ARIA] Voice transcript: \"{transcript}\"");
         OnFinalTranscript?.Invoke(transcript);
+
+        // One-shot mode: return transcript to callback, don't trigger pipeline
+        if (_oneShotMode && _oneShotCallback != null)
+        {
+            _oneShotMode = false;
+            var cb = _oneShotCallback;
+            _oneShotCallback = null;
+            OnListeningChanged?.Invoke(false);
+            cb.Invoke(transcript);
+            return;
+        }
+
         _orchestrator.ProcessVoiceCommand(transcript);
 
         // Re-activate for next command if auto mode

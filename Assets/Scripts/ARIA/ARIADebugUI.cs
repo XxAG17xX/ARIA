@@ -327,24 +327,23 @@ public class ARIADebugUI : MonoBehaviour
         MakeButton(_mainPanel.transform, "DemoBed", "Spawn Bed (floor)",
             new Vector2(-145, y), new Vector2(270, 48),
             () => StartCountdownForAction("Bed on floor",
-                () => _orchestrator.SpawnBundledGlb("bed.glb", "FLOOR", 0.5f, "bed", 1.4f, 2.0f)));
+                () => { _orchestrator.SetUserContext("spawn a bed"); _orchestrator.SpawnBundledGlb("bed.glb", "FLOOR", 0.5f, "bed", 1.4f, 2.0f); }));
         MakeButton(_mainPanel.transform, "DemoLamp", "Spawn Lamp (floor)",
             new Vector2(145, y), new Vector2(270, 48),
             () => StartCountdownForAction("Lamp on floor",
-                () => _orchestrator.SpawnBundledGlb("lamp.glb", "FLOOR", 1.5f, "lamp")));
+                () => { _orchestrator.SetUserContext("spawn a lamp"); _orchestrator.SpawnBundledGlb("lamp.glb", "FLOOR", 1.5f, "lamp"); }));
         y -= 58f;
 
         MakeButton(_mainPanel.transform, "DemoWall", "Spawn Wall Art (wall)",
             new Vector2(0, y), new Vector2(560, 48),
             () => StartCountdownForAction("Wall art on wall",
-                () => _orchestrator.SpawnBundledGlb("wall_art.glb", "WALL_FACE", 0.6f, "wall_art", 0.8f, 0.05f)));
+                () => { _orchestrator.SetUserContext("hang a painting on the wall"); _orchestrator.SpawnBundledGlb("wall_art.glb", "WALL_FACE", 0.6f, "wall_art", 0.8f, 0.05f); }));
         y -= 58f;
 
         // Adjust with Claude — user looks at target, then presses
-        MakeButton(_mainPanel.transform, "BtnAdjust", "Adjust with Claude (look first!)",
+        MakeButton(_mainPanel.transform, "BtnAdjust", "Adjust with Claude (speak + look)",
             new Vector2(0, y), new Vector2(560, 48),
-            () => StartCountdownForAction("Claude adjustment",
-                () => _orchestrator.AdjustLastSpawnWithClaude()));
+            () => StartVoiceAdjust());
         y -= 58f;
 
         // Toggle EffectMesh visibility
@@ -539,6 +538,46 @@ public class ARIADebugUI : MonoBehaviour
         if (_countdownCmdText != null)
             _countdownCmdText.text = $"Look {ScanDirections[_scanPhase]} and pull trigger ({_scanPhase + 1}/4)";
         SetStatus($"Room scan: look {ScanDirections[_scanPhase]}...");
+    }
+
+    // -------------------------------------------------------------------------
+    // Voice-assisted Claude adjustment
+    // -------------------------------------------------------------------------
+
+    private void StartVoiceAdjust()
+    {
+        if (_voiceConnector != null)
+        {
+            // Step 1: Record voice command
+            SetStatus("Speak your adjustment... (e.g. 'move to the table corner')");
+            if (_countdownPanel != null)
+            {
+                _countdownPanel.SetActive(true);
+                _mainPanel.SetActive(false);
+                _countdownNumText.text = "\ud83c\udf99"; // microphone emoji
+                _countdownCmdText.text = "Speak now... then look at target";
+            }
+
+            _voiceConnector.RecordOneShot(transcript =>
+            {
+                // Step 2: Voice captured — show transcript, then countdown to capture image
+                SetStatus($"Heard: \"{transcript}\" — now look at target...");
+                _orchestrator.SetUserContext(transcript);
+
+                if (_countdownCmdText != null)
+                    _countdownCmdText.text = $"\"{transcript}\"";
+
+                // Step 3: Start countdown for image capture
+                StartCountdownForAction("Claude adjustment",
+                    () => _orchestrator.AdjustLastSpawnWithClaude());
+            });
+        }
+        else
+        {
+            // No voice SDK — just do countdown + Claude without voice
+            StartCountdownForAction("Claude adjustment",
+                () => _orchestrator.AdjustLastSpawnWithClaude());
+        }
     }
 
     private bool _effectMeshHidden;

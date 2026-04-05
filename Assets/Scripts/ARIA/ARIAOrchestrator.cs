@@ -53,7 +53,7 @@ public class ARIAOrchestrator : MonoBehaviour
     [Tooltip("Which API to use for 3D mesh generation. Switch to save credits.")]
     [SerializeField] private MeshProvider meshProvider = MeshProvider.Tripo3D;
 
-    // API keys — loaded from config.json at runtime, never hardcoded
+    // API keys — loaded from StreamingAssets/config.json at runtime
     private string _claudeKey;
     private string _geminiKey;
     private string _hitemAccessKey;
@@ -62,6 +62,12 @@ public class ARIAOrchestrator : MonoBehaviour
 
     // Passthrough camera for frame capture (WebCamTexture, Quest 3/3S only)
     private WebCamTexture _webcam;
+
+    // Last user context — voice command or button label, passed to Claude for adjustment
+    private string _lastUserCommand = "";
+
+    /// <summary>Set by VoiceSDKConnector or ARIADebugUI before adjustment calls.</summary>
+    public void SetUserContext(string command) { _lastUserCommand = command ?? ""; }
 
     // Tracks grey-mesh previews so they can be swapped when the textured mesh arrives
     private readonly Dictionary<string, GameObject> _previews = new();
@@ -234,6 +240,7 @@ public class ARIAOrchestrator : MonoBehaviour
     public async void ProcessVoiceCommand(string transcript)
     {
         Debug.Log($"[ARIA] Voice command: \"{transcript}\"");
+        _lastUserCommand = transcript; // save for Claude adjustment context
         SetStatus("Capturing room...");
 
         // Capture passthrough frame ONCE — reused for Claude API and SH estimator
@@ -501,12 +508,15 @@ public class ARIAOrchestrator : MonoBehaviour
 
         if (req.result != UnityWebRequest.Result.Success)
         {
-            Debug.LogWarning($"[ARIA] Claude refinement failed ({req.error}) — using original dimensions.");
+            string errBody = req.downloadHandler?.text ?? "(no body)";
+            Debug.LogError($"[ARIA] Claude API FAILED: {req.error} | {req.responseCode} | {errBody}");
+            SetStatus($"Claude FAILED: {req.error}");
             return original;
         }
 
         try
         {
+            Debug.Log($"[ARIA] Claude response received ({req.downloadHandler.text.Length} chars)");
             var resp = JsonConvert.DeserializeObject<ClaudeResponse>(req.downloadHandler.text);
             string json = StripCodeFences(resp.content[0].text);
             var refined = JsonConvert.DeserializeObject<PlacementInstruction>(json);
@@ -528,6 +538,125 @@ public class ARIAOrchestrator : MonoBehaviour
         catch (Exception e)
         {
             Debug.LogWarning($"[ARIA] Claude refinement parse error: {e.Message} — using original.");
+            return original;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Claude adjustment — dedicated method for post-spawn visual refinement
+    // -------------------------------------------------------------------------
+
+    private async Task<PlacementInstruction> CallClaudeAdjustmentAsync(
+        PlacementInstruction original, byte[] passthroughJpeg, string mrukJson,
+        Vector3 userPosition, Vector3 gazeDirection)
+    {
+        var content = new List<object>();
+
+        content.Add(new
+        {
+            type = "image",
+            source = new { type = "base64", media_type = "image/jpeg",
+                           data = Convert.ToBase64String(passthroughJpeg) }
+        });
+
+        content.Add(new
+        {
+            type = "text",
+            text = $"=== ROOM SCAN DATA (Meta Quest 3 MRUK — real room boundaries) ===\n{mrukJson}\n\n" +
+                   $"=== USER STATE ===\n" +
+                   $"Position in room: ({userPosition.x:F2}, {userPosition.y:F2}, {userPosition.z:F2}) metres\n" +
+                   $"Gaze direction: ({gazeDirection.x:F2}, {gazeDirection.y:F2}, {gazeDirection.z:F2})\n" +
+                   $"The IMAGE CENTER is exactly where the user is looking.\n\n" +
+                   $"=== VIRTUAL OBJECT TO PLACE ===\n" +
+                   $"Object: \"{original.category}\"\n" +
+                   $"Current world size: {original.height_metres:F2}m H x {original.width_metres:F2}m W x {original.depth_metres:F2}m D\n" +
+                   $"Current position: ({original.light_range:F2}, {original.light_intensity:F2}, 0) (approximate)\n\n" +
+                   (string.IsNullOrEmpty(_lastUserCommand) ? "" :
+                   $"=== USER VOICE COMMAND / CONTEXT ===\n\"{_lastUserCommand}\"\n" +
+                   "Use this to understand the user's INTENT — what they want, where they want it, " +
+                   "and any specific instructions about placement or style.\n\n") +
+                   "=== OTHER SPAWNED OBJECTS IN SCENE ===\n" + GetSpawnedObjectsSummary() + "\n\n" +
+                   "=== YOUR TASK ===\n" +
+                   "You are the spatial reasoning AI for ARIA, a mixed reality interior design system on Meta Quest 3.\n" +
+                   "The user is wearing a VR headset with passthrough (they see the real room). They spawned a virtual object " +
+                   "and now want you to decide the BEST placement and scale based on what you see.\n\n" +
+                   "HOW TO USE THE IMAGE:\n" +
+                   "- This is a RAW passthrough camera image — you see the REAL room exactly as the user sees it\n" +
+                   "- The CENTER of the image is where the user is looking (their gaze target)\n" +
+                   "- Look at what SURFACE is at the center: is it a table/desk surface? A wall? The floor?\n" +
+                   "- Look at OBJECTS on that surface: keyboard, mouse, phone, bottles, cables — the virtual object must NOT overlap these\n" +
+                   "- Look at CLEAR AREAS near the gaze center where the virtual object could fit\n" +
+                   "- If the user is looking at a small area (e.g., corner of a desk), the object must be scaled DOWN to fit\n\n" +
+                   "HOW TO USE MRUK DATA:\n" +
+                   "- The room scan gives you exact dimensions of walls, floor, ceiling, furniture in metres\n" +
+                   "- Use these to determine maximum possible size (object can't be bigger than the room)\n" +
+                   "- surface_label tells the placement engine WHICH real surface to attach the object to\n" +
+                   "- Cross-reference the image (what you SEE) with the MRUK data (exact measurements)\n\n" +
+                   "RULES:\n" +
+                   "1. surface_label: FLOOR / WALL_FACE / TABLE / BED / COUCH / CEILING\n" +
+                   "   - Judge from the IMAGE what surface the user is looking at\n" +
+                   "   - TABLE = desk, table, any horizontal elevated surface with objects on it\n" +
+                   "   - FLOOR = ground/floor visible in the image\n" +
+                   "   - WALL_FACE = vertical wall surface\n\n" +
+                   "2. scale_factor: A SINGLE float (0.02 to 2.0) for UNIFORM proportional resize\n" +
+                   "   - 1.0 = current size (real-world furniture scale)\n" +
+                   "   - 0.1 = miniature/figurine (10% of real size, good for placing on desks)\n" +
+                   "   - 0.05 = tiny decorative item\n" +
+                   "   - NEVER change height/width/depth independently — ONLY scale_factor\n" +
+                   "   - If surface is TABLE: scale_factor should be 0.05–0.2 (miniature to fit on desk)\n" +
+                   "   - If surface is FLOOR: scale_factor 0.5–1.0 (real furniture size, fit the room)\n" +
+                   "   - If surface is WALL_FACE: scale_factor 0.3–0.8 (painting/art size)\n\n" +
+                   "3. AVOID OVERLAP with real objects visible in the image\n" +
+                   "   - Don't place on top of keyboards, mice, phones, shoes, bags, bottles\n" +
+                   "   - Find the nearest CLEAR area to the gaze center\n\n" +
+                   "Return JSON ONLY:\n" +
+                   "{\"surface_label\": \"TABLE\", \"scale_factor\": 0.1, \"category\": \"lamp\", " +
+                   "\"reasoning\": \"User looking at desk corner near keyboard, scaling to miniature to fit clear area\"}"
+        });
+
+        string body = JsonConvert.SerializeObject(new
+        {
+            model = "claude-sonnet-4-6",
+            max_tokens = 256,
+            system = "You are the spatial reasoning AI for ARIA, a mixed reality furniture placement system on Meta Quest 3. " +
+                     "You receive: (1) a passthrough camera image of the real room, (2) MRUK room scan data with exact dimensions, " +
+                     "(3) user position and gaze direction. " +
+                     "Your job: decide surface_label and scale_factor for a virtual object. " +
+                     "scale_factor is a SINGLE float for UNIFORM proportional scaling — NEVER change individual dimensions. " +
+                     "Analyze the image to identify the surface the user is looking at and find a clear area to place the object. " +
+                     "Return valid JSON only, no explanation outside the JSON.",
+            messages = new[] { new { role = "user", content } }
+        });
+
+        using var req = new UnityWebRequest("https://api.anthropic.com/v1/messages", "POST");
+        req.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(body));
+        req.downloadHandler = new DownloadHandlerBuffer();
+        req.timeout = 30;
+        req.SetRequestHeader("x-api-key", _claudeKey);
+        req.SetRequestHeader("anthropic-version", "2023-06-01");
+        req.SetRequestHeader("content-type", "application/json");
+
+        await AwaitRequest(req.SendWebRequest());
+
+        if (req.result != UnityWebRequest.Result.Success)
+        {
+            string errBody = req.downloadHandler?.text ?? "(no body)";
+            Debug.LogError($"[ARIA] Claude adjustment FAILED: {req.error} | {req.responseCode} | {errBody}");
+            SetStatus($"Claude FAILED: {req.responseCode} {req.error}");
+            return original;
+        }
+
+        try
+        {
+            Debug.Log($"[ARIA] Claude adjustment response: {req.downloadHandler.text.Substring(0, Mathf.Min(200, req.downloadHandler.text.Length))}...");
+            var resp = JsonConvert.DeserializeObject<ClaudeResponse>(req.downloadHandler.text);
+            string json = StripCodeFences(resp.content[0].text);
+            return JsonConvert.DeserializeObject<PlacementInstruction>(json);
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[ARIA] Claude adjustment parse error: {e.Message}");
+            SetStatus($"Claude parse error: {e.Message}");
             return original;
         }
     }
@@ -1116,19 +1245,74 @@ public class ARIAOrchestrator : MonoBehaviour
         glbBytes = File.ReadAllBytes(path);
 #endif
 
-        var instr = new PlacementInstruction
-        {
-            prompt        = category ?? Path.GetFileNameWithoutExtension(filename),
-            surface_label = surfaceLabel,
-            height_metres = height,
-            width_metres  = width,
-            depth_metres  = depth,
-            category      = category ?? Path.GetFileNameWithoutExtension(filename)
-        };
+        string name = category ?? Path.GetFileNameWithoutExtension(filename);
 
-        // Spawn with MRUK-only placement (no Claude, no photo yet)
-        await SpawnFromGlbBytes(glbBytes, instr, null);
-        SetStatus($"Spawned: {instr.category}. Look at target, tap 'Adjust with Claude'.");
+        // Spawn the GLB first (unscaled, at origin temporarily)
+        var root = new GameObject(name);
+        root.transform.SetParent(spawnRoot != null ? spawnRoot : transform);
+        root.layer = LayerMask.NameToLayer("Ignore Raycast"); // don't interfere with gaze raycast
+
+        var gltf = new GltfImport();
+        bool ok = await gltf.Load(glbBytes);
+        if (!ok) { Debug.LogError($"[ARIA] GLTFast failed: {name}"); Destroy(root); return; }
+        await gltf.InstantiateMainSceneAsync(root.transform);
+        FixPinkMaterials(root);
+
+        // Scale to initial real-world dimensions
+        scaleSystem?.ApplyScale(root, height, category, width, depth);
+
+        // Place at crosshair hit point — wherever the user was looking
+        Camera cam = Camera.main;
+        if (cam != null && Physics.Raycast(cam.transform.position, cam.transform.forward, out RaycastHit hit, 10f))
+        {
+            // Place at the hit point, offset so object doesn't clip into the surface
+            Bounds b = CalculateMeshBounds(root);
+            Vector3 pos = hit.point;
+
+            // If hit a horizontal surface (floor/table), lift object so bottom sits on surface
+            if (Vector3.Dot(hit.normal, Vector3.up) > 0.5f)
+                pos.y += b.extents.y;
+            // If hit a vertical surface (wall), offset from wall
+            else
+                pos += hit.normal * (Mathf.Min(b.extents.x, b.extents.z) + 0.05f);
+
+            root.transform.position = pos;
+
+            // Face the user
+            Vector3 toUser = cam.transform.position - pos;
+            toUser.y = 0;
+            if (toUser.sqrMagnitude > 0.01f)
+                root.transform.rotation = Quaternion.LookRotation(toUser.normalized);
+
+            Debug.Log($"[ARIA] Spawned {name} at crosshair hit: {pos} (surface normal: {hit.normal})");
+        }
+        else
+        {
+            // No hit — place 1.5m in front of user on floor
+            Vector3 fwd = cam != null ? cam.transform.forward : Vector3.forward;
+            fwd.y = 0; fwd.Normalize();
+            Bounds b = CalculateMeshBounds(root);
+            root.transform.position = cam.transform.position + fwd * 1.5f + Vector3.up * b.extents.y;
+            Debug.Log($"[ARIA] Spawned {name} at fallback (no raycast hit)");
+        }
+
+        // Auto-fit to available MRUK space (won't hit other spawned objects due to layer)
+#if UNITY_ANDROID && !UNITY_EDITOR
+        var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
+        if (fitRoom != null)
+            placementEngine?.FitToAvailableSpace(root, fitRoom);
+#endif
+
+        // Reset layer so future raycasts CAN hit this object
+        root.layer = 0;
+
+        // Physics
+        if (enablePhysics) AddPhysicsAndInteraction(root);
+
+        // Reflection probe
+        AddReflectionProbe(root);
+
+        SetStatus($"Spawned: {name}. Look at target, tap 'Adjust with Claude'.");
     }
 
     // -------------------------------------------------------------------------
@@ -1151,7 +1335,8 @@ public class ARIAOrchestrator : MonoBehaviour
 
         if (string.IsNullOrEmpty(_claudeKey))
         {
-            SetStatus("Claude API key missing — check config.json");
+            SetStatus($"Claude API key missing! Key length: {(_claudeKey ?? "null").Length}");
+            Debug.LogError($"[ARIA] Claude key is empty/null. Key: '{_claudeKey}'");
             return;
         }
 
@@ -1163,48 +1348,62 @@ public class ARIAOrchestrator : MonoBehaviour
         byte[] jpeg = await CapturePassthroughFrameAsync();
         if (jpeg == null)
         {
-            SetStatus("Passthrough capture failed.");
+            SetStatus("Passthrough capture failed — camera not ready.");
+            Debug.LogError("[ARIA] CapturePassthroughFrameAsync returned null");
             return;
         }
 
-        SetStatus($"Claude analyzing {objName}...");
+        SetStatus($"Claude analyzing {objName} ({jpeg.Length/1024}KB image)...");
+        Debug.Log($"[ARIA] Sending to Claude: {objName}, image={jpeg.Length/1024}KB, key={_claudeKey.Substring(0,10)}...");
+
         string mrukJson = SerializeMRUKData();
 
+        // Get actual world-space bounds of the spawned object
+        Bounds objBounds = CalculateMeshBounds(lastSpawn.gameObject);
+        Camera cam = Camera.main;
+        Vector3 gazePos = cam != null ? cam.transform.position : Vector3.zero;
+        Vector3 gazeFwd = cam != null ? cam.transform.forward : Vector3.forward;
+
+        Vector3 objPos = lastSpawn.position;
         var instr = new PlacementInstruction
         {
             prompt = objName,
             category = objName,
-            surface_label = "FLOOR", // will be refined by Claude
-            height_metres = lastSpawn.localScale.y,
-            width_metres = lastSpawn.localScale.x,
-            depth_metres = lastSpawn.localScale.z
+            surface_label = "AUTO",
+            height_metres = objBounds.size.y,
+            width_metres = objBounds.size.x,
+            depth_metres = objBounds.size.z,
+            // Repurpose light fields to pass object position to prompt
+            light_range = objPos.x,
+            light_intensity = objPos.y
         };
 
-        var refined = await CallClaudeRefinementAsync(instr, jpeg, mrukJson);
+        // Send passthrough image with rich context
+        var refined = await CallClaudeAdjustmentAsync(instr, jpeg, mrukJson, gazePos, gazeFwd);
 
-        bool changed = Mathf.Abs(refined.height_metres - instr.height_metres) > 0.02f ||
-                       Mathf.Abs(refined.width_metres - instr.width_metres) > 0.02f ||
-                       Mathf.Abs(refined.depth_metres - instr.depth_metres) > 0.02f ||
-                       (refined.surface_label != null && refined.surface_label != instr.surface_label);
+        // Claude returns scale_factor (uniform) + surface_label + reasoning
+        float scaleFactor = refined.scale_factor > 0.01f ? refined.scale_factor : 1f;
+        string surface = refined.surface_label ?? "FLOOR";
+        string reasoning = refined.reasoning ?? "";
 
-        if (changed)
+        // Apply uniform scale (proportional, no deformation)
+        if (scaleFactor > 0.01f && Mathf.Abs(scaleFactor - 1f) > 0.05f)
         {
-            scaleSystem?.ApplyScale(lastSpawn.gameObject, refined.height_metres, refined.category,
-                                    refined.width_metres, refined.depth_metres);
-            placementEngine?.Place(lastSpawn.gameObject, refined.surface_label ?? instr.surface_label);
+            lastSpawn.localScale *= scaleFactor;
+            Debug.Log($"[ARIA] Claude scale: {scaleFactor:F2}x (uniform)");
+        }
+
+        // Re-place on the surface Claude decided
+        placementEngine?.Place(lastSpawn.gameObject, surface);
 
 #if UNITY_ANDROID && !UNITY_EDITOR
-            var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
-            if (fitRoom != null)
-                placementEngine?.FitToAvailableSpace(lastSpawn.gameObject, fitRoom);
+        var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
+        if (fitRoom != null)
+            placementEngine?.FitToAvailableSpace(lastSpawn.gameObject, fitRoom);
 #endif
-            SetStatus($"Claude adjusted {objName}: h={refined.height_metres:F2}m " +
-                      $"surface={refined.surface_label}");
-        }
-        else
-        {
-            SetStatus($"Claude: {objName} looks good, no changes.");
-        }
+
+        SetStatus($"Claude: {objName} → {surface}, scale {scaleFactor:F2}x. {reasoning}");
+        Debug.Log($"[ARIA] Claude adjustment: surface={surface}, scale={scaleFactor:F2}x, reason={reasoning}");
     }
 
     // -------------------------------------------------------------------------
@@ -1433,6 +1632,21 @@ public class ARIAOrchestrator : MonoBehaviour
         return b;
     }
 
+    private string GetSpawnedObjectsSummary()
+    {
+        Transform root = spawnRoot != null ? spawnRoot : transform;
+        if (root.childCount == 0) return "None — this is the first object.";
+
+        var sb = new StringBuilder();
+        foreach (Transform child in root)
+        {
+            Bounds b = CalculateMeshBounds(child.gameObject);
+            sb.AppendLine($"- \"{child.name}\" at ({child.position.x:F2}, {child.position.y:F2}, {child.position.z:F2}), " +
+                          $"size: {b.size.x:F2}x{b.size.y:F2}x{b.size.z:F2}m");
+        }
+        return sb.ToString();
+    }
+
     private void SetStatus(string msg)
     {
         OnStatusChanged?.Invoke(msg);
@@ -1451,9 +1665,11 @@ public class PlacementInstruction
     public string   prompt;
     public string   surface_label;
     public float    height_metres;
-    public float    width_metres;    // contextual width (e.g. bed width relative to room)
-    public float    depth_metres;    // contextual depth
+    public float    width_metres;
+    public float    depth_metres;
     public string   category;
+    public float    scale_factor;    // uniform scale (0.05–2.0), used by Claude adjustment
+    public string   reasoning;      // Claude's explanation of its decision
     // Virtual light source fields (optional — only set when emits_light = true)
     public bool     emits_light;
     public string   light_type;
