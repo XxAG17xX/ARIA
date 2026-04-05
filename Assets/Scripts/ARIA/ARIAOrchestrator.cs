@@ -53,7 +53,7 @@ public class ARIAOrchestrator : MonoBehaviour
     [Tooltip("Which API to use for 3D mesh generation. Switch to save credits.")]
     [SerializeField] private MeshProvider meshProvider = MeshProvider.Tripo3D;
 
-    // API keys — loaded from StreamingAssets/config.json at runtime
+    // API keys — loaded from StreamingAssets/config.json, hardcode locally for dev
     private string _claudeKey;
     private string _geminiKey;
     private string _hitemAccessKey;
@@ -1261,39 +1261,87 @@ public class ARIAOrchestrator : MonoBehaviour
         // Scale to initial real-world dimensions
         scaleSystem?.ApplyScale(root, height, category, width, depth);
 
-        // Place at crosshair hit point — wherever the user was looking
+        // Wait one frame for mesh renderers to initialize bounds properly
+        await Task.Yield();
+
+        // Place using Meta's EnvironmentRaycastManager (depth-based, accurate surface detection)
         Camera cam = Camera.main;
-        if (cam != null && Physics.Raycast(cam.transform.position, cam.transform.forward, out RaycastHit hit, 10f))
+        bool placed = false;
+
+#if UNITY_ANDROID && !UNITY_EDITOR
+        var envRaycastMgr = FindFirstObjectByType<EnvironmentRaycastManager>();
+        if (envRaycastMgr != null && cam != null)
         {
-            // Place at the hit point, offset so object doesn't clip into the surface
+            Ray gazeRay = new Ray(cam.transform.position, cam.transform.forward);
             Bounds b = CalculateMeshBounds(root);
-            Vector3 pos = hit.point;
+            Vector3 objSize = b.size;
+            if (objSize.magnitude < 0.01f) objSize = Vector3.one * 0.3f;
 
-            // If hit a horizontal surface (floor/table), lift object so bottom sits on surface
-            if (Vector3.Dot(hit.normal, Vector3.up) > 0.5f)
-                pos.y += b.extents.y;
-            // If hit a vertical surface (wall), offset from wall
-            else
-                pos += hit.normal * (Mathf.Min(b.extents.x, b.extents.z) + 0.05f);
+            // PlaceBox finds a surface spot where the object fits
+            Vector3 upward = Vector3.up;
+            if (envRaycastMgr.Raycast(gazeRay, out var envHit, 10f))
+            {
+                bool isVertical = Mathf.Abs(Vector3.Dot(envHit.normal, Vector3.up)) < 0.3f;
+                upward = isVertical ? Vector3.up : Vector3.ProjectOnPlane(cam.transform.up, Vector3.Cross(gazeRay.direction, Vector3.up));
 
-            root.transform.position = pos;
+                if (envRaycastMgr.PlaceBox(gazeRay, objSize, upward, out var placeHit))
+                {
+                    // Correct rotation: forward along surface, normal as up
+                    Vector3 forward = Vector3.Cross(placeHit.normal, Vector3.Cross(cam.transform.forward, placeHit.normal).normalized);
+                    root.transform.rotation = Quaternion.LookRotation(forward, placeHit.normal);
+                    root.transform.position = placeHit.point;
 
-            // Face the user
-            Vector3 toUser = cam.transform.position - pos;
-            toUser.y = 0;
-            if (toUser.sqrMagnitude > 0.01f)
-                root.transform.rotation = Quaternion.LookRotation(toUser.normalized);
+                    // For horizontal surfaces, lift so bottom sits on surface
+                    if (!isVertical)
+                    {
+                        float bottomOffset = root.transform.position.y - CalculateMeshBounds(root).min.y;
+                        root.transform.position += Vector3.up * bottomOffset;
+                    }
 
-            Debug.Log($"[ARIA] Spawned {name} at crosshair hit: {pos} (surface normal: {hit.normal})");
+                    placed = true;
+                    Debug.Log($"[ARIA] Spawned {name} via EnvironmentRaycast at {placeHit.point} (normal={placeHit.normal})");
+                }
+                else
+                {
+                    // PlaceBox failed but raycast hit — use hit point directly
+                    root.transform.position = envHit.point;
+                    if (!isVertical)
+                    {
+                        float bottomOffset = root.transform.position.y - CalculateMeshBounds(root).min.y;
+                        root.transform.position += Vector3.up * bottomOffset;
+                        Vector3 toUser = cam.transform.position - root.transform.position;
+                        toUser.y = 0;
+                        if (toUser.sqrMagnitude > 0.01f)
+                            root.transform.rotation = Quaternion.LookRotation(toUser.normalized);
+                    }
+                    else
+                    {
+                        root.transform.rotation = Quaternion.LookRotation(envHit.normal, Vector3.up);
+                    }
+                    placed = true;
+                    Debug.Log($"[ARIA] Spawned {name} via EnvRaycast fallback at {envHit.point}");
+                }
+            }
         }
-        else
+#endif
+
+        if (!placed && cam != null)
         {
-            // No hit — place 1.5m in front of user on floor
-            Vector3 fwd = cam != null ? cam.transform.forward : Vector3.forward;
-            fwd.y = 0; fwd.Normalize();
-            Bounds b = CalculateMeshBounds(root);
-            root.transform.position = cam.transform.position + fwd * 1.5f + Vector3.up * b.extents.y;
-            Debug.Log($"[ARIA] Spawned {name} at fallback (no raycast hit)");
+            // Final fallback: Physics.Raycast or 1.5m ahead
+            if (Physics.Raycast(cam.transform.position, cam.transform.forward, out RaycastHit hit, 10f))
+            {
+                root.transform.position = hit.point;
+                float bottomOffset = root.transform.position.y - CalculateMeshBounds(root).min.y;
+                root.transform.position += Vector3.up * Mathf.Max(bottomOffset, 0);
+            }
+            else
+            {
+                Vector3 fwd = cam.transform.forward; fwd.y = 0; fwd.Normalize();
+                Bounds b = CalculateMeshBounds(root);
+                float bottomOffset = root.transform.position.y - b.min.y;
+                root.transform.position = cam.transform.position + fwd * 1.5f + Vector3.up * bottomOffset;
+            }
+            Debug.Log($"[ARIA] Spawned {name} via Physics fallback");
         }
 
         // Auto-fit to available MRUK space (won't hit other spawned objects due to layer)
@@ -1407,43 +1455,7 @@ public class ARIAOrchestrator : MonoBehaviour
     }
 
     // -------------------------------------------------------------------------
-    // Room lighting scan — 4-photo 360° capture for accurate SH estimation
-    // -------------------------------------------------------------------------
-
-    private byte[][] _roomScanPhotos;
-    private float[]  _roomScanHeadings;
-    private int      _roomScanCount;
-    public bool HasRoomScan => _roomScanCount >= 4;
-
-    /// <summary>Initialise storage for a new 4-photo room scan.</summary>
-    public void BeginRoomLightingScan()
-    {
-        _roomScanPhotos = new byte[4][];
-        _roomScanHeadings = new float[4];
-        _roomScanCount = 0;
-        Debug.Log("[ARIA] Room lighting scan started.");
-    }
-
-    /// <summary>Capture and store one photo for the room scan.</summary>
-    public async Task<bool> CaptureRoomScanPhoto(int phase)
-    {
-        byte[] jpeg = await CapturePassthroughFrameAsync();
-        if (jpeg == null || jpeg.Length == 0)
-        {
-            Debug.LogWarning($"[ARIA] Room scan photo {phase} capture failed.");
-            return false;
-        }
-
-        Camera cam = Camera.main;
-        float heading = cam != null ? cam.transform.eulerAngles.y : phase * 90f;
-
-        _roomScanPhotos[phase] = jpeg;
-        _roomScanHeadings[phase] = heading;
-        _roomScanCount = phase + 1;
-
-        Debug.Log($"[ARIA] Room scan photo {phase} captured (heading: {heading:F1}°, {jpeg.Length / 1024}KB)");
-        return true;
-    }
+    // Room lighting scan removed — now uses single-frame analysis + PTRL shader
 
     // -------------------------------------------------------------------------
     // Retroactive lighting — call from debug UI to apply lighting to all spawned objects
@@ -1458,27 +1470,13 @@ public class ARIAOrchestrator : MonoBehaviour
         Transform root = spawnRoot != null ? spawnRoot : transform;
         int count = 0;
 
-        // Use room scan data if available (4-photo 360°), otherwise single frame
-        if (HasRoomScan && shEstimator != null)
-        {
-            shEstimator.EstimateFromRoomScan(_roomScanPhotos, _roomScanHeadings,
-                                              sceneDirectionalLight);
-            Debug.Log("[ARIA] Applied 4-photo room scan lighting.");
-        }
-        else
-        {
-            byte[] jpeg = await CapturePassthroughFrameAsync();
-            bool firstChild = true;
-            foreach (Transform child in root)
-            {
-                if (firstChild)
-                {
-                    shEstimator?.EstimateLighting(jpeg, sceneDirectionalLight, child.gameObject);
-                    firstChild = false;
-                }
-            }
-            Debug.Log("[ARIA] Applied single-frame lighting (no room scan).");
-        }
+        // Capture fresh passthrough frame and analyze lighting
+        SetStatus("Analyzing room lighting...");
+        byte[] jpeg = await CapturePassthroughFrameAsync();
+        shEstimator?.EstimateLighting(jpeg, sceneDirectionalLight, null);
+
+        // Re-configure shadow receiver with PTRL shader (in case new surfaces spawned)
+        shadowReceiver?.Reconfigure();
 
         foreach (Transform child in root)
         {

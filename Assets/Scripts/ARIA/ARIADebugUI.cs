@@ -35,11 +35,7 @@ public class ARIADebugUI : MonoBehaviour
     private System.Action _pendingAction; // for demo spawns
     private const float CountdownSeconds = 3f;
 
-    // Room lighting scan state
-    private bool _scanActive;
-    private int  _scanPhase; // 0=forward, 1=right, 2=back, 3=left
-    private static readonly string[] ScanDirections = { "FORWARD", "RIGHT", "BACK", "LEFT" };
-    private static readonly string[] ScanArrows     = { "^", ">", "v", "<" };
+    // Room scan removed — lighting now uses PTRL + single-frame analysis
 
     // VR Canvas UI elements (Quest)
     private Canvas     _vrCanvas;
@@ -109,8 +105,8 @@ public class ARIADebugUI : MonoBehaviour
 
     private void Update()
     {
-        // Left Y button toggles menu — but NOT during room scan
-        if (IsRunningOnQuest() && _canvasGO != null && !_scanActive)
+        // Left Y button toggles menu
+        if (IsRunningOnQuest() && _canvasGO != null)
         {
 #if UNITY_ANDROID && !UNITY_EDITOR
             if (OVRInput.GetDown(OVRInput.Button.Four)) // Y button on left controller
@@ -118,18 +114,11 @@ public class ARIADebugUI : MonoBehaviour
 #endif
         }
 
-        // Room scan: left trigger captures photo
-        if (_scanActive && IsRunningOnQuest())
-        {
-#if UNITY_ANDROID && !UNITY_EDITOR
-            if (OVRInput.GetDown(OVRInput.Button.SecondaryIndexTrigger) || // left trigger
-                OVRInput.GetDown(OVRInput.Button.Three))                   // X button (left)
-                CaptureRoomScanPhoto();
-#endif
-        }
+        // Voice recording timeout check
+        CheckVoiceTimeout();
 
-        // Gaze-based VR pointer (only when menu is visible, not during scan)
-        if (IsRunningOnQuest() && _vrCanvas != null && _menuVisible && !_scanActive)
+        // Gaze-based VR pointer (only when menu is visible)
+        if (IsRunningOnQuest() && _vrCanvas != null && _menuVisible)
             UpdateGazePointer();
 
         if (!_countdownActive) return;
@@ -303,11 +292,7 @@ public class ARIADebugUI : MonoBehaviour
             new Vector2(0, y), new Vector2(560, 55), () => StartCountdown(quickCommand3));
         y -= 75f;
 
-        // Room scan button
-        MakeButton(_mainPanel.transform, "BtnScan", "Scan Room Lighting (4 photos)",
-            new Vector2(0, y), new Vector2(560, 50),
-            () => StartRoomLightingScan());
-        y -= 58f;
+        // Room scan removed — lighting now uses single-frame analysis + PTRL shader
 
         // Lighting row
         MakeButton(_mainPanel.transform, "BtnLight", "Apply Lighting",
@@ -494,87 +479,74 @@ public class ARIADebugUI : MonoBehaviour
     // Room lighting scan — 4-photo 360° capture
     // -------------------------------------------------------------------------
 
-    private void StartRoomLightingScan()
-    {
-        _orchestrator.BeginRoomLightingScan();
-        _scanActive = true;
-        _scanPhase = 0;
-
-        // Hide main panel, show scan overlay using countdown panel
-        if (_mainPanel != null) _mainPanel.SetActive(false);
-        if (_countdownPanel != null)
-        {
-            _countdownPanel.SetActive(true);
-            _countdownNumText.text = ScanArrows[0];
-            _countdownCmdText.text = $"Look {ScanDirections[0]} and pull trigger (1/4)";
-        }
-        SetStatus("Room scan: look FORWARD...");
-    }
-
-    private async void CaptureRoomScanPhoto()
-    {
-        bool ok = await _orchestrator.CaptureRoomScanPhoto(_scanPhase);
-        if (!ok)
-        {
-            SetStatus("Photo capture failed — try again.");
-            return;
-        }
-
-        _scanPhase++;
-
-        if (_scanPhase >= 4)
-        {
-            // Scan complete
-            _scanActive = false;
-            if (_countdownPanel != null) _countdownPanel.SetActive(false);
-            if (_mainPanel != null) _mainPanel.SetActive(true);
-            SetStatus("Room scan complete! Tap 'Apply Lighting' to use it.");
-            Debug.Log("[ARIA] Room lighting scan complete — 4 photos captured.");
-            return;
-        }
-
-        // Show next direction
-        if (_countdownNumText != null) _countdownNumText.text = ScanArrows[_scanPhase];
-        if (_countdownCmdText != null)
-            _countdownCmdText.text = $"Look {ScanDirections[_scanPhase]} and pull trigger ({_scanPhase + 1}/4)";
-        SetStatus($"Room scan: look {ScanDirections[_scanPhase]}...");
-    }
+    // Room scan methods removed — lighting uses PTRL + single-frame analysis
 
     // -------------------------------------------------------------------------
     // Voice-assisted Claude adjustment
     // -------------------------------------------------------------------------
 
+    private bool _waitingForVoice;
+    private float _voiceTimeout;
+
     private void StartVoiceAdjust()
     {
-        if (_voiceConnector != null)
+        if (_voiceConnector != null && !_waitingForVoice)
         {
-            // Step 1: Record voice command
-            SetStatus("Speak your adjustment... (e.g. 'move to the table corner')");
+            // Step 1: Record voice command with 5-second timeout
+            SetStatus("Speak now... (5s timeout, or press trigger to skip)");
+            _waitingForVoice = true;
+            _voiceTimeout = Time.time + 5f;
+
             if (_countdownPanel != null)
             {
                 _countdownPanel.SetActive(true);
                 _mainPanel.SetActive(false);
-                _countdownNumText.text = "\ud83c\udf99"; // microphone emoji
-                _countdownCmdText.text = "Speak now... then look at target";
+                _countdownNumText.text = "Speak";
+                _countdownCmdText.text = "Say what to adjust, or press trigger to skip";
             }
 
             _voiceConnector.RecordOneShot(transcript =>
             {
-                // Step 2: Voice captured — show transcript, then countdown to capture image
+                _waitingForVoice = false;
                 SetStatus($"Heard: \"{transcript}\" — now look at target...");
                 _orchestrator.SetUserContext(transcript);
 
                 if (_countdownCmdText != null)
                     _countdownCmdText.text = $"\"{transcript}\"";
 
-                // Step 3: Start countdown for image capture
                 StartCountdownForAction("Claude adjustment",
                     () => _orchestrator.AdjustLastSpawnWithClaude());
             });
         }
         else
         {
-            // No voice SDK — just do countdown + Claude without voice
+            // No voice SDK or already waiting — skip voice, go straight to countdown
+            StartCountdownForAction("Claude adjustment",
+                () => _orchestrator.AdjustLastSpawnWithClaude());
+        }
+    }
+
+    private void CheckVoiceTimeout()
+    {
+        if (!_waitingForVoice) return;
+
+        // Check for trigger press to skip voice recording
+#if UNITY_ANDROID && !UNITY_EDITOR
+        bool skip = OVRInput.GetDown(OVRInput.Button.SecondaryIndexTrigger) ||
+                    OVRInput.GetDown(OVRInput.Button.Three);
+#else
+        bool skip = Input.GetMouseButtonDown(0);
+#endif
+
+        if (skip || Time.time > _voiceTimeout)
+        {
+            _waitingForVoice = false;
+            _voiceConnector?.StopListening();
+
+            if (_countdownPanel != null) _countdownPanel.SetActive(false);
+            if (_mainPanel != null) _mainPanel.SetActive(true);
+
+            SetStatus("Voice skipped — adjusting with visual context only...");
             StartCountdownForAction("Claude adjustment",
                 () => _orchestrator.AdjustLastSpawnWithClaude());
         }

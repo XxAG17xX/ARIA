@@ -1,15 +1,15 @@
 // ShadowReceiverSetup.cs
-// Configures MRUK EffectMesh surfaces (floor, walls) to receive shadows from virtual objects.
-// Uses the custom ARIA/ShadowReceiver shader: transparent everywhere, dark overlay in shadows.
+// Configures MRUK EffectMesh surfaces to receive shadows AND highlights using
+// Meta's Passthrough Relighting (PTRL) HighlightsAndShadows shader.
+//
+// This shader renders:
+//   - Shadows from the main directional light onto real room surfaces
+//   - Highlights from additional point/spot lights (our detected room lights)
+//   - Environment depth occlusion so shadows respect real geometry
 //
 // Call Configure() once after the scene/room is loaded.
-// In editor, creates a simple floor plane as a fallback shadow receiver for testing.
-//
-// Scene setup required (done manually in Unity):
-//   1. Create a child GameObject under MRUK or ARIA_Manager.
-//   2. Add EffectMesh component, set Labels = FLOOR | WALL_FACE, GenerateOnStart = true.
-//   3. Assign this ShadowReceiverSetup script's shadowReceiverMaterial to the EffectMesh
-//      renderer, or leave it null to let Configure() create the material automatically.
+// The shader works with any Unity light — our detected ceiling lights
+// automatically cast shadows and highlights through this shader.
 
 using UnityEngine;
 
@@ -19,30 +19,35 @@ using Meta.XR.MRUtilityKit;
 
 public class ShadowReceiverSetup : MonoBehaviour
 {
-    [Tooltip("The ARIA/ShadowReceiver material. If null, created automatically from the shader.")]
-    [SerializeField] private Material shadowReceiverMaterial;
-
-    [Tooltip("How dark the shadow overlay is (0 = invisible, 1 = black).")]
+    [Header("PTRL Shader Settings")]
+    [Tooltip("Shadow darkness (0 = invisible, 1 = fully black).")]
     [Range(0f, 1f)]
-    [SerializeField] private float shadowStrength = 0.65f;
+    [SerializeField] private float shadowIntensity = 0.7f;
 
-    [Tooltip("The EffectMesh GameObject that MRUK uses to generate room surface meshes. " +
-             "If null, Configure() will search for one.")]
+    [Tooltip("How strongly additional lights create highlights on real surfaces.")]
+    [Range(0f, 1f)]
+    [SerializeField] private float highlightAttenuation = 0.8f;
+
+    [Tooltip("Opacity of highlight effect on real surfaces.")]
+    [Range(0f, 1f)]
+    [SerializeField] private float highlightOpacity = 0.3f;
+
+    [Tooltip("Depth bias for environment occlusion (prevents z-fighting).")]
+    [Range(0f, 0.2f)]
+    [SerializeField] private float depthBias = 0.06f;
+
+    [Tooltip("The EffectMesh GameObject. If null, searches automatically.")]
     [SerializeField] private GameObject effectMeshObject;
 
-    private Material _runtimeMaterial;
+    private Material _ptrlMaterial;
 
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
 
-    /// <summary>
-    /// Applies the shadow-receiver material to all MRUK EffectMesh surface renderers.
-    /// Call once from ARIAOrchestrator.Start() or from MRUK's SceneLoadedEvent.
-    /// </summary>
     public void Configure()
     {
-        EnsureMaterial();
+        CreatePTRLMaterial();
 
 #if UNITY_ANDROID && !UNITY_EDITOR
         ConfigureEffectMesh();
@@ -51,45 +56,93 @@ public class ShadowReceiverSetup : MonoBehaviour
 #endif
     }
 
+    /// <summary>
+    /// Re-applies material to newly spawned EffectMesh renderers.
+    /// Call after MRUK loads new room data.
+    /// </summary>
+    public void Reconfigure()
+    {
+        Configure();
+    }
+
     // -------------------------------------------------------------------------
-    // MRUK / EffectMesh configuration (Quest APK)
+    // PTRL material creation
+    // -------------------------------------------------------------------------
+
+    private void CreatePTRLMaterial()
+    {
+        if (_ptrlMaterial != null) return;
+
+        // Use Meta's built-in PTRL shader from MRUK package
+        var shader = Shader.Find("Meta/MRUK/Scene/HighlightsAndShadows");
+        if (shader != null)
+        {
+            _ptrlMaterial = new Material(shader);
+            _ptrlMaterial.SetFloat("_ShadowIntensity", shadowIntensity);
+            _ptrlMaterial.SetFloat("_HighLightAttenuation", highlightAttenuation);
+            _ptrlMaterial.SetFloat("_HighlightOpacity", highlightOpacity);
+            _ptrlMaterial.SetFloat("_EnvironmentDepthBias", depthBias);
+            Debug.Log("[ShadowReceiver] Created PTRL HighlightsAndShadows material.");
+            return;
+        }
+
+        // Fallback: try our original shader
+        shader = Shader.Find("ARIA/ShadowReceiver");
+        if (shader != null)
+        {
+            _ptrlMaterial = new Material(shader);
+            _ptrlMaterial.SetFloat("_ShadowStrength", shadowIntensity);
+            Debug.LogWarning("[ShadowReceiver] PTRL shader not found, using ARIA fallback.");
+            return;
+        }
+
+        Debug.LogError("[ShadowReceiver] No shadow shader found. Ensure MRUK package is installed.");
+    }
+
+    // -------------------------------------------------------------------------
+    // EffectMesh configuration (Quest APK)
     // -------------------------------------------------------------------------
 
 #if UNITY_ANDROID && !UNITY_EDITOR
     private void ConfigureEffectMesh()
     {
+        if (_ptrlMaterial == null) return;
+
         if (effectMeshObject != null)
         {
-            // Try the assigned object first
             var renderers = effectMeshObject.GetComponentsInChildren<Renderer>(true);
             ApplyToRenderers(renderers);
-            Debug.Log($"[ShadowReceiver] Applied to {renderers.Length} renderer(s) on assigned EffectMesh.");
+            Debug.Log($"[ShadowReceiver] PTRL applied to {renderers.Length} assigned EffectMesh renderer(s).");
             return;
         }
 
-        // Search for EffectMesh in the scene
-        var effectMesh = FindFirstObjectByType<Meta.XR.MRUtilityKit.EffectMesh>();
+        var effectMesh = FindFirstObjectByType<EffectMesh>();
         if (effectMesh != null)
         {
+            // Apply to existing renderers
             var renderers = effectMesh.GetComponentsInChildren<Renderer>(true);
             ApplyToRenderers(renderers);
-            Debug.Log($"[ShadowReceiver] Applied to {renderers.Length} EffectMesh renderer(s).");
+            Debug.Log($"[ShadowReceiver] PTRL applied to {renderers.Length} EffectMesh renderer(s).");
+
+            // Also set the material on the EffectMesh component so future spawned surfaces use it
+            effectMesh.MeshMaterial = _ptrlMaterial;
+            Debug.Log("[ShadowReceiver] Set PTRL material on EffectMesh component for future surfaces.");
         }
         else
         {
-            Debug.LogWarning("[ShadowReceiver] No EffectMesh found in scene. " +
-                "Add an EffectMesh component to a GameObject with FLOOR/WALL_FACE labels.");
+            Debug.LogWarning("[ShadowReceiver] No EffectMesh found in scene.");
         }
     }
 #endif
 
     // -------------------------------------------------------------------------
-    // Editor fallback — simple floor plane for shadow testing
+    // Editor fallback
     // -------------------------------------------------------------------------
 
     private void ConfigureEditorFallback()
     {
-        // Check if a fallback plane already exists
+        if (_ptrlMaterial == null) return;
+
         var existing = GameObject.Find("ARIA_ShadowFloor");
         if (existing != null)
         {
@@ -97,18 +150,16 @@ public class ShadowReceiverSetup : MonoBehaviour
             return;
         }
 
-        // Create a flat plane at y=0 to catch shadows in editor
         var floor = GameObject.CreatePrimitive(PrimitiveType.Plane);
         floor.name = "ARIA_ShadowFloor";
-        floor.transform.localScale = new Vector3(1f, 1f, 1f); // 10x10m (plane default)
-        floor.transform.position   = Vector3.zero;
+        floor.transform.localScale = new Vector3(1f, 1f, 1f);
+        floor.transform.position = Vector3.zero;
 
-        // Remove default collider (we only want the visual shadow effect)
         var col = floor.GetComponent<Collider>();
         if (col != null) Destroy(col);
 
         ApplyToRenderers(floor.GetComponentsInChildren<Renderer>());
-        Debug.Log("[ShadowReceiver] Editor fallback: created ARIA_ShadowFloor plane.");
+        Debug.Log("[ShadowReceiver] Editor fallback: created ARIA_ShadowFloor with PTRL material.");
     }
 
     // -------------------------------------------------------------------------
@@ -119,35 +170,9 @@ public class ShadowReceiverSetup : MonoBehaviour
     {
         foreach (var r in renderers)
         {
-            r.shadowCastingMode  = UnityEngine.Rendering.ShadowCastingMode.Off;
-            r.receiveShadows     = true;
-            r.sharedMaterial     = _runtimeMaterial;
+            r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            r.receiveShadows = true;
+            r.sharedMaterial = _ptrlMaterial;
         }
-    }
-
-    private void EnsureMaterial()
-    {
-        if (_runtimeMaterial != null) return;
-
-        if (shadowReceiverMaterial != null)
-        {
-            // Clone the assigned material so we can modify strength without affecting the asset
-            _runtimeMaterial = new Material(shadowReceiverMaterial);
-        }
-        else
-        {
-            // Create from shader at runtime
-            var shader = Shader.Find("ARIA/ShadowReceiver");
-            if (shader == null)
-            {
-                Debug.LogError("[ShadowReceiver] ARIA/ShadowReceiver shader not found. " +
-                    "Ensure Assets/Shaders/ARIA/ShadowReceiver.shader is in the project.");
-                return;
-            }
-            _runtimeMaterial = new Material(shader);
-        }
-
-        _runtimeMaterial.SetFloat("_ShadowStrength", shadowStrength);
-        _runtimeMaterial.SetColor("_ShadowColor", Color.black);
     }
 }

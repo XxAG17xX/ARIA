@@ -1,6 +1,6 @@
 # ARIA — Adaptive Reality and Intelligent Authoring
 
-> Voice-driven spatial 3D content generation with perceptual lighting in Mixed Reality
+> AI-driven spatial interior design with perceptual lighting in Mixed Reality
 
 **Author:** Kartik Gupta (guptak1@tcd.ie) | **Platform:** Meta Quest 3 | **Unity 6000.3.8f1 LTS, URP**
 
@@ -8,93 +8,82 @@
 
 ## What Is ARIA?
 
-Speak a natural language command — *"put a reading lamp in the corner"* — and ARIA generates contextually appropriate 3D objects, places them on real room surfaces at physically correct scale, lights them to match your actual room illumination, and makes them immediately interactive with bare hands.
+ARIA places AI-generated 3D furniture in your real room through Mixed Reality. Speak a command, and ARIA uses multimodal AI to understand your room's layout, style, and lighting — then generates, places, scales, and lights virtual objects so they blend naturally with the real environment.
 
-No buttons. No menus. Just speak.
-
----
-
-## The Problem
-
-Virtual content in MR environments looks synthetic. Wrong lighting direction, no shadows, arbitrary scale, physically absurd placement. The closest prior work — *Say It, See It* (IEEE VR 2025) — generates a single object at gaze point with no room awareness, no surface anchoring, no lighting coherence, and no post-spawn interaction. ARIA addresses every gap.
+Two modes:
+- **Full pipeline:** Voice command -> Claude spatial reasoning -> Gemini image -> Tripo3D mesh -> contextual placement + lighting
+- **Demo mode:** Pre-generated 3D models placed instantly using room scan data, with optional Claude-powered refinement via passthrough image analysis
 
 ---
 
-## Pipeline
+## Pipeline Architecture
 
 ```
-Voice command
+Voice command (Wit.ai STT)
   |
   v
-Claude API (spatial reasoning over MRUK room scan + passthrough camera image)
-  - Decides what objects to generate, where to place them
-  - Contextual: style, color, material matched to room aesthetic
-  - Outputs dimensions proportional to room size (height + width + depth)
+Claude API (multimodal spatial reasoning)
+  - Receives: passthrough camera image + MRUK room scan data + voice transcript
+  - Decides: what objects, what style/color/material, what dimensions
+  - Outputs: PlacementInstructions (surface, scale, category, light properties)
   |
   v
-Gemini (AI reference image generation — studio-lit, white background)
+Gemini (reference image generation)
   |
   v
-Claude refinement pass (optional — sees reference image + room layout)
-  - Adjusts dimensions if image proportions differ from plan
-  - Refines style description before 3D generation
+Claude refinement (optional — compares reference image to room context)
   |
   v
-HiTEM3D or Tripo3D (textured 3D GLB mesh — switchable in Inspector)
-  - Cheapest settings for testing (low poly, basic texture)
+Tripo3D / HiTEM3D (textured 3D GLB mesh generation)
   |
   v
-GLTFast (runtime GLB loading into scene)
-  |
-  v
-Five ARIA systems:
-  - SemanticPlacementEngine  -> correct MRUK surface (floor/wall/table/ceiling)
-  - ScaleInferenceSystem     -> proportional scaling (H x W x D, not just height)
-  - SH LightingEstimator     -> matches real room illumination
-  - ShadowReceiverSetup      -> MRUK mesh receives shadows from virtual objects
-  - ARIAOrchestrator         -> coordinates everything, concurrent object processing
+Runtime placement + lighting:
+  - EnvironmentRaycastManager  -> depth-based surface placement (Meta SDK)
+  - SemanticPlacementEngine    -> MRUK anchor-aware placement for pipeline objects
+  - ScaleInferenceSystem       -> proportional scaling from Claude dimensions
+  - Multi-light detection      -> passthrough brightness analysis, ceiling projection
+  - PTRL HighlightsAndShadows  -> shadows + highlights on real room surfaces (Meta SDK)
+  - Claude post-spawn adjustment -> voice + passthrough refinement of position/scale
 ```
-
-All processing via HTTPS over WiFi. No local server. Works in any room.
 
 ---
 
-## Current Status
+## Key Features
 
-### Working (confirmed end-to-end in editor)
-- Full pipeline: voice command -> Claude -> Gemini -> 3D API -> GLTFast -> placed + scaled in scene
-- Claude contextual reasoning (object style/color/dimensions from room context)
-- Claude refinement pass (sees Gemini image, adjusts dimensions before 3D generation)
-- Two 3D providers: HiTEM3D and Tripo3D (switchable, saves credits)
-- GLB cache (skips entire generation pipeline for previously generated categories)
-- Proportional scaling (width + depth, not just height)
-- Demo toggles: lighting, physics, Claude refinement all toggleable in Inspector
-- Debug UI with "Apply Lighting" button for staged demos
+### Placement
+- **EnvironmentRaycastManager** (Meta Depth API) for accurate surface detection — objects land on floors, walls, tables at the exact gaze point
+- **MRUK-aware collision avoidance** — objects fit within room boundaries, don't overlap furniture
+- **Gaze-directed** — look at where you want the object, 3-2-1 countdown, it appears there
 
-### Not yet tested
-- On-device MRUK (requires Quest 3 APK build)
-- Voice SDK integration (debug UI bypasses it for now)
-- Meta XR Simulator
-- Hand grab interaction (code ready, needs Interaction SDK Building Block in scene)
+### Lighting (Primary Research Contribution)
+- **Multi-light source detection** from passthrough camera: 16x16 brightness grid -> greedy clustering -> projected to 3D ceiling positions via MRUK height data
+- **SH ambient probe** (Ramamoorthi & Hanrahan 2001) computed from passthrough frame for fill light
+- **PTRL HighlightsAndShadows shader** (Meta SDK) renders shadows and highlights on real room surfaces from detected virtual lights
+- **Per-object directional light** from nearest detected ceiling light for correct shadow direction
+- **ARIA vs Default toggle** for before/after comparison
 
-### Next steps
-1. Test with Tripo3D provider (cheaper, faster)
-2. Meta XR Simulator testing with synthetic room data
-3. APK build for Quest 3
-4. Voice SDK wiring
-5. Final README + demo video
+### AI Integration
+- **Claude multimodal reasoning** — sees your room (passthrough + MRUK) and decides contextually appropriate placement
+- **Voice-assisted adjustment** — speak what you want ("move this to the table, make it smaller"), Claude adjusts with visual + spatial context
+- **All spawned objects listed** in Claude context so it reasons about the full scene, not just one object
+
+### Quest 3 Features
+- VR Canvas UI with gaze pointer (Y to toggle, trigger to click)
+- Passthrough camera access for lighting estimation
+- MRUK room scan with EffectMesh visualization
+- Occlusion via EnvironmentDepthManager
+- Boundary suppression for MR passthrough
 
 ---
 
 ## Original Engineering Contributions
 
-| System | File | Description |
-|---|---|---|
-| SemanticPlacementEngine | `SemanticPlacementEngine.cs` | Maps Claude's surface labels to MRUK anchors. Floor: 1.5m in front of camera. Wall: closest wall, object faces room. Table/Couch: top of volume anchor. |
-| ScaleInferenceSystem | `ScaleInferenceSystem.cs` | Proportional scaling using all 3 dimensions from Claude. Non-uniform scale when width/depth differ. Canonical height fallback dictionary. Room height sanity check. |
-| SH Lighting Estimator | `SphericalHarmonicsLightingEstimator.cs` | Samples passthrough camera frame, computes SH coefficients, updates ambient probe + directional light. |
-| Shadow Receiver | `ShadowReceiverSetup.cs` | Custom URP shader on MRUK EffectMesh — transparent surface that only receives shadows. |
-| ARIA Orchestrator | `ARIAOrchestrator.cs` | Master pipeline controller. Concurrent object processing, two-pass Claude, provider switching, GLB caching, progressive placement. |
+| Contribution | Description |
+|---|---|
+| **Multi-light detection** | Detects multiple real light source positions from passthrough camera analysis. Existing tools (PTRL, QuestCameraKit) only provide manual light placement or single-direction estimation. Our clustering algorithm finds distinct sources and projects them to 3D world positions. |
+| **Claude spatial reasoning pipeline** | Multimodal AI that sees the room (image + scan data + voice) and reasons about furniture style, scale, placement. No prior Quest 3 project combines LLM reasoning with MRUK spatial data for interior design. |
+| **Voice-driven adjustment** | Post-spawn refinement where user speaks intent ("put this on the table corner") and Claude re-evaluates with fresh passthrough capture. |
+| **End-to-end generation** | Voice -> AI reasoning -> image generation -> 3D mesh -> contextual placement -> perceptual lighting. Complete pipeline from natural language to placed, lit object. |
 
 ---
 
@@ -103,14 +92,16 @@ All processing via HTTPS over WiFi. No local server. Works in any room.
 | Component | Technology |
 |---|---|
 | Platform | Meta Quest 3, Unity 6 URP |
-| Room scanning | Meta MRUK (Mixed Reality Utility Kit) |
-| Spatial reasoning | Claude API (claude-sonnet-4-6) |
-| Image generation | Gemini 2.5 Flash (stable) + 3.1 Flash Preview (fallback) |
-| 3D generation | HiTEM3D v1.5 / Tripo3D (switchable in Inspector) |
-| Runtime GLB loading | GLTFast |
-| Hand interaction | Meta Interaction SDK |
-| Lighting | Spherical Harmonics (Ramamoorthi & Hanrahan 2001) |
-| JSON | Newtonsoft.Json |
+| Room scanning | Meta MRUK + EffectMesh + EnvironmentRaycastManager |
+| Surface placement | EnvironmentRaycastManager (depth API) + SemanticPlacementEngine |
+| Shadow rendering | PTRL HighlightsAndShadows shader (Meta SDK) |
+| Light detection | Custom multi-light clustering from passthrough frames |
+| Spatial reasoning | Claude API (claude-sonnet-4-6, multimodal) |
+| Image generation | Gemini 2.5 Flash |
+| 3D generation | Tripo3D / HiTEM3D (switchable) |
+| Runtime GLB loading | GLTFast 6.18 |
+| Voice input | Meta Voice SDK (Wit.ai) |
+| Ambient lighting | Spherical Harmonics L2 probe |
 
 ---
 
@@ -118,44 +109,41 @@ All processing via HTTPS over WiFi. No local server. Works in any room.
 
 ```
 Assets/Scripts/ARIA/
-  ARIAOrchestrator.cs              <- Master pipeline controller
-  SemanticPlacementEngine.cs       <- MRUK surface placement
+  ARIAOrchestrator.cs              <- Pipeline controller, API calls, spawn logic
+  SemanticPlacementEngine.cs       <- MRUK surface placement (pipeline objects)
   ScaleInferenceSystem.cs          <- Proportional real-world scaling
-  SphericalHarmonicsLightingEstimator.cs  <- SH ambient lighting
-  ShadowReceiverSetup.cs           <- Shadow receiver on MRUK mesh
-  ARIADebugUI.cs                   <- Editor testing UI (bottom-left panel)
-  FlyCamera.cs                     <- Editor camera (WASD + right-click look)
+  SphericalHarmonicsLightingEstimator.cs  <- Multi-light detection + SH probe
+  ShadowReceiverSetup.cs           <- PTRL shader on EffectMesh surfaces
+  ARIADebugUI.cs                   <- VR Canvas UI (gaze pointer, buttons)
+  VoiceSDKConnector.cs             <- Wit.ai bridge to orchestrator
 
-Assets/Shaders/ARIA/
-  ShadowReceiver.shader            <- Custom URP transparent shadow receiver
-
-Assets/Scenes/
-  ARIATestScene.unity              <- Clean test scene with ARIA_Manager wired
+Assets/StreamingAssets/
+  GLBCache/                        <- Pre-generated demo models (bed, lamp, wall_art)
+  config.json                      <- API keys (gitignored)
 ```
 
 ---
 
-## How to Run (Editor)
+## How to Run
 
-1. Open `ARIATestScene.unity`
-2. Make sure `Assets/config.json` exists with all 5 keys (see below)
-3. Hit Play
-4. Bottom-left debug panel: type a command and click **Send Command**
-5. Watch console — pipeline logs every stage with checkmarks/timers
-6. **Do NOT stop play mode during HiTEM3D/Tripo3D generation** (takes 1-5 min, this is normal)
-7. After first successful run, `aria_glb_cache.json` saves URLs for instant reruns
+### Quest 3 (primary target)
+1. Create `Assets/StreamingAssets/config.json` with API keys
+2. Build via File -> Build Profiles -> Meta Quest
+3. Deploy APK via Meta Quest Developer Hub
+4. In headset: press **Y** to open menu
+5. Demo spawn: tap Spawn Bed/Lamp/Wall Art -> 3-2-1 countdown -> look at target
+6. Adjust: tap "Adjust with Claude" -> speak intent -> look at target
+7. Lighting: tap "Apply Lighting" -> "ARIA vs Default" to compare
 
-### Inspector toggles on ARIA_Manager:
-- **meshProvider** — switch between HiTEM3D and Tripo3D
-- **enableClaudeRefinement** — two-pass Claude (adds ~10s, improves accuracy)
-- **enableLighting** — toggle SH lighting and reflection probes
-- **enablePhysics** — toggle Rigidbody + colliders
+### Editor (testing)
+1. Open `ARIATestScene.unity`, ensure `Assets/config.json` exists
+2. Hit Play -> bottom-left debug panel -> type command -> Send
 
 ---
 
 ## Config
 
-Create `Assets/config.json` (gitignored — never commit this):
+Create `Assets/StreamingAssets/config.json` (gitignored):
 ```json
 {
   "claude_key": "sk-ant-...",
@@ -166,13 +154,14 @@ Create `Assets/config.json` (gitignored — never commit this):
 }
 ```
 
-For Quest APK: push via `adb push config.json /sdcard/Android/data/<package>/files/config.json`
+Automatically copied to device persistent storage on first launch.
 
 ---
 
-## Known Limitations
+## Acknowledgements
 
-- SH lighting is view-dependent (documented approximation)
-- 1-5 min generation latency per object (mitigated by caching + progressive placement)
-- Tripo3D free tier: 300 credits/month (~10 models). HiTEM3D: limited credits.
-- Editor mode uses mock room data (5x4x2.8m room). Real MRUK requires Quest APK.
+- Meta MRUK, PTRL, EnvironmentRaycastManager, Depth API
+- [MRRealLightCapture](https://github.com/hellomixedworld/MRRealLightCapture) — cubemap lighting concepts
+- [QuestCameraKit](https://github.com/xrdevrob/QuestCameraKit) — passthrough camera reference
+- [Unity-MRMotifs](https://github.com/oculus-samples/Unity-MRMotifs) — grounding shadow shader reference
+- Anthropic Claude, Google Gemini, Tripo3D APIs
