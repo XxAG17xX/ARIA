@@ -11,6 +11,7 @@
 // The shader works with any Unity light — our detected ceiling lights
 // automatically cast shadows and highlights through this shader.
 
+using System.Linq;
 using UnityEngine;
 
 #if UNITY_ANDROID && !UNITY_EDITOR
@@ -73,7 +74,26 @@ public class ShadowReceiverSetup : MonoBehaviour
     {
         if (_ptrlMaterial != null) return;
 
-        // Use Meta's built-in PTRL shader from MRUK package
+        // Try to load Meta's pre-made TransparentSceneAnchor material (exact material from PTRL sample)
+        var ptrlMat = Resources.Load<Material>("TransparentSceneAnchor");
+        if (ptrlMat == null)
+        {
+            // Try loading from package path
+            ptrlMat = UnityEngine.Resources.FindObjectsOfTypeAll<Material>()
+                .FirstOrDefault(m => m.name == "TransparentSceneAnchor");
+        }
+        if (ptrlMat != null)
+        {
+            _ptrlMaterial = new Material(ptrlMat); // clone it
+            _ptrlMaterial.SetFloat("_ShadowIntensity", shadowIntensity);
+            _ptrlMaterial.SetFloat("_HighLightAttenuation", highlightAttenuation);
+            _ptrlMaterial.SetFloat("_HighlightOpacity", highlightOpacity);
+            _ptrlMaterial.SetFloat("_EnvironmentDepthBias", depthBias);
+            Debug.Log("[ShadowReceiver] Using Meta's TransparentSceneAnchor material.");
+            return;
+        }
+
+        // Fallback: create from shader
         var shader = Shader.Find("Meta/MRUK/Scene/HighlightsAndShadows");
         if (shader != null)
         {
@@ -82,7 +102,7 @@ public class ShadowReceiverSetup : MonoBehaviour
             _ptrlMaterial.SetFloat("_HighLightAttenuation", highlightAttenuation);
             _ptrlMaterial.SetFloat("_HighlightOpacity", highlightOpacity);
             _ptrlMaterial.SetFloat("_EnvironmentDepthBias", depthBias);
-            Debug.Log("[ShadowReceiver] Created PTRL HighlightsAndShadows material.");
+            Debug.Log("[ShadowReceiver] Created PTRL material from shader.");
             return;
         }
 

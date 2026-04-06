@@ -48,6 +48,16 @@ public class ARIADebugUI : MonoBehaviour
     private Text       _countdownNumText;
     private Text       _countdownCmdText;
 
+    // PTRL toggle button reference
+    private GameObject _ptrlButton;
+    private Text _ptrlButtonText;
+
+    // Claude log panel (shows what was sent/received)
+    private GameObject _logCanvasGO;
+    private Text       _logText;
+    private static string _claudeLog = "No Claude calls yet.";
+    public static void AppendClaudeLog(string msg) { _claudeLog = msg + "\n\n" + _claudeLog; if (_claudeLog.Length > 2000) _claudeLog = _claudeLog.Substring(0, 2000); }
+
     // IMGUI styles (editor)
     private GUIStyle _panelStyle, _labelStyle, _bigLabelStyle;
     private GUIStyle _countdownStyle, _buttonStyle, _fieldStyle;
@@ -85,9 +95,43 @@ public class ARIADebugUI : MonoBehaviour
         if (IsRunningOnQuest())
         {
             CreateVRCanvas();
+            CreateLogPanel();
             // Suppress Quest boundary for MR passthrough (user sees real world)
             SuppressBoundary();
         }
+    }
+
+    private void CreateLogPanel()
+    {
+        _logCanvasGO = new GameObject("ARIA_LogPanel");
+        var canvas = _logCanvasGO.AddComponent<Canvas>();
+        canvas.renderMode = RenderMode.WorldSpace;
+        _logCanvasGO.AddComponent<CanvasScaler>();
+        _logCanvasGO.AddComponent<GraphicRaycaster>();
+
+        var rt = _logCanvasGO.GetComponent<RectTransform>();
+        rt.sizeDelta = new Vector2(500, 700);
+        _logCanvasGO.transform.localScale = Vector3.one * 0.001f;
+
+        // Dark background
+        var panel = MakePanel(_logCanvasGO.transform, "LogBg",
+            Vector2.zero, new Vector2(500, 700), new Color(0f, 0f, 0f, 0.85f));
+
+        // Title
+        MakeLabel(panel.transform, "LogTitle", "Claude Log",
+            new Vector2(0, 320), new Vector2(460, 30), 20, FontStyle.Bold, Color.yellow);
+
+        // Close button (top right)
+        MakeButton(panel.transform, "LogClose", "X",
+            new Vector2(220, 320), new Vector2(50, 30),
+            () => { _logCanvasGO.SetActive(false); });
+
+        // Log text (scrollable via pages)
+        _logText = MakeLabel(panel.transform, "LogContent", _claudeLog,
+            new Vector2(0, -20), new Vector2(480, 600), 12, FontStyle.Normal, Color.white);
+        _logText.alignment = TextAnchor.UpperLeft;
+
+        _logCanvasGO.SetActive(false);
     }
 
     private static void SuppressBoundary()
@@ -111,6 +155,23 @@ public class ARIADebugUI : MonoBehaviour
 #if UNITY_ANDROID && !UNITY_EDITOR
             if (OVRInput.GetDown(OVRInput.Button.Four)) // Y button on left controller
                 ToggleMenu();
+            // Left grip = place light at crosshair (no menu needed)
+            if (OVRInput.GetDown(OVRInput.Button.PrimaryHandTrigger) && !_menuVisible)
+                _orchestrator.PlaceLightAtCrosshair();
+            // Right grip = grab/release nearest light source
+            if (OVRInput.Get(OVRInput.Button.SecondaryHandTrigger))
+                GrabNearestLight();
+            else if (_grabbedLight != null)
+                ReleaseLight();
+#endif
+        }
+
+        // X button: cycle selection / delete (only when menu is NOT visible)
+        if (IsRunningOnQuest() && !_menuVisible)
+        {
+#if UNITY_ANDROID && !UNITY_EDITOR
+            if (OVRInput.GetDown(OVRInput.Button.Three)) // X button on left controller
+                CycleOrDeleteSelection();
 #endif
         }
 
@@ -295,13 +356,14 @@ public class ARIADebugUI : MonoBehaviour
         // Room scan removed — lighting now uses single-frame analysis + PTRL shader
 
         // Lighting row
-        MakeButton(_mainPanel.transform, "BtnLight", "Apply Lighting",
-            new Vector2(-145, y), new Vector2(270, 50),
-            () => _orchestrator.ApplyLightingToAllSpawned());
-        MakeButton(_mainPanel.transform, "BtnToggle", "ARIA vs Default",
-            new Vector2(145, y), new Vector2(270, 50),
-            () => _orchestrator.ToggleLightingComparison());
-        y -= 65f;
+        _ptrlButton = MakeButtonWithRef(_mainPanel.transform, "BtnPTRL", "PTRL: OFF",
+            new Vector2(0, y), new Vector2(560, 50),
+            () => {
+                bool on = _orchestrator.TogglePTRL();
+                if (_ptrlButtonText != null)
+                    _ptrlButtonText.text = on ? "PTRL: ON" : "PTRL: OFF";
+            });
+        y -= 58f;
 
         // ── DEMO SPAWN — pre-bundled GLBs, zero API calls ──────────────
         MakeLabel(_mainPanel.transform, "DemoTitle", "DEMO (instant, no credits):",
@@ -332,8 +394,12 @@ public class ARIADebugUI : MonoBehaviour
         y -= 58f;
 
         // Toggle EffectMesh visibility
-        MakeButton(_mainPanel.transform, "BtnEffectMesh", "Toggle Room Wireframe",
-            new Vector2(0, y), new Vector2(560, 44),
+        // Light + wireframe controls
+        MakeButton(_mainPanel.transform, "BtnPlaceLight", "Place Light Here",
+            new Vector2(-145, y), new Vector2(270, 44),
+            () => _orchestrator.PlaceLightAtCrosshair());
+        MakeButton(_mainPanel.transform, "BtnEffectMesh", "Toggle Wireframe",
+            new Vector2(145, y), new Vector2(270, 44),
             () => ToggleEffectMesh());
         y -= 52f;
 
@@ -404,6 +470,20 @@ public class ARIADebugUI : MonoBehaviour
         return t;
     }
 
+    private GameObject MakeButtonWithRef(Transform parent, string name, string label,
+        Vector2 pos, Vector2 size, UnityEngine.Events.UnityAction onClick)
+    {
+        MakeButton(parent, name, label, pos, size, onClick);
+        // Find the text child to update later
+        var btnGO = parent.Find(name);
+        if (btnGO != null)
+        {
+            var txt = btnGO.GetComponentInChildren<Text>();
+            _ptrlButtonText = txt;
+        }
+        return btnGO?.gameObject;
+    }
+
     private static void MakeButton(Transform parent, string name, string label,
         Vector2 pos, Vector2 size, UnityEngine.Events.UnityAction onClick)
     {
@@ -458,7 +538,6 @@ public class ARIADebugUI : MonoBehaviour
 
         if (_menuVisible)
         {
-            // Place in front of user at current head position (stays in world space)
             Camera cam = Camera.main;
             if (cam != null)
             {
@@ -466,12 +545,27 @@ public class ARIADebugUI : MonoBehaviour
                 fwd.y = 0f;
                 if (fwd.sqrMagnitude < 0.001f) fwd = Vector3.forward;
                 else fwd.Normalize();
+                Vector3 right = Vector3.Cross(Vector3.up, fwd).normalized;
+
+                // Main menu in front
                 _canvasGO.transform.position = cam.transform.position + fwd * 1.2f;
                 _canvasGO.transform.rotation = Quaternion.LookRotation(fwd);
+
+                // Log panel to the left, facing user
+                if (_logCanvasGO != null)
+                {
+                    _logCanvasGO.SetActive(true);
+                    _logCanvasGO.transform.position = cam.transform.position + fwd * 1.2f - right * 0.65f;
+                    _logCanvasGO.transform.rotation = Quaternion.LookRotation(fwd);
+                    if (_logText != null) _logText.text = _claudeLog;
+                }
             }
         }
+        else
+        {
+            if (_logCanvasGO != null) _logCanvasGO.SetActive(false);
+        }
 
-        // Hide/show reticle with menu
         if (_reticle != null) _reticle.SetActive(_menuVisible);
     }
 
@@ -549,6 +643,134 @@ public class ARIADebugUI : MonoBehaviour
             SetStatus("Voice skipped — adjusting with visual context only...");
             StartCountdownForAction("Claude adjustment",
                 () => _orchestrator.AdjustLastSpawnWithClaude());
+        }
+    }
+
+    // Light grab state
+    private GameObject _grabbedLight;
+    private float _grabDistance;
+
+    private void GrabNearestLight()
+    {
+        if (_grabbedLight != null)
+        {
+            // Already grabbing — move light to right controller position
+#if UNITY_ANDROID && !UNITY_EDITOR
+            Vector3 controllerPos = OVRInput.GetLocalControllerPosition(OVRInput.Controller.RTouch);
+            Quaternion controllerRot = OVRInput.GetLocalControllerRotation(OVRInput.Controller.RTouch);
+            // Transform from tracking space to world space
+            Camera cam = Camera.main;
+            if (cam != null)
+            {
+                Transform trackingSpace = cam.transform.parent;
+                if (trackingSpace != null)
+                    controllerPos = trackingSpace.TransformPoint(controllerPos);
+            }
+            _grabbedLight.transform.position = controllerPos + (controllerRot * Vector3.forward) * 0.1f;
+#endif
+            return;
+        }
+
+        // Find nearest manual light to right controller
+#if UNITY_ANDROID && !UNITY_EDITOR
+        Vector3 rPos = OVRInput.GetLocalControllerPosition(OVRInput.Controller.RTouch);
+        Camera c = Camera.main;
+        if (c != null)
+        {
+            Transform ts = c.transform.parent;
+            if (ts != null) rPos = ts.TransformPoint(rPos);
+        }
+
+        float nearest = 0.3f; // grab radius
+        foreach (var go in FindObjectsByType<Light>(FindObjectsSortMode.None))
+        {
+            if (go.name.StartsWith("ARIA_ManualLight"))
+            {
+                float dist = Vector3.Distance(go.transform.position, rPos);
+                if (dist < nearest)
+                {
+                    nearest = dist;
+                    _grabbedLight = go.gameObject;
+                }
+            }
+        }
+
+        if (_grabbedLight != null)
+            SetStatus($"Grabbed light — move and release grip to place");
+#endif
+    }
+
+    private void ReleaseLight()
+    {
+        if (_grabbedLight != null)
+        {
+            SetStatus($"Light dropped at {_grabbedLight.transform.position:F1}");
+            Debug.Log($"[ARIA] Light released at {_grabbedLight.transform.position}");
+            _grabbedLight = null;
+        }
+    }
+
+    private int _selectedIndex = -1;
+    private GameObject _selectionHighlight;
+    private float _lastXPress;
+
+    private void CycleOrDeleteSelection()
+    {
+        Transform root = _orchestrator.transform;
+        int childCount = root.childCount;
+        if (childCount == 0)
+        {
+            SetStatus("No objects to select.");
+            return;
+        }
+
+        // Double-tap X within 0.5s = delete selected
+        if (_selectedIndex >= 0 && Time.time - _lastXPress < 0.5f)
+        {
+            Transform selected = root.GetChild(Mathf.Min(_selectedIndex, childCount - 1));
+            string objName = selected.name;
+            ClearSelectionHighlight();
+            Destroy(selected.gameObject);
+            _selectedIndex = -1;
+            SetStatus($"Deleted: {objName}");
+            Debug.Log($"[ARIA] Deleted: {objName}");
+            _lastXPress = 0;
+            return;
+        }
+
+        _lastXPress = Time.time;
+
+        // Single tap = cycle to next object
+        _selectedIndex = (_selectedIndex + 1) % root.childCount;
+        Transform obj = root.GetChild(_selectedIndex);
+        HighlightObject(obj.gameObject);
+        SetStatus($"Selected [{_selectedIndex + 1}/{root.childCount}]: {obj.name} — double-tap X to delete");
+    }
+
+    private void HighlightObject(GameObject obj)
+    {
+        ClearSelectionHighlight();
+
+        // Create a wireframe cube around the selected object
+        Bounds b = ARIAOrchestrator.CalculateMeshBounds(obj);
+        _selectionHighlight = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        _selectionHighlight.name = "ARIA_SelectionHighlight";
+        Destroy(_selectionHighlight.GetComponent<Collider>());
+        _selectionHighlight.transform.position = b.center;
+        _selectionHighlight.transform.localScale = b.size + Vector3.one * 0.05f;
+
+        // Orange wireframe material
+        var mat = new Material(Shader.Find("UI/Default"));
+        mat.color = new Color(1f, 0.6f, 0f, 0.3f);
+        _selectionHighlight.GetComponent<Renderer>().material = mat;
+    }
+
+    private void ClearSelectionHighlight()
+    {
+        if (_selectionHighlight != null)
+        {
+            Destroy(_selectionHighlight);
+            _selectionHighlight = null;
         }
     }
 
@@ -672,10 +894,8 @@ public class ARIADebugUI : MonoBehaviour
         cy += lineH + 6f;
 
         float halfBtn = (panelW - padding * 2f - 8f) / 2f;
-        if (GUI.Button(new Rect(inner, cy, halfBtn, lineH + 4f), "Apply Lighting"))
-            _orchestrator.ApplyLightingToAllSpawned();
-        if (GUI.Button(new Rect(inner + halfBtn + 8f, cy, halfBtn, lineH + 4f), "ARIA vs Default"))
-            _orchestrator.ToggleLightingComparison();
+        if (GUI.Button(new Rect(inner, cy, panelW - padding * 2f, lineH + 4f), "PTRL: Toggle"))
+            _orchestrator.TogglePTRL();
         cy += lineH + 10f;
 
         if (!string.IsNullOrEmpty(_partialTranscript))

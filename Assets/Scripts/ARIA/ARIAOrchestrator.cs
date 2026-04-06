@@ -53,7 +53,7 @@ public class ARIAOrchestrator : MonoBehaviour
     [Tooltip("Which API to use for 3D mesh generation. Switch to save credits.")]
     [SerializeField] private MeshProvider meshProvider = MeshProvider.Tripo3D;
 
-    // API keys — loaded from StreamingAssets/config.json, hardcode locally for dev
+    // API keys — loaded from StreamingAssets/config.json
     private string _claudeKey;
     private string _geminiKey;
     private string _hitemAccessKey;
@@ -156,6 +156,16 @@ public class ARIAOrchestrator : MonoBehaviour
     private void OnMRUKSceneLoaded()
     {
         Debug.Log("[ARIA] MRUK scene loaded — real room data available.");
+        // Re-apply PTRL shadow material now that EffectMesh has spawned surfaces
+        StartCoroutine(DelayedShadowSetup());
+    }
+
+    private System.Collections.IEnumerator DelayedShadowSetup()
+    {
+        // Wait 1 second for EffectMesh to finish generating surfaces
+        yield return new WaitForSeconds(1f);
+        shadowReceiver?.Reconfigure();
+        Debug.Log("[ARIA] Shadow receiver reconfigured after MRUK scene load.");
     }
 
     // -------------------------------------------------------------------------
@@ -279,31 +289,94 @@ public class ARIAOrchestrator : MonoBehaviour
     private async Task<byte[]> CapturePassthroughFrameAsync()
     {
 #if UNITY_ANDROID && !UNITY_EDITOR
+        // Use Meta's PassthroughCameraAccess (not WebCamTexture which returns black on Quest 3)
+        var pca = FindFirstObjectByType<Meta.XR.PassthroughCameraAccess>();
+        if (pca != null && pca.IsPlaying)
+        {
+            Texture camTex = pca.GetTexture();
+            if (camTex != null && camTex.width > 2)
+            {
+                // Copy GPU texture to CPU-readable Texture2D
+                var rt = RenderTexture.GetTemporary(camTex.width, camTex.height, 0);
+                Graphics.Blit(camTex, rt);
+                RenderTexture.active = rt;
+                var snap = new Texture2D(camTex.width, camTex.height, TextureFormat.RGB24, false);
+                snap.ReadPixels(new Rect(0, 0, camTex.width, camTex.height), 0, 0);
+                snap.Apply();
+                RenderTexture.active = null;
+                RenderTexture.ReleaseTemporary(rt);
+
+                byte[] jpeg = snap.EncodeToJPG(75);
+                Debug.Log($"[ARIA] PCA capture: {camTex.width}x{camTex.height}, JPEG={jpeg.Length/1024}KB");
+                Destroy(snap);
+                return jpeg;
+            }
+            Debug.LogWarning("[ARIA] PCA texture not ready.");
+        }
+
+        // Fallback: WebCamTexture (likely returns black but try anyway)
         if (_webcam == null)
         {
             _webcam = new WebCamTexture();
             _webcam.Play();
         }
-
-        // Wait 2 frames for first valid frame (first frame is often black)
         await Task.Yield();
         await Task.Yield();
-
-        if (!_webcam.isPlaying || _webcam.width < 2)
+        if (_webcam.isPlaying && _webcam.width > 2)
         {
-            Debug.LogWarning("[ARIA] WebCamTexture not ready — Claude will run text-only.");
-            return null;
+            var snap = new Texture2D(_webcam.width, _webcam.height, TextureFormat.RGB24, false);
+            snap.SetPixels(_webcam.GetPixels());
+            snap.Apply();
+            byte[] jpeg = snap.EncodeToJPG(75);
+            Debug.Log($"[ARIA] WebCam fallback: {_webcam.width}x{_webcam.height}, JPEG={jpeg.Length/1024}KB");
+            Destroy(snap);
+            return jpeg;
         }
 
-        var snap = new Texture2D(_webcam.width, _webcam.height, TextureFormat.RGB24, false);
-        snap.SetPixels(_webcam.GetPixels());
-        snap.Apply();
-        byte[] jpeg = snap.EncodeToJPG(75);
-        Destroy(snap);
+        Debug.LogWarning("[ARIA] No camera available — text-only mode.");
+        return null;
+#else
+        await Task.Yield();
+        return null;
+#endif
+    }
+
+    /// <summary>
+    /// Captures what the user SEES — passthrough + wireframe + virtual objects.
+    /// Better for Claude adjustment than raw passthrough since Claude can see
+    /// the spawned objects and MRUK boundaries visually.
+    /// </summary>
+    private async Task<byte[]> CaptureRenderedViewAsync()
+    {
+#if UNITY_ANDROID && !UNITY_EDITOR
+        // Wait for end of frame so rendering is complete
+        await Task.Yield();
+
+        Camera cam = Camera.main;
+        if (cam == null) return await CapturePassthroughFrameAsync();
+
+        // Render the camera to a RenderTexture
+        int w = 1536, h = 1536;
+        var rt = new RenderTexture(w, h, 24);
+        cam.targetTexture = rt;
+        cam.Render();
+        cam.targetTexture = null;
+
+        // Read pixels from RenderTexture
+        RenderTexture.active = rt;
+        var tex = new Texture2D(w, h, TextureFormat.RGB24, false);
+        tex.ReadPixels(new Rect(0, 0, w, h), 0, 0);
+        tex.Apply();
+        RenderTexture.active = null;
+        Destroy(rt);
+
+        byte[] jpeg = tex.EncodeToJPG(80);
+        Debug.Log($"[ARIA] Rendered view capture: {w}x{h}, JPEG={jpeg.Length/1024}KB");
+        Destroy(tex);
         return jpeg;
 #else
         await Task.Yield();
-        return null; // Editor: Claude operates on text + mock MRUK only
+        return null;
 #endif
     }
 
@@ -581,7 +654,9 @@ public class ARIAOrchestrator : MonoBehaviour
                    "The user is wearing a VR headset with passthrough (they see the real room). They spawned a virtual object " +
                    "and now want you to decide the BEST placement and scale based on what you see.\n\n" +
                    "HOW TO USE THE IMAGE:\n" +
-                   "- This is a RAW passthrough camera image — you see the REAL room exactly as the user sees it\n" +
+                   "- This is a RENDERED view showing the real room (passthrough) WITH virtual objects and cyan MRUK wireframe boundaries visible\n" +
+                   "- Cyan/blue wireframe lines show detected room boundaries (walls, floor, table, bed surfaces)\n" +
+                   "- Any 3D objects visible that aren't real are the spawned virtual objects you need to adjust\n" +
                    "- The CENTER of the image is where the user is looking (their gaze target)\n" +
                    "- Look at what SURFACE is at the center: is it a table/desk surface? A wall? The floor?\n" +
                    "- Look at OBJECTS on that surface: keyboard, mouse, phone, bottles, cables — the virtual object must NOT overlap these\n" +
@@ -628,6 +703,18 @@ public class ARIAOrchestrator : MonoBehaviour
             messages = new[] { new { role = "user", content } }
         });
 
+        // Log what we're sending
+        string requestLog = $"REQUEST:\n" +
+            $"Object: {original.category}\n" +
+            $"Size: {original.height_metres:F2}x{original.width_metres:F2}x{original.depth_metres:F2}m\n" +
+            $"User pos: ({userPosition.x:F1},{userPosition.y:F1},{userPosition.z:F1})\n" +
+            $"Gaze: ({gazeDirection.x:F2},{gazeDirection.y:F2},{gazeDirection.z:F2})\n" +
+            $"Voice: \"{_lastUserCommand}\"\n" +
+            $"Image: {passthroughJpeg.Length/1024}KB\n" +
+            $"MRUK: {mrukJson.Length} chars";
+        Debug.Log($"[ARIA] {requestLog}");
+        ARIADebugUI.AppendClaudeLog(requestLog);
+
         using var req = new UnityWebRequest("https://api.anthropic.com/v1/messages", "POST");
         req.uploadHandler = new UploadHandlerRaw(Encoding.UTF8.GetBytes(body));
         req.downloadHandler = new DownloadHandlerBuffer();
@@ -648,14 +735,22 @@ public class ARIAOrchestrator : MonoBehaviour
 
         try
         {
-            Debug.Log($"[ARIA] Claude adjustment response: {req.downloadHandler.text.Substring(0, Mathf.Min(200, req.downloadHandler.text.Length))}...");
-            var resp = JsonConvert.DeserializeObject<ClaudeResponse>(req.downloadHandler.text);
-            string json = StripCodeFences(resp.content[0].text);
-            return JsonConvert.DeserializeObject<PlacementInstruction>(json);
+            string fullResponse = req.downloadHandler.text;
+            var resp = JsonConvert.DeserializeObject<ClaudeResponse>(fullResponse);
+            string claudeText = resp.content[0].text;
+            string json = StripCodeFences(claudeText);
+
+            string responseLog = $"RESPONSE:\n{claudeText}";
+            Debug.Log($"[ARIA] {responseLog}");
+            ARIADebugUI.AppendClaudeLog(responseLog);
+
+            var result = JsonConvert.DeserializeObject<PlacementInstruction>(json);
+            SetStatus($"Claude: {result.category} → {result.surface_label}, scale {result.scale_factor:F2}x. {result.reasoning ?? ""}");
+            return result;
         }
         catch (Exception e)
         {
-            Debug.LogError($"[ARIA] Claude adjustment parse error: {e.Message}");
+            Debug.LogError($"[ARIA] Claude adjustment parse error: {e.Message}\nRaw: {req.downloadHandler.text}");
             SetStatus($"Claude parse error: {e.Message}");
             return original;
         }
@@ -1136,14 +1231,9 @@ public class ARIAOrchestrator : MonoBehaviour
 #endif
 
         // Lighting + interaction setup
-        if (enableLighting)
-        {
-            shEstimator?.EstimateLighting(jpeg, sceneDirectionalLight, root);
-            shEstimator?.AddPerObjectLight(root); // per-object directional from nearest ceiling light
-            AddReflectionProbe(root);
-            if (instr.emits_light) AddVirtualLight(root, instr);
-            Debug.Log($"[ARIA] Lighting applied to \"{instr.prompt}\"");
-        }
+        // Lighting is handled by PTRL toggle, not per-spawn
+        // Only add virtual light if object emits light (e.g. lamp)
+        if (instr.emits_light) AddVirtualLight(root, instr);
 
         if (enablePhysics)
             AddPhysicsAndInteraction(root);
@@ -1264,84 +1354,17 @@ public class ARIAOrchestrator : MonoBehaviour
         // Wait one frame for mesh renderers to initialize bounds properly
         await Task.Yield();
 
-        // Place using Meta's EnvironmentRaycastManager (depth-based, accurate surface detection)
+        // Initial spawn: place 1.5m ahead at eye height, floating in air.
+        // Claude adjustment handles final placement on correct surface.
         Camera cam = Camera.main;
-        bool placed = false;
-
-#if UNITY_ANDROID && !UNITY_EDITOR
-        var envRaycastMgr = FindFirstObjectByType<EnvironmentRaycastManager>();
-        if (envRaycastMgr != null && cam != null)
+        if (cam != null)
         {
-            Ray gazeRay = new Ray(cam.transform.position, cam.transform.forward);
-            Bounds b = CalculateMeshBounds(root);
-            Vector3 objSize = b.size;
-            if (objSize.magnitude < 0.01f) objSize = Vector3.one * 0.3f;
-
-            // PlaceBox finds a surface spot where the object fits
-            Vector3 upward = Vector3.up;
-            if (envRaycastMgr.Raycast(gazeRay, out var envHit, 10f))
-            {
-                bool isVertical = Mathf.Abs(Vector3.Dot(envHit.normal, Vector3.up)) < 0.3f;
-                upward = isVertical ? Vector3.up : Vector3.ProjectOnPlane(cam.transform.up, Vector3.Cross(gazeRay.direction, Vector3.up));
-
-                if (envRaycastMgr.PlaceBox(gazeRay, objSize, upward, out var placeHit))
-                {
-                    // Correct rotation: forward along surface, normal as up
-                    Vector3 forward = Vector3.Cross(placeHit.normal, Vector3.Cross(cam.transform.forward, placeHit.normal).normalized);
-                    root.transform.rotation = Quaternion.LookRotation(forward, placeHit.normal);
-                    root.transform.position = placeHit.point;
-
-                    // For horizontal surfaces, lift so bottom sits on surface
-                    if (!isVertical)
-                    {
-                        float bottomOffset = root.transform.position.y - CalculateMeshBounds(root).min.y;
-                        root.transform.position += Vector3.up * bottomOffset;
-                    }
-
-                    placed = true;
-                    Debug.Log($"[ARIA] Spawned {name} via EnvironmentRaycast at {placeHit.point} (normal={placeHit.normal})");
-                }
-                else
-                {
-                    // PlaceBox failed but raycast hit — use hit point directly
-                    root.transform.position = envHit.point;
-                    if (!isVertical)
-                    {
-                        float bottomOffset = root.transform.position.y - CalculateMeshBounds(root).min.y;
-                        root.transform.position += Vector3.up * bottomOffset;
-                        Vector3 toUser = cam.transform.position - root.transform.position;
-                        toUser.y = 0;
-                        if (toUser.sqrMagnitude > 0.01f)
-                            root.transform.rotation = Quaternion.LookRotation(toUser.normalized);
-                    }
-                    else
-                    {
-                        root.transform.rotation = Quaternion.LookRotation(envHit.normal, Vector3.up);
-                    }
-                    placed = true;
-                    Debug.Log($"[ARIA] Spawned {name} via EnvRaycast fallback at {envHit.point}");
-                }
-            }
-        }
-#endif
-
-        if (!placed && cam != null)
-        {
-            // Final fallback: Physics.Raycast or 1.5m ahead
-            if (Physics.Raycast(cam.transform.position, cam.transform.forward, out RaycastHit hit, 10f))
-            {
-                root.transform.position = hit.point;
-                float bottomOffset = root.transform.position.y - CalculateMeshBounds(root).min.y;
-                root.transform.position += Vector3.up * Mathf.Max(bottomOffset, 0);
-            }
-            else
-            {
-                Vector3 fwd = cam.transform.forward; fwd.y = 0; fwd.Normalize();
-                Bounds b = CalculateMeshBounds(root);
-                float bottomOffset = root.transform.position.y - b.min.y;
-                root.transform.position = cam.transform.position + fwd * 1.5f + Vector3.up * bottomOffset;
-            }
-            Debug.Log($"[ARIA] Spawned {name} via Physics fallback");
+            Vector3 fwd = cam.transform.forward;
+            fwd.y = 0;
+            if (fwd.sqrMagnitude < 0.001f) fwd = Vector3.forward;
+            else fwd.Normalize();
+            root.transform.position = cam.transform.position + fwd * 1.5f;
+            root.transform.rotation = Quaternion.LookRotation(-fwd, Vector3.up);
         }
 
         // Auto-fit to available MRUK space (won't hit other spawned objects due to layer)
@@ -1392,12 +1415,18 @@ public class ARIAOrchestrator : MonoBehaviour
         Transform lastSpawn = root.GetChild(root.childCount - 1);
         string objName = lastSpawn.name;
 
-        SetStatus($"Capturing view for Claude...");
-        byte[] jpeg = await CapturePassthroughFrameAsync();
+        SetStatus($"Capturing rendered view for Claude...");
+        // Capture rendered view (includes wireframe + virtual objects) for better Claude context
+        byte[] jpeg = await CaptureRenderedViewAsync();
+        if (jpeg == null || jpeg.Length < 1000)
+        {
+            // Fallback to passthrough if rendered capture fails
+            jpeg = await CapturePassthroughFrameAsync();
+        }
         if (jpeg == null)
         {
-            SetStatus("Passthrough capture failed — camera not ready.");
-            Debug.LogError("[ARIA] CapturePassthroughFrameAsync returned null");
+            SetStatus("Image capture failed.");
+            Debug.LogError("[ARIA] Both rendered and passthrough capture failed");
             return;
         }
 
@@ -1461,45 +1490,255 @@ public class ARIAOrchestrator : MonoBehaviour
     // Retroactive lighting — call from debug UI to apply lighting to all spawned objects
     // -------------------------------------------------------------------------
 
+    // -------------------------------------------------------------------------
+    // PTRL toggle — single button controls everything
+    // -------------------------------------------------------------------------
+
+    private bool _ptrlActive;
+
     /// <summary>
-    /// Applies lighting (SH, reflection probes) to all children of spawnRoot.
-    /// Called from ARIADebugUI when "Enable Lighting" is toggled on mid-demo.
+    /// Toggles PTRL on/off. Single button replaces Apply Lighting + ARIA vs Default.
+    /// ON: EffectMesh gets PTRL material, shadows enabled, light spheres hidden, passthrough dims.
+    /// OFF: EffectMesh back to wireframe, no shadows, plain default lighting.
     /// </summary>
-    public async void ApplyLightingToAllSpawned()
+    public bool TogglePTRL()
     {
-        Transform root = spawnRoot != null ? spawnRoot : transform;
-        int count = 0;
+        _ptrlActive = !_ptrlActive;
 
-        // Capture fresh passthrough frame and analyze lighting
-        SetStatus("Analyzing room lighting...");
-        byte[] jpeg = await CapturePassthroughFrameAsync();
-        shEstimator?.EstimateLighting(jpeg, sceneDirectionalLight, null);
-
-        // Re-configure shadow receiver with PTRL shader (in case new surfaces spawned)
-        shadowReceiver?.Reconfigure();
-
-        foreach (Transform child in root)
+        if (_ptrlActive)
         {
-            if (child.Find("ARIA_ObjectLight") == null)
-                shEstimator?.AddPerObjectLight(child.gameObject);
-            if (child.Find("ARIA_ReflectionProbe") == null)
-                AddReflectionProbe(child.gameObject);
-            count++;
+            // ── PTRL ON ──────────────────────────────────────────────────
+
+            // Switch EffectMesh to PTRL material for shadow rendering on real surfaces
+            // PTRL material applied directly to EffectMesh below — no shadowReceiver needed
+#if UNITY_ANDROID && !UNITY_EDITOR
+            var effectMesh = FindFirstObjectByType<Meta.XR.MRUtilityKit.EffectMesh>();
+            if (effectMesh != null)
+            {
+                effectMesh.DestroyMesh();
+                // Switch to PTRL material + FLOOR only
+                var ptrlMat = UnityEngine.Resources.FindObjectsOfTypeAll<Material>()
+                    .FirstOrDefault(m => m.name == "TransparentSceneAnchor");
+                if (ptrlMat != null) effectMesh.MeshMaterial = ptrlMat;
+                effectMesh.Labels = Meta.XR.MRUtilityKit.MRUKAnchor.SceneLabels.FLOOR;
+                effectMesh.HideMesh = false;
+                effectMesh.CreateMesh();
+                Debug.Log("[ARIA] EffectMesh: PTRL material on FLOOR only.");
+            }
+#endif
+
+            // Align directional light from first manual sphere toward scene center
+            if (sceneDirectionalLight != null)
+            {
+                sceneDirectionalLight.shadows = LightShadows.Soft;
+                if (_manualLights.Count > 0)
+                {
+                    Vector3 lightPos = _manualLights[0].transform.position;
+                    Transform objRoot = spawnRoot != null ? spawnRoot : transform;
+                    Vector3 targetPos = objRoot.childCount > 0
+                        ? objRoot.GetChild(0).position : Vector3.zero;
+                    Vector3 dir = (targetPos - lightPos).normalized;
+                    if (dir.sqrMagnitude > 0.01f)
+                        sceneDirectionalLight.transform.rotation = Quaternion.LookRotation(dir);
+                    var ml = _manualLights[0].GetComponent<Light>();
+                    if (ml != null) sceneDirectionalLight.color = ml.color;
+                }
+                sceneDirectionalLight.intensity = 1f;
+            }
+
+            // Enable point lights from manual spheres, hide sphere visuals
+            foreach (var lightGO in _manualLights)
+            {
+                if (lightGO == null) continue;
+                var light = lightGO.GetComponent<Light>();
+                if (light != null) light.enabled = true;
+                foreach (var r in lightGO.GetComponentsInChildren<Renderer>())
+                    r.enabled = false;
+            }
+
+            // Dim passthrough for better shadow visibility
+#if UNITY_ANDROID && !UNITY_EDITOR
+            var ptLayer = FindFirstObjectByType<OVRPassthroughLayer>();
+            if (ptLayer != null)
+                ptLayer.SetBrightnessContrastSaturation(0f); // no dimming — room is well-lit
+#endif
+
+            SetStatus($"PTRL ON — {_manualLights.Count} light(s), shadows active");
+            Debug.Log("[ARIA] PTRL enabled.");
         }
-        string summary = shEstimator != null ? shEstimator.GetLightingSummary() : "";
-        Debug.Log($"[ARIA] Applied lighting to {count} spawned object(s). {summary}");
-        SetStatus($"Lighting: {count} obj(s). {summary}");
+        else
+        {
+            // ── PTRL OFF ─────────────────────────────────────────────────
+
+            // Directional light: plain white from above, NO shadows
+            if (sceneDirectionalLight != null)
+            {
+                sceneDirectionalLight.shadows = LightShadows.None;
+                sceneDirectionalLight.color = Color.white;
+                sceneDirectionalLight.transform.rotation = Quaternion.Euler(90, 0, 0);
+                sceneDirectionalLight.intensity = 1f;
+            }
+
+            // Disable point lights, show sphere visuals
+            foreach (var lightGO in _manualLights)
+            {
+                if (lightGO == null) continue;
+                var light = lightGO.GetComponent<Light>();
+                if (light != null) light.enabled = false;
+                foreach (var r in lightGO.GetComponentsInChildren<Renderer>())
+                    r.enabled = true;
+            }
+
+            // Restore EffectMesh to wireframe with all labels
+#if UNITY_ANDROID && !UNITY_EDITOR
+            var effectMeshOff = FindFirstObjectByType<Meta.XR.MRUtilityKit.EffectMesh>();
+            if (effectMeshOff != null)
+            {
+                effectMeshOff.DestroyMesh();
+                // Restore wireframe material + all labels
+                var wireframeMat = UnityEngine.Resources.FindObjectsOfTypeAll<Material>()
+                    .FirstOrDefault(m => m.name == "RoomBoxEffects");
+                if (wireframeMat != null) effectMeshOff.MeshMaterial = wireframeMat;
+                effectMeshOff.Labels = (Meta.XR.MRUtilityKit.MRUKAnchor.SceneLabels)442367;
+                effectMeshOff.HideMesh = false;
+                effectMeshOff.CreateMesh();
+                Debug.Log("[ARIA] EffectMesh: wireframe restored.");
+            }
+
+            var ptLayer = FindFirstObjectByType<OVRPassthroughLayer>();
+            if (ptLayer != null)
+                ptLayer.SetBrightnessContrastSaturation(0f);
+#endif
+
+            SetStatus("PTRL OFF — default lighting");
+            Debug.Log("[ARIA] PTRL disabled.");
+        }
+
+        return _ptrlActive;
     }
 
+    // -------------------------------------------------------------------------
+    // Manual light placement — user places virtual lights at real light positions
+    // -------------------------------------------------------------------------
+
+    private readonly List<GameObject> _manualLights = new();
+
     /// <summary>
-    /// Toggles between ARIA lighting and default Unity lighting for demo comparison.
+    /// Places a virtual point light at the crosshair position.
+    /// User looks at their real ceiling light and presses this button.
+    /// The PTRL shader renders shadows from this light on room surfaces.
     /// </summary>
-    public bool ToggleLightingComparison()
+    public async void PlaceLightAtCrosshair()
     {
-        if (shEstimator == null) return true;
-        bool ariaActive = shEstimator.ToggleComparison(sceneDirectionalLight);
-        SetStatus(ariaActive ? "ARIA lighting ON" : "Default lighting (no ARIA)");
-        return ariaActive;
+        Camera cam = Camera.main;
+        if (cam == null) return;
+
+        Vector3 lightPos;
+
+        // Spawn 1m in front of user, easy to grab and move
+        Vector3 fwd = cam.transform.forward;
+        lightPos = cam.transform.position + fwd * 1f;
+
+        // Capture passthrough and sample AVERAGE color (our SH-inspired approach)
+        // The average of the frame near the light source gives the real light's color
+        Color lightColor = new Color(1f, 0.9f, 0.7f); // warm white fallback
+        float lightIntensity = 2f;
+
+        byte[] jpeg = await CapturePassthroughFrameAsync();
+        if (jpeg != null && jpeg.Length > 1000)
+        {
+            var tex = new Texture2D(2, 2, TextureFormat.RGB24, false);
+            if (tex.LoadImage(jpeg))
+            {
+                // Sample 4x4 grid (16 points) across the frame — our SH sampling approach
+                Color avgColor = Color.black;
+                float maxBright = 0f;
+                int samples = 0;
+                for (int sRow = 0; sRow < 4; sRow++)
+                {
+                    for (int sCol = 0; sCol < 4; sCol++)
+                    {
+                        Color p = tex.GetPixelBilinear((sCol + 0.5f) / 4f, (sRow + 0.5f) / 4f);
+                        avgColor += p;
+                        if (p.grayscale > maxBright) maxBright = p.grayscale;
+                        samples++;
+                    }
+                }
+                avgColor /= Mathf.Max(samples, 1);
+
+                if (avgColor.grayscale > 0.05f)
+                {
+                    // Blend toward the average room color — this IS our light color
+                    lightColor = Color.Lerp(Color.white, avgColor, 0.7f);
+                    lightIntensity = Mathf.Clamp(maxBright * 3f, 1f, 4f);
+                    Debug.Log($"[ARIA] Light color from SH sampling: avg={avgColor}, max={maxBright:F2}, intensity={lightIntensity:F1}");
+                    ARIADebugUI.AppendClaudeLog($"LIGHT COLOR:\nAvg: {avgColor}\nMax brightness: {maxBright:F2}\nIntensity: {lightIntensity:F1}");
+                }
+            }
+            Destroy(tex);
+        }
+
+        var lightGO = new GameObject($"ARIA_ManualLight_{_manualLights.Count}");
+        lightGO.transform.position = lightPos;
+
+        var light = lightGO.AddComponent<Light>();
+        light.type = LightType.Point;
+        light.color = lightColor;
+        light.intensity = lightIntensity;
+        light.range = 10f;
+        light.shadows = LightShadows.Soft;
+        light.shadowStrength = 0.6f;
+        light.shadowBias = 0.05f;
+        light.shadowNormalBias = 0.4f;
+
+        // Visual indicator — small glowing sphere
+        var indicator = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        indicator.transform.SetParent(lightGO.transform);
+        indicator.transform.localPosition = Vector3.zero;
+        indicator.transform.localScale = Vector3.one * 0.05f;
+        Destroy(indicator.GetComponent<Collider>());
+        var mat = new Material(Shader.Find("Universal Render Pipeline/Lit"));
+        if (mat != null)
+        {
+            mat.SetColor("_BaseColor", lightColor);
+            mat.SetColor("_EmissionColor", lightColor * 3f);
+            mat.EnableKeyword("_EMISSION");
+            indicator.GetComponent<Renderer>().material = mat;
+        }
+
+        // Add collider so controller can detect it + Interaction SDK grab components
+        var col = indicator.AddComponent<SphereCollider>();
+        col.radius = 2f; // generous grab radius in local space (sphere is 0.05 scale = 0.1m grab zone)
+
+        // Add Grabbable + HandGrabInteractable via reflection (avoids compile-time dependency)
+#if UNITY_ANDROID && !UNITY_EDITOR
+        try
+        {
+            var grabbableType = System.Type.GetType("Oculus.Interaction.Grabbable, Oculus.Interaction.Runtime");
+            var grabInterType = System.Type.GetType("Oculus.Interaction.HandGrab.HandGrabInteractable, Oculus.Interaction.Runtime");
+            if (grabbableType != null) lightGO.AddComponent(grabbableType);
+            if (grabInterType != null) lightGO.AddComponent(grabInterType);
+            Debug.Log($"[ARIA] Grab components added to light #{_manualLights.Count}");
+        }
+        catch (System.Exception e)
+        {
+            Debug.LogWarning($"[ARIA] Grab setup skipped: {e.Message}");
+        }
+#endif
+
+        // Add Rigidbody (kinematic — no gravity, stays where you drop it)
+        var rb = lightGO.AddComponent<Rigidbody>();
+        rb.useGravity = false;
+        rb.isKinematic = true;
+
+        _manualLights.Add(lightGO);
+
+        // Re-apply PTRL material
+        shadowReceiver?.Reconfigure();
+
+        SetStatus($"Light #{_manualLights.Count} placed (color: {lightColor}, intensity: {lightIntensity:F1})");
+        Debug.Log($"[ARIA] Manual light at {lightPos}, color={lightColor}, intensity={lightIntensity:F1}");
+        ARIADebugUI.AppendClaudeLog($"LIGHT PLACED:\nPos: {lightPos}\nColor: {lightColor}\nIntensity: {lightIntensity:F1}");
     }
 
     // -------------------------------------------------------------------------

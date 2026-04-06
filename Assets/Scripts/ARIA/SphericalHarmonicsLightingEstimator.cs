@@ -35,8 +35,9 @@ public class SphericalHarmonicsLightingEstimator : MonoBehaviour
     [SerializeField] private float analysisInterval = 3f;
 
     [Header("Multi-light Detection")]
-    [Tooltip("Minimum brightness (0-1) for a cubemap pixel to be a light source candidate.")]
-    [SerializeField] private float brightThreshold = 0.45f;
+    [Tooltip("Minimum brightness (0-1) for a cubemap pixel to be a light source candidate. " +
+             "Quest passthrough is very dark — use 0.2-0.3.")]
+    [SerializeField] private float brightThreshold = 0.25f;
 
     [Tooltip("Maximum number of detected room lights.")]
     [SerializeField] private int maxDetectedLights = 4;
@@ -261,6 +262,24 @@ public class SphericalHarmonicsLightingEstimator : MonoBehaviour
         // Stage 2: Set directional light from dominant brightness
         SetDirectionalLightFromFrame(tex, directionalLight);
 
+        // Log image stats for debugging
+        float maxBrightness = 0f, avgBrightness = 0f;
+        int sampleCount = 0;
+        for (int sy = 0; sy < 8; sy++)
+        {
+            for (int sx = 0; sx < 8; sx++)
+            {
+                Color p = tex.GetPixelBilinear((sx + 0.5f) / 8f, (sy + 0.5f) / 8f);
+                float b = p.grayscale;
+                if (b > maxBrightness) maxBrightness = b;
+                avgBrightness += b;
+                sampleCount++;
+            }
+        }
+        avgBrightness /= Mathf.Max(sampleCount, 1);
+        Debug.Log($"[SHEstimator] Image stats: {tex.width}x{tex.height}, avg brightness={avgBrightness:F3}, max={maxBrightness:F3}, threshold={brightThreshold}");
+        ARIADebugUI.AppendClaudeLog($"LIGHTING:\nImage: {tex.width}x{tex.height}\nAvg brightness: {avgBrightness:F3}\nMax brightness: {maxBrightness:F3}\nThreshold: {brightThreshold}");
+
         // Stage 3: Multi-light detection — find bright clusters → spawn point lights
         CleanupDetectedLights();
         DetectMultipleLightSources(tex, directionalLight);
@@ -269,6 +288,7 @@ public class SphericalHarmonicsLightingEstimator : MonoBehaviour
 
         string summary = GetLightingSummary();
         Debug.Log($"[SHEstimator] Analysis complete. {summary}");
+        ARIADebugUI.AppendClaudeLog($"RESULT: {summary}");
     }
 
     // -------------------------------------------------------------------------

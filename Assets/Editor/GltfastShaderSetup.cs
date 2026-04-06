@@ -22,6 +22,8 @@ public static class GltfastShaderSetup
             "glTF/Unlit",
             "Universal Render Pipeline/Lit",
             "Universal Render Pipeline/Simple Lit",
+            "Meta/MRUK/Scene/HighlightsAndShadows",
+            "Meta/MRUK/Scene/BlobShadow",
         };
 
         var graphicsSettings = AssetDatabase.LoadAssetAtPath<GraphicsSettings>(
