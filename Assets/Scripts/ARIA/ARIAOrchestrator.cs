@@ -19,6 +19,7 @@ using UnityEngine;
 using UnityEngine.Networking;
 
 public enum MeshProvider { HiTEM3D, Tripo3D }
+public enum ShadowMode  { Directional, PointLight }
 
 public class ARIAOrchestrator : MonoBehaviour
 {
@@ -53,12 +54,12 @@ public class ARIAOrchestrator : MonoBehaviour
     [Tooltip("Which API to use for 3D mesh generation. Switch to save credits.")]
     [SerializeField] private MeshProvider meshProvider = MeshProvider.Tripo3D;
 
-    // API keys — loaded from config.json at runtime
-    private string _claudeKey;
-    private string _geminiKey;
-    private string _hitemAccessKey;
-    private string _hitemSecretKey;
-    private string _tripoKey;
+    // API keys — hardcoded for development, removed before git push
+    private string _claudeKey  = "";
+    private string _geminiKey  = "";
+    private string _hitemAccessKey = "";
+    private string _hitemSecretKey = "";
+    private string _tripoKey   = "";
 
     // Passthrough camera for frame capture (WebCamTexture, Quest 3/3S only)
     private WebCamTexture _webcam;
@@ -1477,9 +1478,41 @@ public class ARIAOrchestrator : MonoBehaviour
     // -------------------------------------------------------------------------
 
     private bool _ptrlActive;
+    private ShadowMode _shadowMode = ShadowMode.Directional;
 
     /// <summary>Whether PTRL is currently active. Used by DebugUI to gate selection.</summary>
     public bool IsPTRLActive => _ptrlActive;
+    public ShadowMode CurrentShadowMode => _shadowMode;
+
+    /// <summary>Cycles shadow mode. Only takes effect on next TogglePTRL call.</summary>
+    public ShadowMode CycleShadowMode()
+    {
+        _shadowMode = _shadowMode == ShadowMode.Directional
+            ? ShadowMode.PointLight : ShadowMode.Directional;
+        // If PTRL is already on, re-apply with the new mode
+        if (_ptrlActive)
+        {
+            ApplyShadowMode();
+            // Update PTRL surface properties for the new mode
+            float hlOpacity = _shadowMode == ShadowMode.PointLight ? 0.5f : 0f;
+            float shadowInt = _shadowMode == ShadowMode.PointLight ? 1f : 0.75f;
+            foreach (var surface in _ptrlShadowSurfaces)
+            {
+                if (surface == null) continue;
+                var mat = surface.GetComponent<Renderer>()?.material;
+                if (mat != null)
+                {
+                    mat.SetFloat("_HighlightOpacity", hlOpacity);
+                    mat.SetFloat("_ShadowIntensity", shadowInt);
+                }
+            }
+        }
+        string modeLabel = _shadowMode == ShadowMode.Directional ? "Directional" : "Point Light";
+        SetStatus($"Shadow mode: {modeLabel}");
+        Debug.Log($"[ARIA] Shadow mode: {_shadowMode}");
+        ARIADebugUI.AppendClaudeLog($"Shadow mode → {modeLabel}");
+        return _shadowMode;
+    }
 
     /// <summary>
     /// Toggles PTRL on/off. Single button replaces Apply Lighting + ARIA vs Default.
@@ -1496,48 +1529,50 @@ public class ARIAOrchestrator : MonoBehaviour
         {
             // ── PTRL ON ──────────────────────────────────────────────────
 
-            // Create invisible shadow floor with PTRL material
+            // Create invisible shadow surfaces (floor + walls + ceiling) with PTRL material
             CreatePTRLShadowFloor();
 
-            // Disable directional light shadows — we use point lights from spheres instead.
-            // Point lights create diverging shadows from a specific position (like a real ceiling light),
-            // unlike directional lights which cast parallel shadows (like distant sunlight).
-            if (sceneDirectionalLight != null)
-            {
-                sceneDirectionalLight.shadows = LightShadows.None;
-                sceneDirectionalLight.intensity = 0.3f; // dim ambient fill only
-            }
+            // Apply shadow mode (directional or point light)
+            ApplyShadowMode();
 
-            // Enable point lights from manual spheres — these cast the shadows
+            // Hide sphere visuals so they don't cast shadows themselves
             foreach (var lightGO in _manualLights)
             {
                 if (lightGO == null) continue;
-                var light = lightGO.GetComponent<Light>();
-                if (light != null)
-                {
-                    light.enabled = true;
-                    light.shadows = LightShadows.Soft;
-                    light.shadowStrength = 0.8f;
-                }
-                // Hide sphere visuals so they don't cast shadows themselves
                 foreach (var r in lightGO.GetComponentsInChildren<Renderer>())
                     r.enabled = false;
             }
 
-            // Make sure EffectMesh surfaces don't cast shadows (only virtual objects should)
+            // Configure PTRL surface properties based on shadow mode
+            // Directional mode: highlights OFF (prevents white-wash), shadows only
+            // Point light mode: highlights ON (point light shadows work via highlight channel)
+            float hlOpacity = _shadowMode == ShadowMode.PointLight ? 0.5f : 0f;
+            float shadowInt = _shadowMode == ShadowMode.PointLight ? 1f : 0.75f;
+            foreach (var surface in _ptrlShadowSurfaces)
+            {
+                if (surface == null) continue;
+                var mat = surface.GetComponent<Renderer>()?.material;
+                if (mat != null)
+                {
+                    mat.SetFloat("_HighlightOpacity", hlOpacity);
+                    mat.SetFloat("_ShadowIntensity", shadowInt);
+                }
+            }
+
+            // Make sure EffectMesh surfaces don't cast shadows
             var effectMesh = FindFirstObjectByType<Meta.XR.MRUtilityKit.EffectMesh>();
             if (effectMesh != null)
             {
                 foreach (var r in effectMesh.GetComponentsInChildren<Renderer>())
                 {
                     r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
-                    r.receiveShadows = false; // don't show shadows on wireframe surfaces
+                    r.receiveShadows = false;
                 }
             }
 
-            SetStatus($"PTRL ON — {_manualLights.Count} light(s), shadows active");
-            Debug.Log("[ARIA] PTRL enabled.");
-            ARIADebugUI.AppendClaudeLog($"PTRL ON\nLights: {_manualLights.Count}\nAmbient: {RenderSettings.ambientLight}");
+            SetStatus($"PTRL ON ({_shadowMode}) — {_manualLights.Count} light(s)");
+            Debug.Log($"[ARIA] PTRL enabled. Shadow mode: {_shadowMode}");
+            ARIADebugUI.AppendClaudeLog($"PTRL ON ({_shadowMode})\nLights: {_manualLights.Count}\nAmbient: {RenderSettings.ambientLight}");
         }
         else
         {
@@ -1546,7 +1581,7 @@ public class ARIAOrchestrator : MonoBehaviour
             // Destroy the shadow floor
             DestroyPTRLShadowFloor();
 
-            // Directional light: plain white from above, NO shadows
+            // Directional light: plain white from above, NO shadows, full intensity
             if (sceneDirectionalLight != null)
             {
                 sceneDirectionalLight.shadows = LightShadows.None;
@@ -1554,6 +1589,10 @@ public class ARIAOrchestrator : MonoBehaviour
                 sceneDirectionalLight.transform.rotation = Quaternion.Euler(90, 0, 0);
                 sceneDirectionalLight.intensity = 1f;
             }
+
+            // Reset ambient to default bright so objects don't go dark
+            RenderSettings.ambientMode = UnityEngine.Rendering.AmbientMode.Flat;
+            RenderSettings.ambientLight = new Color(0.5f, 0.5f, 0.5f); // neutral grey ambient
 
             // Disable point lights, show sphere visuals
             foreach (var lightGO in _manualLights)
@@ -1571,6 +1610,77 @@ public class ARIAOrchestrator : MonoBehaviour
         }
 
         return _ptrlActive;
+    }
+
+    /// <summary>
+    /// Configures lights based on current shadow mode.
+    /// Directional: single directional light aimed from first sphere toward objects, point lights for color only.
+    /// PointLight: each point light casts its own shadows (cubemap), no directional shadow.
+    /// </summary>
+    private void ApplyShadowMode()
+    {
+        if (_shadowMode == ShadowMode.Directional)
+        {
+            // Directional light aimed from first sphere toward objects — sharp shadows, one direction
+            if (sceneDirectionalLight != null && _manualLights.Count > 0)
+            {
+                Vector3 lightPos = _manualLights[0].transform.position;
+                Transform objRoot = spawnRoot != null ? spawnRoot : transform;
+                Vector3 targetPos = objRoot.childCount > 0
+                    ? objRoot.GetChild(0).position : Vector3.zero;
+                Vector3 dir = (targetPos - lightPos).normalized;
+                if (dir.sqrMagnitude > 0.01f)
+                    sceneDirectionalLight.transform.rotation = Quaternion.LookRotation(dir);
+
+                sceneDirectionalLight.shadows = LightShadows.Soft;
+                sceneDirectionalLight.shadowStrength = 0.85f;
+                sceneDirectionalLight.intensity = 0.15f;
+                sceneDirectionalLight.color = _manualLights[0].GetComponent<Light>()?.color ?? Color.white;
+            }
+            else if (sceneDirectionalLight != null)
+            {
+                sceneDirectionalLight.shadows = LightShadows.None;
+                sceneDirectionalLight.intensity = 0.3f;
+            }
+
+            // Point lights: color/illumination only, NO shadows
+            foreach (var lightGO in _manualLights)
+            {
+                if (lightGO == null) continue;
+                var light = lightGO.GetComponent<Light>();
+                if (light != null)
+                {
+                    light.enabled = true;
+                    light.shadows = LightShadows.None;
+                }
+            }
+        }
+        else // PointLight mode
+        {
+            // Directional light: dim ambient fill, NO shadows
+            if (sceneDirectionalLight != null)
+            {
+                sceneDirectionalLight.shadows = LightShadows.None;
+                sceneDirectionalLight.intensity = 0.1f;
+                sceneDirectionalLight.color = Color.white;
+                sceneDirectionalLight.transform.rotation = Quaternion.Euler(90, 0, 0);
+            }
+
+            // Each point light casts its own shadows (cubemap, diverging, per-object direction)
+            foreach (var lightGO in _manualLights)
+            {
+                if (lightGO == null) continue;
+                var light = lightGO.GetComponent<Light>();
+                if (light != null)
+                {
+                    light.enabled = true;
+                    light.shadows = LightShadows.Soft;
+                    light.shadowStrength = 1f;
+                    light.shadowBias = 0.05f;
+                    light.shadowNormalBias = 0.4f;
+                }
+            }
+        }
     }
 
     // Invisible PTRL shadow surfaces — floor + wall planes, independent of EffectMesh
@@ -1673,8 +1783,8 @@ public class ARIAOrchestrator : MonoBehaviour
     {
         var r = go.GetComponent<Renderer>();
         r.material = ptrlMat;
-        r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off; // don't cast shadows
-        r.receiveShadows = true; // receive shadows from virtual objects
+        r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+        r.receiveShadows = true;
     }
 
     private void DestroyPTRLShadowFloor()
@@ -1782,7 +1892,10 @@ public class ARIAOrchestrator : MonoBehaviour
         confirmCanvas.transform.localPosition = new Vector3(0f, 0.08f, 0f); // above the sphere
         confirmCanvas.transform.localScale = Vector3.one * 0.002f;
         var canvasRT = confirmCanvas.GetComponent<RectTransform>();
-        canvasRT.sizeDelta = new Vector2(120, 40);
+        canvasRT.sizeDelta = new Vector2(200, 90); // wider for instruction text
+
+        // Billboard: always face the camera
+        confirmCanvas.AddComponent<BillboardFaceCamera>();
 
         // Confirm button
         var btnGO = new GameObject("ConfirmBtn", typeof(RectTransform),
@@ -1940,10 +2053,11 @@ public class ARIAOrchestrator : MonoBehaviour
             }
         }
 
-        SetStatus($"Light #{lightIndex + 1} confirmed: color={lightColor}, intensity={lightIntensity:F1}");
-        Debug.Log($"[ARIA] Light #{lightIndex + 1} confirmed at {lightGO.transform.position}, color={lightColor}, ambient={RenderSettings.ambientLight}");
-        ARIADebugUI.AppendClaudeLog($"LIGHT #{lightIndex + 1} CONFIRMED:\nPos: {lightGO.transform.position:F2}\nColor: {lightColor}\nIntensity: {lightIntensity:F1}\nAmbient: {RenderSettings.ambientLight}");
-        ARIADebugUI.AppendClaudeLog($"LIGHT CONFIRMED:\nPos: {lightGO.transform.position}\nColor: {lightColor}\nIntensity: {lightIntensity:F1}");
+        string colorName = GetColorName(lightColor);
+        string kelvin = GetColorTemperature(lightColor);
+        SetStatus($"Light #{lightIndex + 1}: {colorName} ({kelvin}), intensity={lightIntensity:F1}");
+        Debug.Log($"[ARIA] Light #{lightIndex + 1} confirmed at {lightGO.transform.position}, color={lightColor} ({colorName}), ambient={RenderSettings.ambientLight}");
+        ARIADebugUI.AppendClaudeLog($"LIGHT #{lightIndex + 1} CONFIRMED:\nColor: {colorName} ({kelvin})\nRGB: ({lightColor.r:F2}, {lightColor.g:F2}, {lightColor.b:F2})\nIntensity: {lightIntensity:F1}\nAmbient fill: {RenderSettings.ambientLight}\nPos: {lightGO.transform.position:F2}");
     }
 
     // -------------------------------------------------------------------------
@@ -2039,6 +2153,52 @@ public class ARIAOrchestrator : MonoBehaviour
     // -------------------------------------------------------------------------
     // Utilities
     // -------------------------------------------------------------------------
+
+    /// <summary>Converts a color to a human-readable name based on hue/saturation/brightness.</summary>
+    private static string GetColorName(Color c)
+    {
+        float h, s, v;
+        Color.RGBToHSV(c, out h, out s, out v);
+
+        if (s < 0.1f)
+        {
+            if (v > 0.9f) return "White";
+            if (v > 0.6f) return "Light Grey";
+            if (v > 0.3f) return "Grey";
+            return "Dark Grey";
+        }
+
+        // Hue-based naming (0-1 range)
+        string hue;
+        if (h < 0.04f || h > 0.96f) hue = "Red";
+        else if (h < 0.11f) hue = "Orange";
+        else if (h < 0.18f) hue = "Yellow";
+        else if (h < 0.22f) hue = "Yellow-Green";
+        else if (h < 0.42f) hue = "Green";
+        else if (h < 0.52f) hue = "Cyan";
+        else if (h < 0.72f) hue = "Blue";
+        else if (h < 0.82f) hue = "Purple";
+        else hue = "Pink";
+
+        if (v < 0.3f) return $"Dark {hue}";
+        if (s < 0.4f) return $"Pale {hue}";
+        if (v > 0.85f && s > 0.5f) return $"Bright {hue}";
+        return $"Warm {hue}";
+    }
+
+    /// <summary>Estimates color temperature in Kelvin from RGB color (approximate).</summary>
+    private static string GetColorTemperature(Color c)
+    {
+        // Simple estimate: warm (reddish) = low K, cool (bluish) = high K
+        float warmth = (c.r * 0.6f + c.g * 0.3f) / Mathf.Max(c.b + 0.01f, 0.01f);
+        int kelvin;
+        if (warmth > 2.5f) kelvin = 2700;       // warm incandescent
+        else if (warmth > 1.8f) kelvin = 3200;   // warm white LED
+        else if (warmth > 1.3f) kelvin = 4000;   // neutral white
+        else if (warmth > 0.9f) kelvin = 5000;   // daylight
+        else kelvin = 6500;                       // cool daylight
+        return $"~{kelvin}K";
+    }
 
     /// <summary>Bridges UnityWebRequestAsyncOperation to Task so we can await it.</summary>
     private static Task AwaitRequest(UnityWebRequestAsyncOperation op)

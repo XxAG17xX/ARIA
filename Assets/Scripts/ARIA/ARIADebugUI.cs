@@ -44,6 +44,7 @@ public class ARIADebugUI : MonoBehaviour
     private bool       _menuVisible;
     private GameObject _mainPanel;
     private GameObject _countdownPanel;
+    private CanvasGroup _countdownGroup; // use alpha instead of SetActive to keep mesh alive
     private Text       _statusText;
     private Text       _transcriptText;
     private Text       _countdownNumText;
@@ -52,6 +53,9 @@ public class ARIADebugUI : MonoBehaviour
     // PTRL toggle button reference
     private GameObject _ptrlButton;
     private Text _ptrlButtonText;
+
+    // Shadow mode toggle button reference
+    private Text _shadowModeButtonText;
 
     // Activity log panel (shows Claude calls, light confirms, spawns, PTRL, errors)
     private GameObject _logCanvasGO;
@@ -142,8 +146,26 @@ public class ARIADebugUI : MonoBehaviour
 
     private static void SuppressBoundary()
     {
-        try { OVRManager.boundary.SetVisible(false); }
-        catch (System.Exception) { /* Deprecated in OpenXR — safe to ignore */ }
+        try
+        {
+            // Try multiple approaches to suppress boundary for MR passthrough
+            // 1. Legacy (deprecated but sometimes still works)
+            OVRManager.boundary.SetVisible(false);
+        }
+        catch (System.Exception) { /* Deprecated in OpenXR */ }
+
+        try
+        {
+            // 2. Set boundary to not be visible via OVRManager instance
+            if (OVRManager.instance != null)
+            {
+                // Request no boundary rendering — MR passthrough app shows real world
+                var t = typeof(OVRManager);
+                var prop = t.GetProperty("shouldBoundaryVisibilityBeSuppressed");
+                if (prop != null) prop.SetValue(OVRManager.instance, true);
+            }
+        }
+        catch (System.Exception) { /* Property may not exist in this SDK version */ }
     }
 
     // Gaze pointer state
@@ -182,8 +204,8 @@ public class ARIADebugUI : MonoBehaviour
         // Keep log panel text fresh while menu is open
         if (_menuVisible && _logCanvasGO != null && _logCanvasGO.activeSelf && _logText != null)
         {
-            _logText.text = _claudeLog;
-            _logText.SetAllDirty();
+            if (_logText.text != _claudeLog)
+                _logText = RemakeLabel(_logText, _claudeLog);
         }
 
         // Gaze-based VR pointer (only when menu is visible)
@@ -194,22 +216,23 @@ public class ARIADebugUI : MonoBehaviour
 
         float remaining = _countdownEnd - Time.time;
 
-        // Update VR countdown display
+        // Update VR countdown display — recreate label to force Quest canvas rebuild
         if (_countdownNumText != null)
         {
             int display = Mathf.CeilToInt(remaining);
             if (display < 1) display = 1;
-            _countdownNumText.text = display.ToString();
-            // Force world-space canvas to redraw (batch invalidation)
-            _countdownNumText.SetAllDirty();
-            Canvas.ForceUpdateCanvases();
+            string numStr = display.ToString();
+            if (_countdownNumText.text != numStr)
+                _countdownNumText = RemakeLabel(_countdownNumText, numStr);
         }
 
         if (remaining <= 0f)
         {
             _countdownActive = false;
-            if (_countdownPanel != null) _countdownPanel.SetActive(false);
-            if (_mainPanel != null) _mainPanel.SetActive(true);
+            ShowCountdownPanel(false);
+
+            // Auto-hide menu so spawned objects aren't hidden behind the UI panel
+            if (_menuVisible) ToggleMenu();
 
             if (_pendingAction != null)
             {
@@ -369,12 +392,24 @@ public class ARIADebugUI : MonoBehaviour
             () => {
                 bool on = _orchestrator.TogglePTRL();
                 if (_ptrlButtonText != null)
-                {
                     _ptrlButtonText.text = on ? "PTRL: ON" : "PTRL: OFF";
-                    _ptrlButtonText.SetAllDirty();
-                }
             });
-        y -= 58f;
+
+        // Shadow mode toggle — below PTRL button
+        MakeButton(_mainPanel.transform, "BtnShadowMode", "Shadows: Directional",
+            new Vector2(0, y - 50), new Vector2(560, 44),
+            () => {
+                var mode = _orchestrator.CycleShadowMode();
+                if (_shadowModeButtonText != null)
+                    _shadowModeButtonText.text = mode == ShadowMode.Directional
+                        ? "Shadows: Directional" : "Shadows: Point Light";
+            });
+        {
+            var btn = _mainPanel.transform.Find("BtnShadowMode");
+            if (btn != null)
+                _shadowModeButtonText = btn.GetComponentInChildren<Text>();
+        }
+        y -= 108f; // PTRL (50) + gap + shadow mode (44) + gap
 
         // ── DEMO SPAWN — pre-bundled GLBs, zero API calls ──────────────
         MakeLabel(_mainPanel.transform, "DemoTitle", "DEMO (instant, no credits):",
@@ -424,9 +459,15 @@ public class ARIADebugUI : MonoBehaviour
             "Status: " + _status,
             new Vector2(0, y), new Vector2(560, 50), 17, FontStyle.Normal, Color.white);
 
-        // ── Countdown overlay (hidden) ──────────────────────────────────────
+        // ── Countdown overlay ────────────────────────────────────────────────
+        // Use CanvasGroup alpha instead of SetActive so the Text mesh stays
+        // initialized and .text updates work normally on Quest.
         _countdownPanel = MakePanel(canvasGO.transform, "CountdownPanel",
             Vector2.zero, new Vector2(600, 950), new Color(0f, 0f, 0f, 0.9f));
+        _countdownGroup = _countdownPanel.AddComponent<CanvasGroup>();
+        _countdownGroup.alpha = 0f;
+        _countdownGroup.blocksRaycasts = false;
+        _countdownGroup.interactable = false;
 
         _countdownNumText = MakeLabel(_countdownPanel.transform, "CNum", "3",
             new Vector2(0, 60), new Vector2(300, 180), 120, FontStyle.Bold,
@@ -438,8 +479,6 @@ public class ARIADebugUI : MonoBehaviour
 
         _countdownCmdText = MakeLabel(_countdownPanel.transform, "CCmd", "",
             new Vector2(0, -110), new Vector2(560, 30), 16, FontStyle.Italic, Color.grey);
-
-        _countdownPanel.SetActive(false);
 
         Debug.Log("[ARIA] VR Canvas UI created.");
     }
@@ -479,6 +518,26 @@ public class ARIADebugUI : MonoBehaviour
         t.horizontalOverflow = HorizontalWrapMode.Wrap;
         t.verticalOverflow = VerticalWrapMode.Truncate;
         return t;
+    }
+
+    /// <summary>
+    /// Destroy and recreate a label to force Quest world-space canvas to render new text.
+    /// Quest doesn't rebuild canvas mesh on .text changes, so we create a fresh GameObject.
+    /// </summary>
+    private static Text RemakeLabel(Text existing, string newText)
+    {
+        if (existing == null) return null;
+        var go = existing.gameObject;
+        var parent = go.transform.parent;
+        var rt = go.GetComponent<RectTransform>();
+        var pos = rt.anchoredPosition;
+        var size = rt.sizeDelta;
+        int fSize = existing.fontSize;
+        var style = existing.fontStyle;
+        var color = existing.color;
+        string name = go.name;
+        Destroy(go);
+        return MakeLabel(parent, name, newText, pos, size, fSize, style, color);
     }
 
     private GameObject MakeButtonWithRef(Transform parent, string name, string label,
@@ -559,16 +618,20 @@ public class ARIADebugUI : MonoBehaviour
                 Vector3 right = Vector3.Cross(Vector3.up, fwd).normalized;
 
                 // Main menu in front
-                _canvasGO.transform.position = cam.transform.position + fwd * 1.2f;
+                _canvasGO.transform.position = cam.transform.position + fwd * 1.0f;
                 _canvasGO.transform.rotation = Quaternion.LookRotation(fwd);
 
-                // Log panel to the left, facing user
+                // Log panel to the left, angled toward user for readability
                 if (_logCanvasGO != null)
                 {
                     _logCanvasGO.SetActive(true);
-                    _logCanvasGO.transform.position = cam.transform.position + fwd * 1.2f - right * 0.65f;
-                    _logCanvasGO.transform.rotation = Quaternion.LookRotation(fwd);
-                    if (_logText != null) _logText.text = _claudeLog;
+                    Vector3 logPos = cam.transform.position + fwd * 0.8f - right * 0.55f;
+                    _logCanvasGO.transform.position = logPos;
+                    // Angle inward toward the user (30° rotation toward center)
+                    Vector3 lookDir = (cam.transform.position - logPos).normalized;
+                    lookDir.y = 0;
+                    _logCanvasGO.transform.rotation = Quaternion.LookRotation(-lookDir);
+                    if (_logText != null) _logText = RemakeLabel(_logText, _claudeLog);
                 }
             }
         }
@@ -604,12 +667,9 @@ public class ARIADebugUI : MonoBehaviour
 
             if (_countdownPanel != null)
             {
-                _countdownPanel.SetActive(true);
-                _mainPanel.SetActive(false);
-                _countdownNumText.text = "Speak";
-                _countdownNumText.SetAllDirty();
-                _countdownCmdText.text = "Say what to adjust, or press trigger to skip";
-                _countdownCmdText.SetAllDirty();
+                _countdownNumText = RemakeLabel(_countdownNumText, "Speak");
+                _countdownCmdText = RemakeLabel(_countdownCmdText, "Say what to adjust, or press trigger to skip");
+                ShowCountdownPanel(true);
             }
 
             _voiceConnector.RecordOneShot(transcript =>
@@ -619,10 +679,7 @@ public class ARIADebugUI : MonoBehaviour
                 _orchestrator.SetUserContext(transcript);
 
                 if (_countdownCmdText != null)
-                {
-                    _countdownCmdText.text = $"\"{transcript}\"";
-                    _countdownCmdText.SetAllDirty();
-                }
+                    _countdownCmdText = RemakeLabel(_countdownCmdText, $"\"{transcript}\"");
 
                 StartCountdownForAction("Claude adjustment",
                     () => _orchestrator.AdjustLastSpawnWithClaude());
@@ -650,8 +707,7 @@ public class ARIADebugUI : MonoBehaviour
             _waitingForVoice = false;
             _voiceConnector?.StopListening();
 
-            if (_countdownPanel != null) _countdownPanel.SetActive(false);
-            if (_mainPanel != null) _mainPanel.SetActive(true);
+            ShowCountdownPanel(false);
 
             SetStatus("Voice skipped — adjusting with visual context only...");
             StartCountdownForAction("Claude adjustment",
@@ -678,6 +734,13 @@ public class ARIADebugUI : MonoBehaviour
                     controllerPos = trackingSpace.TransformPoint(controllerPos);
             }
             _grabbedLight.transform.position = controllerPos + (controllerRot * Vector3.forward) * 0.1f;
+
+            // While grabbing during PTRL, show the sphere so user can see where they're placing it
+            if (_orchestrator.IsPTRLActive)
+            {
+                foreach (var r in _grabbedLight.GetComponentsInChildren<Renderer>())
+                    r.enabled = true;
+            }
             return;
         }
 
@@ -690,7 +753,7 @@ public class ARIADebugUI : MonoBehaviour
             if (ts != null) rPos = ts.TransformPoint(rPos);
         }
 
-        float nearest = 0.3f; // grab radius
+        float nearest = 0.5f; // grab radius (wider when PTRL on since spheres are invisible)
         foreach (var go in FindObjectsByType<Light>(FindObjectsSortMode.None))
         {
             if (go.name.StartsWith("ARIA_ManualLight"))
@@ -705,13 +768,20 @@ public class ARIADebugUI : MonoBehaviour
         }
 
         if (_grabbedLight != null)
-            SetStatus($"Grabbed light — move and release grip to place");
+            SetStatus($"Grabbed light — move to reposition, shadows update live");
     }
 
     private void ReleaseLight()
     {
         if (_grabbedLight != null)
         {
+            // Hide sphere again if PTRL is active
+            if (_orchestrator.IsPTRLActive)
+            {
+                foreach (var r in _grabbedLight.GetComponentsInChildren<Renderer>())
+                    r.enabled = false;
+            }
+
             SetStatus($"Light dropped at {_grabbedLight.transform.position:F1}");
             Debug.Log($"[ARIA] Light released at {_grabbedLight.transform.position}");
             _grabbedLight = null;
@@ -839,14 +909,22 @@ public class ARIADebugUI : MonoBehaviour
         SetStatus(_effectMeshHidden ? "Room wireframe OFF" : "Room wireframe ON");
     }
 
+    private void ShowCountdownPanel(bool show)
+    {
+        if (_countdownGroup != null)
+        {
+            _countdownGroup.alpha = show ? 1f : 0f;
+            _countdownGroup.blocksRaycasts = show;
+            _countdownGroup.interactable = show;
+        }
+        if (_mainPanel != null) _mainPanel.SetActive(!show);
+    }
+
     private void SetStatus(string s)
     {
         _status = s;
         if (_statusText != null)
-        {
-            _statusText.text = "Status: " + s;
-            _statusText.SetAllDirty();
-        }
+            _statusText = RemakeLabel(_statusText, "Status: " + s);
     }
 
     private void StartCountdown(string command)
@@ -874,10 +952,8 @@ public class ARIADebugUI : MonoBehaviour
         SetStatus("Look at your target...");
         if (_countdownPanel != null)
         {
-            _countdownCmdText.text = $"\"{label}\"";
-            _countdownCmdText.SetAllDirty();
-            _countdownPanel.SetActive(true);
-            _mainPanel.SetActive(false);
+            _countdownCmdText = RemakeLabel(_countdownCmdText, $"\"{label}\"");
+            ShowCountdownPanel(true);
         }
     }
 
@@ -936,8 +1012,11 @@ public class ARIADebugUI : MonoBehaviour
         cy += lineH + 6f;
 
         float halfBtn = (panelW - padding * 2f - 8f) / 2f;
-        if (GUI.Button(new Rect(inner, cy, panelW - padding * 2f, lineH + 4f), "PTRL: Toggle"))
+        if (GUI.Button(new Rect(inner, cy, halfBtn, lineH + 4f), "PTRL: Toggle"))
             _orchestrator.TogglePTRL();
+        if (GUI.Button(new Rect(inner + halfBtn + 8f, cy, halfBtn, lineH + 4f),
+            $"Shadows: {_orchestrator.CurrentShadowMode}"))
+            _orchestrator.CycleShadowMode();
         cy += lineH + 10f;
 
         if (!string.IsNullOrEmpty(_partialTranscript))
