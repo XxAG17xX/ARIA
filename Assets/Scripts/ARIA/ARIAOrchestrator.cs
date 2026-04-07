@@ -53,7 +53,7 @@ public class ARIAOrchestrator : MonoBehaviour
     [Tooltip("Which API to use for 3D mesh generation. Switch to save credits.")]
     [SerializeField] private MeshProvider meshProvider = MeshProvider.Tripo3D;
 
-    // API keys — loaded from StreamingAssets/config.json
+    // API keys — loaded from config.json at runtime
     private string _claudeKey;
     private string _geminiKey;
     private string _hitemAccessKey;
@@ -136,10 +136,10 @@ public class ARIAOrchestrator : MonoBehaviour
         shadowReceiver?.Configure();
 
         // Subscribe to MRUK scene loaded event so we know when room data is available
-#if UNITY_ANDROID && !UNITY_EDITOR
+
         if (MRUK.Instance != null)
             MRUK.Instance.SceneLoadedEvent.AddListener(OnMRUKSceneLoaded);
-#endif
+
     }
 
     private void OnDestroy()
@@ -147,10 +147,10 @@ public class ARIAOrchestrator : MonoBehaviour
         if (_webcam != null && _webcam.isPlaying)
             _webcam.Stop();
 
-#if UNITY_ANDROID && !UNITY_EDITOR
+
         if (MRUK.Instance != null)
             MRUK.Instance.SceneLoadedEvent.RemoveListener(OnMRUKSceneLoaded);
-#endif
+
     }
 
     private void OnMRUKSceneLoaded()
@@ -232,8 +232,6 @@ public class ARIAOrchestrator : MonoBehaviour
 #if UNITY_EDITOR
         return Path.GetFullPath(Path.Combine(Application.dataPath, "../Assets/config.json"));
 #else
-        // Quest: push config.json with adb before first run:
-        // adb push config.json /sdcard/Android/data/<package-name>/files/config.json
         return Path.Combine(Application.persistentDataPath, "config.json");
 #endif
     }
@@ -288,7 +286,7 @@ public class ARIAOrchestrator : MonoBehaviour
 
     private async Task<byte[]> CapturePassthroughFrameAsync()
     {
-#if UNITY_ANDROID && !UNITY_EDITOR
+
         // Use Meta's PassthroughCameraAccess (not WebCamTexture which returns black on Quest 3)
         var pca = FindFirstObjectByType<Meta.XR.PassthroughCameraAccess>();
         if (pca != null && pca.IsPlaying)
@@ -335,10 +333,6 @@ public class ARIAOrchestrator : MonoBehaviour
 
         Debug.LogWarning("[ARIA] No camera available — text-only mode.");
         return null;
-#else
-        await Task.Yield();
-        return null;
-#endif
     }
 
     /// <summary>
@@ -348,7 +342,7 @@ public class ARIAOrchestrator : MonoBehaviour
     /// </summary>
     private async Task<byte[]> CaptureRenderedViewAsync()
     {
-#if UNITY_ANDROID && !UNITY_EDITOR
+
         // Wait for end of frame so rendering is complete
         await Task.Yield();
 
@@ -374,10 +368,6 @@ public class ARIAOrchestrator : MonoBehaviour
         Debug.Log($"[ARIA] Rendered view capture: {w}x{h}, JPEG={jpeg.Length/1024}KB");
         Destroy(tex);
         return jpeg;
-#else
-        await Task.Yield();
-        return null;
-#endif
     }
 
     // -------------------------------------------------------------------------
@@ -386,7 +376,7 @@ public class ARIAOrchestrator : MonoBehaviour
 
     private string SerializeMRUKData()
     {
-#if UNITY_ANDROID && !UNITY_EDITOR
+
         try
         {
             var room = MRUK.Instance?.GetCurrentRoom();
@@ -415,10 +405,6 @@ public class ARIAOrchestrator : MonoBehaviour
             Debug.LogWarning($"[ARIA] MRUK serialisation error: {e.Message} — using mock data.");
             return MockMRUKJson();
         }
-#else
-        Debug.Log("[ARIA] Editor mode — using mock MRUK data.");
-        return MockMRUKJson();
-#endif
     }
 
     private static string MockMRUKJson() => JsonConvert.SerializeObject(new
@@ -654,9 +640,8 @@ public class ARIAOrchestrator : MonoBehaviour
                    "The user is wearing a VR headset with passthrough (they see the real room). They spawned a virtual object " +
                    "and now want you to decide the BEST placement and scale based on what you see.\n\n" +
                    "HOW TO USE THE IMAGE:\n" +
-                   "- This is a RENDERED view showing the real room (passthrough) WITH virtual objects and cyan MRUK wireframe boundaries visible\n" +
-                   "- Cyan/blue wireframe lines show detected room boundaries (walls, floor, table, bed surfaces)\n" +
-                   "- Any 3D objects visible that aren't real are the spawned virtual objects you need to adjust\n" +
+                   "- This is a RAW passthrough camera image — only the real room is visible, no virtual objects or wireframe\n" +
+                   "- The IMAGE CENTER is where the user is looking\n" +
                    "- The CENTER of the image is where the user is looking (their gaze target)\n" +
                    "- Look at what SURFACE is at the center: is it a table/desk surface? A wall? The floor?\n" +
                    "- Look at OBJECTS on that surface: keyboard, mouse, phone, bottles, cables — the virtual object must NOT overlap these\n" +
@@ -1224,11 +1209,11 @@ public class ARIAOrchestrator : MonoBehaviour
         placementEngine?.Place(root, instr.surface_label);
 
         // Auto-fit: shrink if object clips walls/ceiling/furniture
-#if UNITY_ANDROID && !UNITY_EDITOR
+
         var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
         if (fitRoom != null)
             placementEngine?.FitToAvailableSpace(root, fitRoom);
-#endif
+
 
         // Lighting + interaction setup
         // Lighting is handled by PTRL toggle, not per-spawn
@@ -1368,11 +1353,11 @@ public class ARIAOrchestrator : MonoBehaviour
         }
 
         // Auto-fit to available MRUK space (won't hit other spawned objects due to layer)
-#if UNITY_ANDROID && !UNITY_EDITOR
+
         var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
         if (fitRoom != null)
             placementEngine?.FitToAvailableSpace(root, fitRoom);
-#endif
+
 
         // Reset layer so future raycasts CAN hit this object
         root.layer = 0;
@@ -1384,6 +1369,8 @@ public class ARIAOrchestrator : MonoBehaviour
         AddReflectionProbe(root);
 
         SetStatus($"Spawned: {name}. Look at target, tap 'Adjust with Claude'.");
+        Bounds spawnBounds = CalculateMeshBounds(root);
+        ARIADebugUI.AppendClaudeLog($"SPAWNED: {name}\nPos: {root.transform.position:F2}\nSize: {spawnBounds.size:F2}");
     }
 
     // -------------------------------------------------------------------------
@@ -1415,14 +1402,9 @@ public class ARIAOrchestrator : MonoBehaviour
         Transform lastSpawn = root.GetChild(root.childCount - 1);
         string objName = lastSpawn.name;
 
-        SetStatus($"Capturing rendered view for Claude...");
-        // Capture rendered view (includes wireframe + virtual objects) for better Claude context
-        byte[] jpeg = await CaptureRenderedViewAsync();
-        if (jpeg == null || jpeg.Length < 1000)
-        {
-            // Fallback to passthrough if rendered capture fails
-            jpeg = await CapturePassthroughFrameAsync();
-        }
+        SetStatus($"Capturing passthrough for Claude...");
+        // Raw passthrough only — no wireframe, no virtual objects in the image
+        byte[] jpeg = await CapturePassthroughFrameAsync();
         if (jpeg == null)
         {
             SetStatus("Image capture failed.");
@@ -1473,11 +1455,11 @@ public class ARIAOrchestrator : MonoBehaviour
         // Re-place on the surface Claude decided
         placementEngine?.Place(lastSpawn.gameObject, surface);
 
-#if UNITY_ANDROID && !UNITY_EDITOR
+
         var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
         if (fitRoom != null)
             placementEngine?.FitToAvailableSpace(lastSpawn.gameObject, fitRoom);
-#endif
+
 
         SetStatus($"Claude: {objName} → {surface}, scale {scaleFactor:F2}x. {reasoning}");
         Debug.Log($"[ARIA] Claude adjustment: surface={surface}, scale={scaleFactor:F2}x, reason={reasoning}");
@@ -1496,6 +1478,9 @@ public class ARIAOrchestrator : MonoBehaviour
 
     private bool _ptrlActive;
 
+    /// <summary>Whether PTRL is currently active. Used by DebugUI to gate selection.</summary>
+    public bool IsPTRLActive => _ptrlActive;
+
     /// <summary>
     /// Toggles PTRL on/off. Single button replaces Apply Lighting + ARIA vs Default.
     /// ON: EffectMesh gets PTRL material, shadows enabled, light spheres hidden, passthrough dims.
@@ -1505,70 +1490,61 @@ public class ARIAOrchestrator : MonoBehaviour
     {
         _ptrlActive = !_ptrlActive;
 
+        // EffectMesh is NEVER touched here — wireframe is independent (Toggle Wireframe button)
+
         if (_ptrlActive)
         {
             // ── PTRL ON ──────────────────────────────────────────────────
 
-            // Switch EffectMesh to PTRL material for shadow rendering on real surfaces
-            // PTRL material applied directly to EffectMesh below — no shadowReceiver needed
-#if UNITY_ANDROID && !UNITY_EDITOR
-            var effectMesh = FindFirstObjectByType<Meta.XR.MRUtilityKit.EffectMesh>();
-            if (effectMesh != null)
-            {
-                effectMesh.DestroyMesh();
-                // Switch to PTRL material + FLOOR only
-                var ptrlMat = UnityEngine.Resources.FindObjectsOfTypeAll<Material>()
-                    .FirstOrDefault(m => m.name == "TransparentSceneAnchor");
-                if (ptrlMat != null) effectMesh.MeshMaterial = ptrlMat;
-                effectMesh.Labels = Meta.XR.MRUtilityKit.MRUKAnchor.SceneLabels.FLOOR;
-                effectMesh.HideMesh = false;
-                effectMesh.CreateMesh();
-                Debug.Log("[ARIA] EffectMesh: PTRL material on FLOOR only.");
-            }
-#endif
+            // Create invisible shadow floor with PTRL material
+            CreatePTRLShadowFloor();
 
-            // Align directional light from first manual sphere toward scene center
+            // Disable directional light shadows — we use point lights from spheres instead.
+            // Point lights create diverging shadows from a specific position (like a real ceiling light),
+            // unlike directional lights which cast parallel shadows (like distant sunlight).
             if (sceneDirectionalLight != null)
             {
-                sceneDirectionalLight.shadows = LightShadows.Soft;
-                if (_manualLights.Count > 0)
-                {
-                    Vector3 lightPos = _manualLights[0].transform.position;
-                    Transform objRoot = spawnRoot != null ? spawnRoot : transform;
-                    Vector3 targetPos = objRoot.childCount > 0
-                        ? objRoot.GetChild(0).position : Vector3.zero;
-                    Vector3 dir = (targetPos - lightPos).normalized;
-                    if (dir.sqrMagnitude > 0.01f)
-                        sceneDirectionalLight.transform.rotation = Quaternion.LookRotation(dir);
-                    var ml = _manualLights[0].GetComponent<Light>();
-                    if (ml != null) sceneDirectionalLight.color = ml.color;
-                }
-                sceneDirectionalLight.intensity = 1f;
+                sceneDirectionalLight.shadows = LightShadows.None;
+                sceneDirectionalLight.intensity = 0.3f; // dim ambient fill only
             }
 
-            // Enable point lights from manual spheres, hide sphere visuals
+            // Enable point lights from manual spheres — these cast the shadows
             foreach (var lightGO in _manualLights)
             {
                 if (lightGO == null) continue;
                 var light = lightGO.GetComponent<Light>();
-                if (light != null) light.enabled = true;
+                if (light != null)
+                {
+                    light.enabled = true;
+                    light.shadows = LightShadows.Soft;
+                    light.shadowStrength = 0.8f;
+                }
+                // Hide sphere visuals so they don't cast shadows themselves
                 foreach (var r in lightGO.GetComponentsInChildren<Renderer>())
                     r.enabled = false;
             }
 
-            // Dim passthrough for better shadow visibility
-#if UNITY_ANDROID && !UNITY_EDITOR
-            var ptLayer = FindFirstObjectByType<OVRPassthroughLayer>();
-            if (ptLayer != null)
-                ptLayer.SetBrightnessContrastSaturation(0f); // no dimming — room is well-lit
-#endif
+            // Make sure EffectMesh surfaces don't cast shadows (only virtual objects should)
+            var effectMesh = FindFirstObjectByType<Meta.XR.MRUtilityKit.EffectMesh>();
+            if (effectMesh != null)
+            {
+                foreach (var r in effectMesh.GetComponentsInChildren<Renderer>())
+                {
+                    r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+                    r.receiveShadows = false; // don't show shadows on wireframe surfaces
+                }
+            }
 
             SetStatus($"PTRL ON — {_manualLights.Count} light(s), shadows active");
             Debug.Log("[ARIA] PTRL enabled.");
+            ARIADebugUI.AppendClaudeLog($"PTRL ON\nLights: {_manualLights.Count}\nAmbient: {RenderSettings.ambientLight}");
         }
         else
         {
             // ── PTRL OFF ─────────────────────────────────────────────────
+
+            // Destroy the shadow floor
+            DestroyPTRLShadowFloor();
 
             // Directional light: plain white from above, NO shadows
             if (sceneDirectionalLight != null)
@@ -1589,32 +1565,126 @@ public class ARIAOrchestrator : MonoBehaviour
                     r.enabled = true;
             }
 
-            // Restore EffectMesh to wireframe with all labels
-#if UNITY_ANDROID && !UNITY_EDITOR
-            var effectMeshOff = FindFirstObjectByType<Meta.XR.MRUtilityKit.EffectMesh>();
-            if (effectMeshOff != null)
-            {
-                effectMeshOff.DestroyMesh();
-                // Restore wireframe material + all labels
-                var wireframeMat = UnityEngine.Resources.FindObjectsOfTypeAll<Material>()
-                    .FirstOrDefault(m => m.name == "RoomBoxEffects");
-                if (wireframeMat != null) effectMeshOff.MeshMaterial = wireframeMat;
-                effectMeshOff.Labels = (Meta.XR.MRUtilityKit.MRUKAnchor.SceneLabels)442367;
-                effectMeshOff.HideMesh = false;
-                effectMeshOff.CreateMesh();
-                Debug.Log("[ARIA] EffectMesh: wireframe restored.");
-            }
-
-            var ptLayer = FindFirstObjectByType<OVRPassthroughLayer>();
-            if (ptLayer != null)
-                ptLayer.SetBrightnessContrastSaturation(0f);
-#endif
-
             SetStatus("PTRL OFF — default lighting");
             Debug.Log("[ARIA] PTRL disabled.");
+            ARIADebugUI.AppendClaudeLog("PTRL OFF");
         }
 
         return _ptrlActive;
+    }
+
+    // Invisible PTRL shadow surfaces — floor + wall planes, independent of EffectMesh
+    private readonly List<GameObject> _ptrlShadowSurfaces = new();
+
+    private void CreatePTRLShadowFloor()
+    {
+        if (_ptrlShadowSurfaces.Count > 0) return; // already exists
+
+        // Get PTRL material from ShadowReceiverSetup, or find/create it
+        Material ptrlMat = shadowReceiver?.PTRLMaterial;
+        if (ptrlMat == null)
+        {
+            ptrlMat = UnityEngine.Resources.FindObjectsOfTypeAll<Material>()
+                .FirstOrDefault(m => m.name == "TransparentSceneAnchor");
+        }
+        if (ptrlMat == null)
+        {
+            var shader = Shader.Find("Meta/MRUK/Scene/HighlightsAndShadows");
+            if (shader != null) ptrlMat = new Material(shader);
+        }
+        if (ptrlMat == null)
+        {
+            Debug.LogError("[ARIA] PTRL material not found.");
+            return;
+        }
+
+        var room = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
+
+        // ── Floor plane ─────────────────────────────────────────────────
+        float floorY = 0f;
+        if (room != null)
+        {
+            var floorAnchor = room.Anchors.FirstOrDefault(
+                a => a.HasAnyLabel(Meta.XR.MRUtilityKit.MRUKAnchor.SceneLabels.FLOOR));
+            if (floorAnchor != null) floorY = floorAnchor.transform.position.y;
+        }
+
+        var floor = GameObject.CreatePrimitive(PrimitiveType.Plane);
+        floor.name = "ARIA_PTRL_ShadowFloor";
+        floor.transform.position = new Vector3(0f, floorY + 0.001f, 0f);
+        floor.transform.localScale = new Vector3(2f, 1f, 2f); // 20x20m
+        Destroy(floor.GetComponent<Collider>());
+        ConfigurePTRLRenderer(floor, ptrlMat);
+        _ptrlShadowSurfaces.Add(floor);
+
+        Debug.Log($"[ARIA] PTRL shadow floor at Y={floorY}");
+
+        // ── Wall planes — one per MRUK wall anchor ──────────────────────
+        if (room != null)
+        {
+            int wallCount = 0;
+            foreach (var anchor in room.Anchors)
+            {
+                if (!anchor.HasAnyLabel(Meta.XR.MRUtilityKit.MRUKAnchor.SceneLabels.WALL_FACE))
+                    continue;
+
+                // Wall anchor: position = center, forward = surface normal, PlaneRect = size
+                Vector3 wallPos = anchor.transform.position;
+                Quaternion wallRot = anchor.transform.rotation;
+                Vector2 wallSize = anchor.PlaneRect.HasValue
+                    ? anchor.PlaneRect.Value.size
+                    : new Vector2(4f, 2.8f); // fallback
+
+                var wall = GameObject.CreatePrimitive(PrimitiveType.Quad);
+                wall.name = $"ARIA_PTRL_ShadowWall_{wallCount}";
+                // Offset slightly inward (toward room center) so it doesn't z-fight with EffectMesh
+                wall.transform.position = wallPos - anchor.transform.forward * 0.002f;
+                wall.transform.rotation = wallRot;
+                wall.transform.localScale = new Vector3(wallSize.x, wallSize.y, 1f);
+                Destroy(wall.GetComponent<Collider>());
+                ConfigurePTRLRenderer(wall, ptrlMat);
+                _ptrlShadowSurfaces.Add(wall);
+                wallCount++;
+            }
+            Debug.Log($"[ARIA] PTRL shadow walls created: {wallCount}");
+        }
+
+        // ── Ceiling plane ───────────────────────────────────────────────
+        if (room != null)
+        {
+            var ceilAnchor = room.Anchors.FirstOrDefault(
+                a => a.HasAnyLabel(Meta.XR.MRUtilityKit.MRUKAnchor.SceneLabels.CEILING));
+            if (ceilAnchor != null)
+            {
+                var ceil = GameObject.CreatePrimitive(PrimitiveType.Plane);
+                ceil.name = "ARIA_PTRL_ShadowCeiling";
+                ceil.transform.position = new Vector3(0f, ceilAnchor.transform.position.y - 0.001f, 0f);
+                ceil.transform.rotation = Quaternion.Euler(180f, 0f, 0f); // face downward
+                ceil.transform.localScale = new Vector3(2f, 1f, 2f);
+                Destroy(ceil.GetComponent<Collider>());
+                ConfigurePTRLRenderer(ceil, ptrlMat);
+                _ptrlShadowSurfaces.Add(ceil);
+                Debug.Log($"[ARIA] PTRL shadow ceiling at Y={ceilAnchor.transform.position.y}");
+            }
+        }
+    }
+
+    private static void ConfigurePTRLRenderer(GameObject go, Material ptrlMat)
+    {
+        var r = go.GetComponent<Renderer>();
+        r.material = ptrlMat;
+        r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off; // don't cast shadows
+        r.receiveShadows = true; // receive shadows from virtual objects
+    }
+
+    private void DestroyPTRLShadowFloor()
+    {
+        foreach (var go in _ptrlShadowSurfaces)
+        {
+            if (go != null) Destroy(go);
+        }
+        _ptrlShadowSurfaces.Clear();
+        Debug.Log("[ARIA] PTRL shadow surfaces destroyed.");
     }
 
     // -------------------------------------------------------------------------
@@ -1623,60 +1693,29 @@ public class ARIAOrchestrator : MonoBehaviour
 
     private readonly List<GameObject> _manualLights = new();
 
+    /// <summary>Returns the manual light list for DebugUI selection/deletion.</summary>
+    public List<GameObject> GetManualLights() => _manualLights;
+
+    /// <summary>Removes a light from the tracked list (called when DebugUI deletes it).</summary>
+    public void RemoveManualLight(GameObject lightGO)
+    {
+        _manualLights.Remove(lightGO);
+    }
+
     /// <summary>
     /// Places a virtual point light at the crosshair position.
     /// User looks at their real ceiling light and presses this button.
     /// The PTRL shader renders shadows from this light on room surfaces.
     /// </summary>
-    public async void PlaceLightAtCrosshair()
+    public void PlaceLightAtCrosshair()
     {
         Camera cam = Camera.main;
         if (cam == null) return;
 
-        Vector3 lightPos;
-
-        // Spawn 1m in front of user, easy to grab and move
-        Vector3 fwd = cam.transform.forward;
-        lightPos = cam.transform.position + fwd * 1f;
-
-        // Capture passthrough and sample AVERAGE color (our SH-inspired approach)
-        // The average of the frame near the light source gives the real light's color
-        Color lightColor = new Color(1f, 0.9f, 0.7f); // warm white fallback
+        // Spawn 1m in front of user with default white light
+        Vector3 lightPos = cam.transform.position + cam.transform.forward * 1f;
+        Color lightColor = new Color(1f, 0.95f, 0.85f); // default warm white
         float lightIntensity = 2f;
-
-        byte[] jpeg = await CapturePassthroughFrameAsync();
-        if (jpeg != null && jpeg.Length > 1000)
-        {
-            var tex = new Texture2D(2, 2, TextureFormat.RGB24, false);
-            if (tex.LoadImage(jpeg))
-            {
-                // Sample 4x4 grid (16 points) across the frame — our SH sampling approach
-                Color avgColor = Color.black;
-                float maxBright = 0f;
-                int samples = 0;
-                for (int sRow = 0; sRow < 4; sRow++)
-                {
-                    for (int sCol = 0; sCol < 4; sCol++)
-                    {
-                        Color p = tex.GetPixelBilinear((sCol + 0.5f) / 4f, (sRow + 0.5f) / 4f);
-                        avgColor += p;
-                        if (p.grayscale > maxBright) maxBright = p.grayscale;
-                        samples++;
-                    }
-                }
-                avgColor /= Mathf.Max(samples, 1);
-
-                if (avgColor.grayscale > 0.05f)
-                {
-                    // Blend toward the average room color — this IS our light color
-                    lightColor = Color.Lerp(Color.white, avgColor, 0.7f);
-                    lightIntensity = Mathf.Clamp(maxBright * 3f, 1f, 4f);
-                    Debug.Log($"[ARIA] Light color from SH sampling: avg={avgColor}, max={maxBright:F2}, intensity={lightIntensity:F1}");
-                    ARIADebugUI.AppendClaudeLog($"LIGHT COLOR:\nAvg: {avgColor}\nMax brightness: {maxBright:F2}\nIntensity: {lightIntensity:F1}");
-                }
-            }
-            Destroy(tex);
-        }
 
         var lightGO = new GameObject($"ARIA_ManualLight_{_manualLights.Count}");
         lightGO.transform.position = lightPos;
@@ -1711,7 +1750,7 @@ public class ARIAOrchestrator : MonoBehaviour
         col.radius = 2f; // generous grab radius in local space (sphere is 0.05 scale = 0.1m grab zone)
 
         // Add Grabbable + HandGrabInteractable via reflection (avoids compile-time dependency)
-#if UNITY_ANDROID && !UNITY_EDITOR
+
         try
         {
             var grabbableType = System.Type.GetType("Oculus.Interaction.Grabbable, Oculus.Interaction.Runtime");
@@ -1724,7 +1763,7 @@ public class ARIAOrchestrator : MonoBehaviour
         {
             Debug.LogWarning($"[ARIA] Grab setup skipped: {e.Message}");
         }
-#endif
+
 
         // Add Rigidbody (kinematic — no gravity, stays where you drop it)
         var rb = lightGO.AddComponent<Rigidbody>();
@@ -1733,12 +1772,178 @@ public class ARIAOrchestrator : MonoBehaviour
 
         _manualLights.Add(lightGO);
 
-        // Re-apply PTRL material
-        shadowReceiver?.Reconfigure();
+        // Add small "Confirm" world-space UI near the sphere
+        var confirmCanvas = new GameObject("ConfirmUI");
+        var canvas = confirmCanvas.AddComponent<Canvas>();
+        canvas.renderMode = RenderMode.WorldSpace;
+        confirmCanvas.AddComponent<UnityEngine.UI.CanvasScaler>();
+        confirmCanvas.AddComponent<UnityEngine.UI.GraphicRaycaster>();
+        confirmCanvas.transform.SetParent(lightGO.transform);
+        confirmCanvas.transform.localPosition = new Vector3(0f, 0.08f, 0f); // above the sphere
+        confirmCanvas.transform.localScale = Vector3.one * 0.002f;
+        var canvasRT = confirmCanvas.GetComponent<RectTransform>();
+        canvasRT.sizeDelta = new Vector2(120, 40);
 
-        SetStatus($"Light #{_manualLights.Count} placed (color: {lightColor}, intensity: {lightIntensity:F1})");
-        Debug.Log($"[ARIA] Manual light at {lightPos}, color={lightColor}, intensity={lightIntensity:F1}");
-        ARIADebugUI.AppendClaudeLog($"LIGHT PLACED:\nPos: {lightPos}\nColor: {lightColor}\nIntensity: {lightIntensity:F1}");
+        // Confirm button
+        var btnGO = new GameObject("ConfirmBtn", typeof(RectTransform),
+            typeof(UnityEngine.UI.Image), typeof(UnityEngine.UI.Button), typeof(BoxCollider));
+        btnGO.transform.SetParent(confirmCanvas.transform, false);
+        var btnRT = btnGO.GetComponent<RectTransform>();
+        btnRT.sizeDelta = new Vector2(120, 40);
+        btnGO.GetComponent<UnityEngine.UI.Image>().color = new Color(0.1f, 0.6f, 0.1f, 0.9f);
+        btnGO.GetComponent<BoxCollider>().size = new Vector3(120, 40, 10);
+
+        var txtGO = new GameObject("Text", typeof(RectTransform), typeof(UnityEngine.UI.Text));
+        txtGO.transform.SetParent(btnGO.transform, false);
+        var txtRT = txtGO.GetComponent<RectTransform>();
+        txtRT.anchorMin = Vector2.zero; txtRT.anchorMax = Vector2.one;
+        txtRT.offsetMin = Vector2.zero; txtRT.offsetMax = Vector2.zero;
+        var txt = txtGO.GetComponent<UnityEngine.UI.Text>();
+        txt.text = "Confirm";
+        txt.font = UnityEngine.Resources.GetBuiltinResource<Font>("Arial.ttf");
+        txt.fontSize = 20;
+        txt.fontStyle = FontStyle.Bold;
+        txt.color = Color.white;
+
+        // Instruction label below the button
+        var instrGO = new GameObject("InstrText", typeof(RectTransform), typeof(UnityEngine.UI.Text));
+        instrGO.transform.SetParent(confirmCanvas.transform, false);
+        var instrRT = instrGO.GetComponent<RectTransform>();
+        instrRT.anchoredPosition = new Vector2(0, -35f);
+        instrRT.sizeDelta = new Vector2(200, 50);
+        var instrTxt = instrGO.GetComponent<UnityEngine.UI.Text>();
+        instrTxt.text = "Look at the area\nthis light illuminates";
+        instrTxt.font = UnityEngine.Resources.GetBuiltinResource<Font>("Arial.ttf");
+        instrTxt.fontSize = 11;
+        instrTxt.fontStyle = FontStyle.Italic;
+        instrTxt.color = new Color(0.9f, 0.9f, 0.6f, 0.9f);
+        instrTxt.alignment = TextAnchor.UpperCenter;
+        txt.alignment = TextAnchor.MiddleCenter;
+
+        // On confirm: hide sphere, capture passthrough, sample color, update light
+        int lightIndex = _manualLights.Count - 1;
+        btnGO.GetComponent<UnityEngine.UI.Button>().onClick.AddListener(() =>
+        {
+            ConfirmLightPlacement(lightIndex);
+            Destroy(confirmCanvas); // remove confirm UI after clicking
+        });
+
+        // Light starts disabled until confirmed — just the visual sphere shows
+        light.enabled = false;
+
+        SetStatus($"Light #{_manualLights.Count} spawned — grab, position, then click Confirm");
+        Debug.Log($"[ARIA] Manual light spawned at {lightPos} — awaiting confirmation");
+    }
+
+    /// <summary>
+    /// Called when user confirms a light sphere placement.
+    /// Hides the sphere momentarily, captures passthrough, samples color, updates light.
+    /// </summary>
+    public async void ConfirmLightPlacement(int lightIndex)
+    {
+        if (lightIndex < 0 || lightIndex >= _manualLights.Count) return;
+        var lightGO = _manualLights[lightIndex];
+        if (lightGO == null) return;
+
+        // Hide the sphere so it doesn't block the passthrough capture
+        foreach (var r in lightGO.GetComponentsInChildren<Renderer>())
+            r.enabled = false;
+
+        SetStatus("3...");
+        await Task.Delay(1000);
+        SetStatus("2...");
+        await Task.Delay(1000);
+        SetStatus("1...");
+        await Task.Delay(1000);
+
+        // Capture raw passthrough
+        byte[] jpeg = await CapturePassthroughFrameAsync();
+
+        // Sample 4x4 grid for color (our SH-inspired contribution)
+        Color lightColor = new Color(1f, 0.95f, 0.85f);
+        float lightIntensity = 2f;
+
+        if (jpeg != null && jpeg.Length > 1000)
+        {
+            var tex = new Texture2D(2, 2, TextureFormat.RGB24, false);
+            if (tex.LoadImage(jpeg))
+            {
+                // ── Center 4x4 grid: light source color & intensity ──
+                Color avgColor = Color.black;
+                float maxBright = 0f;
+                int samples = 0;
+                for (int sRow = 0; sRow < 4; sRow++)
+                {
+                    for (int sCol = 0; sCol < 4; sCol++)
+                    {
+                        Color p = tex.GetPixelBilinear((sCol + 0.5f) / 4f, (sRow + 0.5f) / 4f);
+                        avgColor += p;
+                        if (p.grayscale > maxBright) maxBright = p.grayscale;
+                        samples++;
+                    }
+                }
+                avgColor /= Mathf.Max(samples, 1);
+                if (avgColor.grayscale > 0.05f)
+                {
+                    lightColor = Color.Lerp(Color.white, avgColor, 0.7f);
+                    lightIntensity = Mathf.Clamp(maxBright * 3f, 1f, 4f);
+                }
+
+                // ── Edge sampling: ambient room color (fakes bounce light) ──
+                // Sample the borders of the image — walls, floor, ceiling visible at edges
+                // This captures the overall room tone that indirect light would carry
+                Color ambientColor = Color.black;
+                int ambientSamples = 0;
+                for (int i = 0; i < 8; i++)
+                {
+                    float u = (i % 4) / 3f;  // 0, 0.33, 0.66, 1.0
+                    // Top edge
+                    ambientColor += tex.GetPixelBilinear(u, 0.95f);
+                    // Bottom edge
+                    ambientColor += tex.GetPixelBilinear(u, 0.05f);
+                    // Left edge
+                    ambientColor += tex.GetPixelBilinear(0.05f, u);
+                    // Right edge
+                    ambientColor += tex.GetPixelBilinear(0.95f, u);
+                    ambientSamples += 4;
+                }
+                ambientColor /= Mathf.Max(ambientSamples, 1);
+
+                // Set Unity's global ambient light to match room tone
+                // This fills the dark side of objects with soft room-colored light
+                // Intensity kept low (0.15-0.4) so it's subtle fill, not overpowering
+                float ambientStrength = Mathf.Clamp(ambientColor.grayscale * 0.5f, 0.15f, 0.4f);
+                RenderSettings.ambientMode = UnityEngine.Rendering.AmbientMode.Flat;
+                RenderSettings.ambientLight = Color.Lerp(Color.black, ambientColor, ambientStrength);
+                Debug.Log($"[ARIA] Ambient set: color={ambientColor}, strength={ambientStrength:F2}");
+            }
+            Destroy(tex);
+        }
+
+        // Apply sampled color to the light
+        var light = lightGO.GetComponent<Light>();
+        if (light != null)
+        {
+            light.color = lightColor;
+            light.intensity = lightIntensity;
+            light.enabled = true;
+        }
+
+        // Update sphere visual color
+        foreach (var r in lightGO.GetComponentsInChildren<Renderer>())
+        {
+            r.enabled = true;
+            if (r.material != null)
+            {
+                r.material.SetColor("_BaseColor", lightColor);
+                r.material.SetColor("_EmissionColor", lightColor * 3f);
+            }
+        }
+
+        SetStatus($"Light #{lightIndex + 1} confirmed: color={lightColor}, intensity={lightIntensity:F1}");
+        Debug.Log($"[ARIA] Light #{lightIndex + 1} confirmed at {lightGO.transform.position}, color={lightColor}, ambient={RenderSettings.ambientLight}");
+        ARIADebugUI.AppendClaudeLog($"LIGHT #{lightIndex + 1} CONFIRMED:\nPos: {lightGO.transform.position:F2}\nColor: {lightColor}\nIntensity: {lightIntensity:F1}\nAmbient: {RenderSettings.ambientLight}");
+        ARIADebugUI.AppendClaudeLog($"LIGHT CONFIRMED:\nPos: {lightGO.transform.position}\nColor: {lightColor}\nIntensity: {lightIntensity:F1}");
     }
 
     // -------------------------------------------------------------------------
@@ -1794,6 +1999,13 @@ public class ARIAOrchestrator : MonoBehaviour
 
     private static void AddPhysicsAndInteraction(GameObject root)
     {
+        // Ensure all renderers on virtual objects CAST shadows (for PTRL shadow floor)
+        foreach (var r in root.GetComponentsInChildren<Renderer>())
+        {
+            r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.On;
+            r.receiveShadows = true;
+        }
+
         // Rigidbody — kinematic so objects stay exactly where placed (no drift/wobble)
         var rb           = root.AddComponent<Rigidbody>();
         rb.useGravity    = false;
@@ -1810,7 +2022,7 @@ public class ARIAOrchestrator : MonoBehaviour
             ls.z > 0.0001f ? bounds.size.z / ls.z : bounds.size.z);
 
         // Hand grab — requires Interaction SDK Building Block in scene (OVRInteractionComprehensive)
-#if UNITY_ANDROID && !UNITY_EDITOR
+
         try
         {
             root.AddComponent(System.Type.GetType("Oculus.Interaction.Grabbable, Oculus.Interaction.Runtime"));
@@ -1821,7 +2033,7 @@ public class ARIAOrchestrator : MonoBehaviour
         {
             Debug.LogWarning($"[ARIA] Hand grab setup skipped: {e.Message}");
         }
-#endif
+
     }
 
     // -------------------------------------------------------------------------

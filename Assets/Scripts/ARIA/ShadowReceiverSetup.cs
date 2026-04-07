@@ -14,9 +14,7 @@
 using System.Linq;
 using UnityEngine;
 
-#if UNITY_ANDROID && !UNITY_EDITOR
 using Meta.XR.MRUtilityKit;
-#endif
 
 public class ShadowReceiverSetup : MonoBehaviour
 {
@@ -42,19 +40,19 @@ public class ShadowReceiverSetup : MonoBehaviour
 
     private Material _ptrlMaterial;
 
+    /// <summary>Returns the PTRL material for use by shadow floor. Call Configure() first.</summary>
+    public Material PTRLMaterial => _ptrlMaterial;
+
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
 
     public void Configure()
     {
+        // Only create the PTRL material — do NOT apply to EffectMesh on startup.
+        // The wireframe (RoomBoxEffects) must stay visible.
+        // PTRL material is used later by TogglePTRL() on a separate shadow floor.
         CreatePTRLMaterial();
-
-#if UNITY_ANDROID && !UNITY_EDITOR
-        ConfigureEffectMesh();
-#else
-        ConfigureEditorFallback();
-#endif
     }
 
     /// <summary>
@@ -63,7 +61,8 @@ public class ShadowReceiverSetup : MonoBehaviour
     /// </summary>
     public void Reconfigure()
     {
-        Configure();
+        // Re-create material if needed — still don't touch EffectMesh
+        CreatePTRLMaterial();
     }
 
     // -------------------------------------------------------------------------
@@ -123,7 +122,7 @@ public class ShadowReceiverSetup : MonoBehaviour
     // EffectMesh configuration (Quest APK)
     // -------------------------------------------------------------------------
 
-#if UNITY_ANDROID && !UNITY_EDITOR
+
     private void ConfigureEffectMesh()
     {
         if (_ptrlMaterial == null) return;
@@ -153,7 +152,7 @@ public class ShadowReceiverSetup : MonoBehaviour
             Debug.LogWarning("[ShadowReceiver] No EffectMesh found in scene.");
         }
     }
-#endif
+
 
     // -------------------------------------------------------------------------
     // Editor fallback

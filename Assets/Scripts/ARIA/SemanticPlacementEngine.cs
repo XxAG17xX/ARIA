@@ -15,9 +15,7 @@
 using System.Linq;
 using UnityEngine;
 
-#if UNITY_ANDROID && !UNITY_EDITOR
 using Meta.XR.MRUtilityKit;
-#endif
 
 public class SemanticPlacementEngine : MonoBehaviour
 {
@@ -47,14 +45,14 @@ public class SemanticPlacementEngine : MonoBehaviour
 
         string label = (surfaceLabel ?? "FLOOR").ToUpperInvariant();
 
-#if UNITY_ANDROID && !UNITY_EDITOR
+
         var room = MRUK.Instance?.GetCurrentRoom();
         if (room != null)
         {
             PlaceWithMRUK(obj, label, room);
             return;
         }
-#endif
+
         PlaceEditorFallback(obj, label);
     }
 
@@ -62,7 +60,7 @@ public class SemanticPlacementEngine : MonoBehaviour
     // MRUK placement (Quest APK) — collision-aware
     // -------------------------------------------------------------------------
 
-#if UNITY_ANDROID && !UNITY_EDITOR
+
     private void PlaceWithMRUK(GameObject obj, string label, MRUKRoom room)
     {
         switch (label)
@@ -385,7 +383,7 @@ public class SemanticPlacementEngine : MonoBehaviour
             a => a.HasAnyLabel(MRUKAnchor.SceneLabels.FLOOR));
         return floorAnchor != null ? floorAnchor.transform.position.y : 0f;
     }
-#endif
+
 
     // -------------------------------------------------------------------------
     // Editor fallback (no MRUK)
@@ -431,7 +429,7 @@ public class SemanticPlacementEngine : MonoBehaviour
     // Auto-fit: shrink object to fit available MRUK space
     // -------------------------------------------------------------------------
 
-#if UNITY_ANDROID && !UNITY_EDITOR
+
     /// <summary>
     /// Measures available clearance around the object using MRUK room data
     /// and shrinks the object if it clips walls, ceiling, or furniture.
@@ -504,7 +502,7 @@ public class SemanticPlacementEngine : MonoBehaviour
         // Fallback: room dimensions
         return maxDist;
     }
-#endif
+
 
     // -------------------------------------------------------------------------
     // Geometry helpers

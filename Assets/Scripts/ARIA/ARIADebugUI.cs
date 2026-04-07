@@ -6,6 +6,7 @@
 //
 // Editor: IMGUI text field + buttons (same as before).
 
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
 using UnityEngine.EventSystems;
@@ -52,11 +53,16 @@ public class ARIADebugUI : MonoBehaviour
     private GameObject _ptrlButton;
     private Text _ptrlButtonText;
 
-    // Claude log panel (shows what was sent/received)
+    // Activity log panel (shows Claude calls, light confirms, spawns, PTRL, errors)
     private GameObject _logCanvasGO;
     private Text       _logText;
-    private static string _claudeLog = "No Claude calls yet.";
-    public static void AppendClaudeLog(string msg) { _claudeLog = msg + "\n\n" + _claudeLog; if (_claudeLog.Length > 2000) _claudeLog = _claudeLog.Substring(0, 2000); }
+    private static string _claudeLog = "No activity yet.";
+    public static void AppendClaudeLog(string msg)
+    {
+        string timestamp = System.DateTime.Now.ToString("HH:mm:ss");
+        _claudeLog = $"[{timestamp}] {msg}\n\n{_claudeLog}";
+        if (_claudeLog.Length > 3000) _claudeLog = _claudeLog.Substring(0, 3000);
+    }
 
     // IMGUI styles (editor)
     private GUIStyle _panelStyle, _labelStyle, _bigLabelStyle;
@@ -118,7 +124,7 @@ public class ARIADebugUI : MonoBehaviour
             Vector2.zero, new Vector2(500, 700), new Color(0f, 0f, 0f, 0.85f));
 
         // Title
-        MakeLabel(panel.transform, "LogTitle", "Claude Log",
+        MakeLabel(panel.transform, "LogTitle", "ARIA Log",
             new Vector2(0, 320), new Vector2(460, 30), 20, FontStyle.Bold, Color.yellow);
 
         // Close button (top right)
@@ -136,9 +142,8 @@ public class ARIADebugUI : MonoBehaviour
 
     private static void SuppressBoundary()
     {
-#if UNITY_ANDROID && !UNITY_EDITOR
-        OVRManager.boundary.SetVisible(false);
-#endif
+        try { OVRManager.boundary.SetVisible(false); }
+        catch (System.Exception) { /* Deprecated in OpenXR — safe to ignore */ }
     }
 
     // Gaze pointer state
@@ -152,7 +157,6 @@ public class ARIADebugUI : MonoBehaviour
         // Left Y button toggles menu
         if (IsRunningOnQuest() && _canvasGO != null)
         {
-#if UNITY_ANDROID && !UNITY_EDITOR
             if (OVRInput.GetDown(OVRInput.Button.Four)) // Y button on left controller
                 ToggleMenu();
             // Left grip = place light at crosshair (no menu needed)
@@ -163,20 +167,24 @@ public class ARIADebugUI : MonoBehaviour
                 GrabNearestLight();
             else if (_grabbedLight != null)
                 ReleaseLight();
-#endif
         }
 
         // X button: cycle selection / delete (only when menu is NOT visible)
         if (IsRunningOnQuest() && !_menuVisible)
         {
-#if UNITY_ANDROID && !UNITY_EDITOR
             if (OVRInput.GetDown(OVRInput.Button.Three)) // X button on left controller
                 CycleOrDeleteSelection();
-#endif
         }
 
         // Voice recording timeout check
         CheckVoiceTimeout();
+
+        // Keep log panel text fresh while menu is open
+        if (_menuVisible && _logCanvasGO != null && _logCanvasGO.activeSelf && _logText != null)
+        {
+            _logText.text = _claudeLog;
+            _logText.SetAllDirty();
+        }
 
         // Gaze-based VR pointer (only when menu is visible)
         if (IsRunningOnQuest() && _vrCanvas != null && _menuVisible)
@@ -192,6 +200,9 @@ public class ARIADebugUI : MonoBehaviour
             int display = Mathf.CeilToInt(remaining);
             if (display < 1) display = 1;
             _countdownNumText.text = display.ToString();
+            // Force world-space canvas to redraw (batch invalidation)
+            _countdownNumText.SetAllDirty();
+            Canvas.ForceUpdateCanvases();
         }
 
         if (remaining <= 0f)
@@ -258,13 +269,10 @@ public class ARIADebugUI : MonoBehaviour
             }
         }
 
-        // Trigger / A button = click
-#if UNITY_ANDROID && !UNITY_EDITOR
-        bool triggerDown = OVRInput.GetDown(OVRInput.Button.SecondaryIndexTrigger) || // left trigger
-                           OVRInput.GetDown(OVRInput.Button.Three); // X button (left)
-#else
-        bool triggerDown = Input.GetMouseButtonDown(0);
-#endif
+        // Trigger / mouse click (OVRInput works via Quest Link in editor)
+        bool triggerDown = OVRInput.GetDown(OVRInput.Button.SecondaryIndexTrigger) ||
+                           OVRInput.GetDown(OVRInput.Button.Three) ||
+                           Input.GetMouseButtonDown(0);
         if (triggerDown && _hoveredButton != null)
         {
             _hoveredButton.onClick.Invoke();
@@ -361,7 +369,10 @@ public class ARIADebugUI : MonoBehaviour
             () => {
                 bool on = _orchestrator.TogglePTRL();
                 if (_ptrlButtonText != null)
+                {
                     _ptrlButtonText.text = on ? "PTRL: ON" : "PTRL: OFF";
+                    _ptrlButtonText.SetAllDirty();
+                }
             });
         y -= 58f;
 
@@ -596,7 +607,9 @@ public class ARIADebugUI : MonoBehaviour
                 _countdownPanel.SetActive(true);
                 _mainPanel.SetActive(false);
                 _countdownNumText.text = "Speak";
+                _countdownNumText.SetAllDirty();
                 _countdownCmdText.text = "Say what to adjust, or press trigger to skip";
+                _countdownCmdText.SetAllDirty();
             }
 
             _voiceConnector.RecordOneShot(transcript =>
@@ -606,7 +619,10 @@ public class ARIADebugUI : MonoBehaviour
                 _orchestrator.SetUserContext(transcript);
 
                 if (_countdownCmdText != null)
+                {
                     _countdownCmdText.text = $"\"{transcript}\"";
+                    _countdownCmdText.SetAllDirty();
+                }
 
                 StartCountdownForAction("Claude adjustment",
                     () => _orchestrator.AdjustLastSpawnWithClaude());
@@ -625,12 +641,9 @@ public class ARIADebugUI : MonoBehaviour
         if (!_waitingForVoice) return;
 
         // Check for trigger press to skip voice recording
-#if UNITY_ANDROID && !UNITY_EDITOR
         bool skip = OVRInput.GetDown(OVRInput.Button.SecondaryIndexTrigger) ||
-                    OVRInput.GetDown(OVRInput.Button.Three);
-#else
-        bool skip = Input.GetMouseButtonDown(0);
-#endif
+                    OVRInput.GetDown(OVRInput.Button.Three) ||
+                    Input.GetMouseButtonDown(0);
 
         if (skip || Time.time > _voiceTimeout)
         {
@@ -655,10 +668,8 @@ public class ARIADebugUI : MonoBehaviour
         if (_grabbedLight != null)
         {
             // Already grabbing — move light to right controller position
-#if UNITY_ANDROID && !UNITY_EDITOR
             Vector3 controllerPos = OVRInput.GetLocalControllerPosition(OVRInput.Controller.RTouch);
             Quaternion controllerRot = OVRInput.GetLocalControllerRotation(OVRInput.Controller.RTouch);
-            // Transform from tracking space to world space
             Camera cam = Camera.main;
             if (cam != null)
             {
@@ -667,12 +678,10 @@ public class ARIADebugUI : MonoBehaviour
                     controllerPos = trackingSpace.TransformPoint(controllerPos);
             }
             _grabbedLight.transform.position = controllerPos + (controllerRot * Vector3.forward) * 0.1f;
-#endif
             return;
         }
 
         // Find nearest manual light to right controller
-#if UNITY_ANDROID && !UNITY_EDITOR
         Vector3 rPos = OVRInput.GetLocalControllerPosition(OVRInput.Controller.RTouch);
         Camera c = Camera.main;
         if (c != null)
@@ -697,7 +706,6 @@ public class ARIADebugUI : MonoBehaviour
 
         if (_grabbedLight != null)
             SetStatus($"Grabbed light — move and release grip to place");
-#endif
     }
 
     private void ReleaseLight()
@@ -713,24 +721,63 @@ public class ARIADebugUI : MonoBehaviour
     private int _selectedIndex = -1;
     private GameObject _selectionHighlight;
     private float _lastXPress;
+    private readonly List<GameObject> _selectableObjects = new();
+
+    /// <summary>
+    /// Builds a combined list of all selectable objects: spawned objects + light spheres.
+    /// Called each time X is pressed to get a fresh list.
+    /// </summary>
+    private void RefreshSelectableList()
+    {
+        _selectableObjects.Clear();
+
+        // Add spawned objects (children of spawnRoot/orchestrator)
+        Transform root = _orchestrator.transform;
+        for (int i = 0; i < root.childCount; i++)
+        {
+            var child = root.GetChild(i).gameObject;
+            // Skip internal objects (highlight, UI, etc.)
+            if (child.name.StartsWith("ARIA_")) continue;
+            _selectableObjects.Add(child);
+        }
+
+        // Add light spheres
+        foreach (var lightGO in _orchestrator.GetManualLights())
+        {
+            if (lightGO != null)
+                _selectableObjects.Add(lightGO);
+        }
+    }
 
     private void CycleOrDeleteSelection()
     {
-        Transform root = _orchestrator.transform;
-        int childCount = root.childCount;
-        if (childCount == 0)
+        // Only allow selection when PTRL is off
+        if (_orchestrator.IsPTRLActive)
+        {
+            SetStatus("Turn PTRL OFF first to select/delete objects.");
+            return;
+        }
+
+        RefreshSelectableList();
+
+        if (_selectableObjects.Count == 0)
         {
             SetStatus("No objects to select.");
             return;
         }
 
         // Double-tap X within 0.5s = delete selected
-        if (_selectedIndex >= 0 && Time.time - _lastXPress < 0.5f)
+        if (_selectedIndex >= 0 && _selectedIndex < _selectableObjects.Count
+            && Time.time - _lastXPress < 0.5f)
         {
-            Transform selected = root.GetChild(Mathf.Min(_selectedIndex, childCount - 1));
+            GameObject selected = _selectableObjects[_selectedIndex];
             string objName = selected.name;
             ClearSelectionHighlight();
-            Destroy(selected.gameObject);
+
+            // If it's a light sphere, remove from orchestrator's list too
+            _orchestrator.RemoveManualLight(selected);
+
+            Destroy(selected);
             _selectedIndex = -1;
             SetStatus($"Deleted: {objName}");
             Debug.Log($"[ARIA] Deleted: {objName}");
@@ -741,10 +788,11 @@ public class ARIADebugUI : MonoBehaviour
         _lastXPress = Time.time;
 
         // Single tap = cycle to next object
-        _selectedIndex = (_selectedIndex + 1) % root.childCount;
-        Transform obj = root.GetChild(_selectedIndex);
-        HighlightObject(obj.gameObject);
-        SetStatus($"Selected [{_selectedIndex + 1}/{root.childCount}]: {obj.name} — double-tap X to delete");
+        _selectedIndex = (_selectedIndex + 1) % _selectableObjects.Count;
+        GameObject obj = _selectableObjects[_selectedIndex];
+        HighlightObject(obj);
+        string type = obj.name.StartsWith("ARIA_ManualLight") ? " (light)" : "";
+        SetStatus($"Selected [{_selectedIndex + 1}/{_selectableObjects.Count}]: {obj.name}{type} — double-tap X to delete");
     }
 
     private void HighlightObject(GameObject obj)
@@ -778,31 +826,27 @@ public class ARIADebugUI : MonoBehaviour
 
     private void ToggleEffectMesh()
     {
-#if UNITY_ANDROID && !UNITY_EDITOR
         _effectMeshHidden = !_effectMeshHidden;
 
-        // EffectMesh spawns child GameObjects with renderers at runtime —
-        // find ALL renderers in the EffectMesh hierarchy AND the MRUK room objects
         var effectMesh = FindFirstObjectByType<Meta.XR.MRUtilityKit.EffectMesh>();
         if (effectMesh != null)
         {
-            // Toggle the EffectMesh GameObject's children (spawned surface meshes)
             foreach (Transform child in effectMesh.transform)
                 child.gameObject.SetActive(!_effectMeshHidden);
+            effectMesh.HideMesh = _effectMeshHidden;
         }
 
-        // Also toggle the HideMesh property on the EffectMesh component itself
-        if (effectMesh != null)
-            effectMesh.HideMesh = _effectMeshHidden;
-
         SetStatus(_effectMeshHidden ? "Room wireframe OFF" : "Room wireframe ON");
-#endif
     }
 
     private void SetStatus(string s)
     {
         _status = s;
-        if (_statusText != null) _statusText.text = "Status: " + s;
+        if (_statusText != null)
+        {
+            _statusText.text = "Status: " + s;
+            _statusText.SetAllDirty();
+        }
     }
 
     private void StartCountdown(string command)
@@ -831,6 +875,7 @@ public class ARIADebugUI : MonoBehaviour
         if (_countdownPanel != null)
         {
             _countdownCmdText.text = $"\"{label}\"";
+            _countdownCmdText.SetAllDirty();
             _countdownPanel.SetActive(true);
             _mainPanel.SetActive(false);
         }
@@ -846,11 +891,8 @@ public class ARIADebugUI : MonoBehaviour
 
     private static bool IsRunningOnQuest()
     {
-#if UNITY_ANDROID && !UNITY_EDITOR
-        return true;
-#else
-        return false;
-#endif
+        // Runtime check — true when headset is connected (Quest Link or APK)
+        return OVRManager.isHmdPresent;
     }
 
     // -------------------------------------------------------------------------

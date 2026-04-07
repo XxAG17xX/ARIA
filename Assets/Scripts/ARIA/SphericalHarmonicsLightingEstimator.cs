@@ -17,10 +17,8 @@ using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Rendering;
 
-#if UNITY_ANDROID && !UNITY_EDITOR
 using System.Linq;
 using Meta.XR.MRUtilityKit;
-#endif
 
 public class SphericalHarmonicsLightingEstimator : MonoBehaviour
 {
@@ -379,14 +377,14 @@ public class SphericalHarmonicsLightingEstimator : MonoBehaviour
 
         // Get ceiling height from MRUK
         float ceilingHeight = 2.8f;
-#if UNITY_ANDROID && !UNITY_EDITOR
+
         var room = MRUK.Instance?.GetCurrentRoom();
         if (room != null)
         {
             var ceil = room.Anchors.FirstOrDefault(a => a.HasAnyLabel(MRUKAnchor.SceneLabels.CEILING));
             if (ceil != null) ceilingHeight = ceil.transform.position.y;
         }
-#endif
+
 
         // Downsample to grid and find bright cells
         var candidates = new List<(Vector2 uv, Color color, float brightness)>();
