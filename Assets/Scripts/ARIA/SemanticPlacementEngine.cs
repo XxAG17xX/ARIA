@@ -41,15 +41,39 @@ public class SemanticPlacementEngine : MonoBehaviour
     /// </summary>
     public void Place(GameObject obj, string surfaceLabel)
     {
+        Place(obj, surfaceLabel, null, null);
+    }
+
+    public void Place(GameObject obj, string surfaceLabel, MRUKAnchor specificAnchor)
+    {
+        Place(obj, surfaceLabel, specificAnchor, null);
+    }
+
+    /// <summary>
+    /// Positions <paramref name="obj"/> on a specific MRUK anchor if provided,
+    /// otherwise falls back to generic surface_label-based placement.
+    /// <paramref name="nearAnchor"/> is a proximity hint (e.g. "near the door").
+    /// </summary>
+    public void Place(GameObject obj, string surfaceLabel, MRUKAnchor specificAnchor, MRUKAnchor nearAnchor)
+    {
         if (obj == null) return;
 
         string label = (surfaceLabel ?? "FLOOR").ToUpperInvariant();
 
-
         var room = MRUK.Instance?.GetCurrentRoom();
         if (room != null)
         {
+            if (specificAnchor != null)
+            {
+                PlaceOnSpecificAnchor(obj, specificAnchor, room);
+                // If near_anchor hint, nudge position toward that anchor
+                if (nearAnchor != null)
+                    NudgeTowardAnchor(obj, nearAnchor, room);
+                return;
+            }
             PlaceWithMRUK(obj, label, room);
+            if (nearAnchor != null)
+                NudgeTowardAnchor(obj, nearAnchor, room);
             return;
         }
 
@@ -86,6 +110,157 @@ public class SemanticPlacementEngine : MonoBehaviour
                 PlaceOnFloor(obj, room);
                 break;
         }
+    }
+
+    /// <summary>
+    /// Nudges an already-placed object's XZ position toward a reference anchor
+    /// (e.g. "near the door"). Keeps Y unchanged so it stays on its surface.
+    /// Moves 70% of the way toward the anchor's base position, then collision checks.
+    /// </summary>
+    private void NudgeTowardAnchor(GameObject obj, MRUKAnchor nearAnchor, MRUKRoom room)
+    {
+        Vector3 objPos = obj.transform.position;
+        Vector3 anchorPos = nearAnchor.transform.position;
+
+        // Move XZ toward anchor, keep Y (stay on surface)
+        Vector3 target = new Vector3(anchorPos.x, objPos.y, anchorPos.z);
+        Vector3 nudged = Vector3.Lerp(objPos, target, 0.7f);
+
+        // Offset slightly away from the anchor surface so object doesn't clip into it
+        Vector3 anchorNormal = nearAnchor.transform.forward;
+        Bounds b = GetObjectBounds(obj);
+        float offset = Mathf.Max(b.extents.x, b.extents.z) + 0.1f;
+        nudged += new Vector3(anchorNormal.x, 0, anchorNormal.z).normalized * offset;
+
+        // Check clearance at nudged position
+        Vector3 halfExtents = new Vector3(b.extents.x, 0.05f, b.extents.z);
+        if (IsPositionClear(room, nudged, halfExtents))
+        {
+            obj.transform.position = nudged;
+            Debug.Log($"[SemanticPlacement] Nudged {obj.name} toward {nearAnchor.name}");
+            ARIADebugUI.AppendClaudeLog($"  → nudged near {nearAnchor.name}");
+        }
+        else
+        {
+            Debug.Log($"[SemanticPlacement] Nudge blocked — keeping original position for {obj.name}");
+        }
+    }
+
+    // ----- Specific anchor placement -----
+
+    private void PlaceOnSpecificAnchor(GameObject obj, MRUKAnchor anchor, MRUKRoom room)
+    {
+        if (anchor.HasAnyLabel(MRUKAnchor.SceneLabels.WALL_FACE))
+        {
+            PlaceOnSpecificWall(obj, anchor, room);
+        }
+        else if (anchor.HasAnyLabel(MRUKAnchor.SceneLabels.TABLE))
+        {
+            PlaceOnSpecificVolume(obj, anchor, room);
+        }
+        else if (anchor.HasAnyLabel(MRUKAnchor.SceneLabels.COUCH))
+        {
+            PlaceOnSpecificVolume(obj, anchor, room);
+        }
+        else if (anchor.HasAnyLabel(MRUKAnchor.SceneLabels.FLOOR))
+        {
+            PlaceOnFloor(obj, room); // floor is unique, same logic
+        }
+        else if (anchor.HasAnyLabel(MRUKAnchor.SceneLabels.CEILING))
+        {
+            PlaceOnCeiling(obj, room);
+        }
+        else
+        {
+            Debug.LogWarning($"[SemanticPlacement] Unknown anchor type — defaulting to floor.");
+            PlaceOnFloor(obj, room);
+        }
+    }
+
+    private void PlaceOnSpecificWall(GameObject obj, MRUKAnchor wallAnchor, MRUKRoom room)
+    {
+        Camera cam = Camera.main;
+        Vector3 userPos = cam != null ? cam.transform.position : Vector3.zero;
+        Vector3 userFwd = cam != null ? cam.transform.forward : Vector3.forward;
+
+        Vector3 wallNormal = wallAnchor.transform.forward;
+        Vector3 wallCenter = wallAnchor.transform.position;
+        float halfDepth = GetObjectHalfDepth(obj);
+
+        // Intersect gaze ray with this wall's plane for fine positioning
+        Plane wallPlane = new Plane(wallNormal, wallCenter);
+        Ray gazeRay = new Ray(userPos, userFwd);
+        Vector3 hitPoint = wallCenter;
+
+        if (wallPlane.Raycast(gazeRay, out float enter) && enter > 0)
+        {
+            hitPoint = gazeRay.GetPoint(enter);
+            // Clamp to wall bounds
+            if (wallAnchor.PlaneRect.HasValue)
+            {
+                Vector3 localHit = wallAnchor.transform.InverseTransformPoint(hitPoint);
+                Rect rect = wallAnchor.PlaneRect.Value;
+                Bounds objBounds = GetObjectBounds(obj);
+                localHit.x = Mathf.Clamp(localHit.x,
+                    rect.xMin + objBounds.extents.x, rect.xMax - objBounds.extents.x);
+                localHit.y = Mathf.Clamp(localHit.y,
+                    rect.yMin + objBounds.extents.y, rect.yMax - objBounds.extents.y);
+                hitPoint = wallAnchor.transform.TransformPoint(localHit);
+            }
+        }
+
+        Vector3 finalPos = hitPoint + wallNormal * (halfDepth + wallOffset);
+        obj.transform.position = finalPos;
+        obj.transform.rotation = Quaternion.LookRotation(wallNormal, Vector3.up);
+        Debug.Log($"[SemanticPlacement] Specific wall: placed {obj.name} on {wallAnchor.name}");
+        ARIADebugUI.AppendClaudeLog($"PLACED: {obj.name}\n  → wall at ({finalPos.x:F1},{finalPos.y:F1},{finalPos.z:F1})");
+    }
+
+    private void PlaceOnSpecificVolume(GameObject obj, MRUKAnchor anchor, MRUKRoom room)
+    {
+        float surfaceY = anchor.transform.position.y;
+        float halfH = GetObjectHalfHeight(obj);
+        Vector3 centerPos = new Vector3(
+            anchor.transform.position.x, surfaceY + halfH, anchor.transform.position.z);
+
+        Bounds objBounds = GetObjectBounds(obj);
+        Vector3 halfExtents = new Vector3(objBounds.extents.x, 0.02f, objBounds.extents.z);
+
+        if (IsPositionClear(room, centerPos, halfExtents))
+        {
+            obj.transform.position = centerPos;
+            obj.transform.rotation = Quaternion.identity;
+            Debug.Log($"[SemanticPlacement] Specific volume: placed {obj.name} at center of {anchor.name}");
+            return;
+        }
+
+        // Spiral search for clear spot on this surface
+        Vector3 anchorRight = anchor.transform.right;
+        Vector3 anchorUp = anchor.transform.up;
+        float searchRadius = anchor.VolumeBounds.HasValue
+            ? Mathf.Max(anchor.VolumeBounds.Value.size.x, anchor.VolumeBounds.Value.size.y) * 0.4f
+            : 0.3f;
+
+        for (int i = 1; i <= maxPlacementAttempts; i++)
+        {
+            float angle = i * 137.5f * Mathf.Deg2Rad;
+            float radius = searchRadius * Mathf.Sqrt((float)i / maxPlacementAttempts);
+            Vector3 offset = anchorRight * (Mathf.Cos(angle) * radius) +
+                             anchorUp * (Mathf.Sin(angle) * radius);
+            Vector3 candidate = centerPos + offset;
+
+            if (IsPositionClear(room, candidate, halfExtents))
+            {
+                obj.transform.position = candidate;
+                obj.transform.rotation = Quaternion.identity;
+                Debug.Log($"[SemanticPlacement] Specific volume: found clear spot for {obj.name}");
+                return;
+            }
+        }
+
+        obj.transform.position = centerPos;
+        obj.transform.rotation = Quaternion.identity;
+        Debug.LogWarning($"[SemanticPlacement] Specific volume: no clear spot, placed at center.");
     }
 
     // ----- FLOOR placement -----
@@ -134,6 +309,7 @@ public class SemanticPlacementEngine : MonoBehaviour
 
         obj.transform.position = bestPos;
         obj.transform.rotation = Quaternion.LookRotation(-forward, Vector3.up);
+        ARIADebugUI.AppendClaudeLog($"PLACED: {obj.name}\n  → floor at ({bestPos.x:F1},{bestPos.y:F1},{bestPos.z:F1})");
     }
 
     private void PlaceFallbackFloor(GameObject obj, MRUKRoom room)
@@ -181,6 +357,7 @@ public class SemanticPlacementEngine : MonoBehaviour
             obj.transform.position = finalPos;
             obj.transform.rotation = Quaternion.LookRotation(wallNormal, Vector3.up);
             Debug.Log($"[SemanticPlacement] Wall: placed {obj.name} at gaze hit {hit.point} (Y={hit.point.y:F2}m)");
+            ARIADebugUI.AppendClaudeLog($"PLACED: {obj.name}\n  → wall at ({finalPos.x:F1},{finalPos.y:F1},{finalPos.z:F1})");
             return;
         }
 

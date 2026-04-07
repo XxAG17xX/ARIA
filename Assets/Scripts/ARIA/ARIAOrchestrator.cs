@@ -70,6 +70,13 @@ public class ARIAOrchestrator : MonoBehaviour
     /// <summary>Set by VoiceSDKConnector or ARIADebugUI before adjustment calls.</summary>
     public void SetUserContext(string command) { _lastUserCommand = command ?? ""; }
 
+    // Anchor registry: maps anchor IDs (e.g. "WALL_0") to MRUK anchors for specific placement
+    private Dictionary<string, Meta.XR.MRUtilityKit.MRUKAnchor> _anchorRegistry = new();
+
+    /// <summary>Look up a specific MRUK anchor by ID (e.g. "WALL_2"). Returns null if not found.</summary>
+    public Meta.XR.MRUtilityKit.MRUKAnchor GetAnchorById(string anchorId)
+        => !string.IsNullOrEmpty(anchorId) && _anchorRegistry.TryGetValue(anchorId, out var a) ? a : null;
+
     // Tracks grey-mesh previews so they can be swapped when the textured mesh arrives
     private readonly Dictionary<string, GameObject> _previews = new();
 
@@ -137,10 +144,35 @@ public class ARIAOrchestrator : MonoBehaviour
         shadowReceiver?.Configure();
 
         // Subscribe to MRUK scene loaded event so we know when room data is available
-
         if (MRUK.Instance != null)
             MRUK.Instance.SceneLoadedEvent.AddListener(OnMRUKSceneLoaded);
 
+        // Enable environment depth occlusion so virtual objects hide behind real geometry
+        EnableOcclusion();
+    }
+
+    private void EnableOcclusion()
+    {
+        // Try the template OcclusionManager first
+        var occMgr = FindFirstObjectByType<UnityEngine.XR.Templates.MR.OcclusionManager>();
+        if (occMgr != null)
+        {
+            occMgr.enableManagerOnStart = true;
+            occMgr.SetupManager();
+            Debug.Log("[ARIA] Occlusion enabled via OcclusionManager.");
+            return;
+        }
+
+        // Fallback: enable AROcclusionManager directly
+        var arocc = FindFirstObjectByType<UnityEngine.XR.ARFoundation.AROcclusionManager>();
+        if (arocc != null)
+        {
+            arocc.enabled = true;
+            Debug.Log("[ARIA] Occlusion enabled via AROcclusionManager.");
+            return;
+        }
+
+        Debug.LogWarning("[ARIA] No occlusion manager found — virtual objects won't be occluded by real geometry.");
     }
 
     private void OnDestroy()
@@ -252,11 +284,14 @@ public class ARIAOrchestrator : MonoBehaviour
         _lastUserCommand = transcript; // save for Claude adjustment context
         SetStatus("Capturing room...");
 
-        // Capture passthrough frame ONCE — reused for Claude API and SH estimator
-        byte[] jpeg = await CapturePassthroughFrameAsync();
-
-        // Serialize MRUK room data
+        // Serialize MRUK room data first (populates _anchorRegistry for labels)
         string mrukJson = SerializeMRUKData();
+        ARIADebugUI.AppendClaudeLog($"VOICE: \"{transcript}\"\nAnchors: {_anchorRegistry.Count} ({string.Join(", ", _anchorRegistry.Keys)})");
+
+        // Capture annotated view — passthrough + wireframe + anchor labels + gaze crosshair
+        SetStatus("Capturing annotated view...");
+        byte[] jpeg = await CaptureAnnotatedViewAsync();
+        ARIADebugUI.AppendClaudeLog($"IMAGE: {(jpeg != null ? jpeg.Length / 1024 + "KB" : "null")}");
 
         SetStatus("Asking Claude...");
         List<PlacementInstruction> instructions = await CallClaudeAsync(jpeg, mrukJson, transcript);
@@ -265,10 +300,18 @@ public class ARIAOrchestrator : MonoBehaviour
         {
             Debug.LogWarning("[ARIA] Claude returned no placement instructions.");
             SetStatus("No objects to place.");
+            ARIADebugUI.AppendClaudeLog("Claude returned NO objects.");
             return;
         }
 
-        Debug.Log($"[ARIA] Spawning {instructions.Count} object(s) progressively...");
+        // Log Claude's decisions
+        foreach (var instr in instructions)
+        {
+            string placement = instr.anchor_id ?? instr.surface_label;
+            string near = !string.IsNullOrEmpty(instr.near_anchor_id) ? $" near {instr.near_anchor_id}" : "";
+            ARIADebugUI.AppendClaudeLog($"CLAUDE → {instr.category}\n  On: {placement}{near}\n  Size: {instr.height_metres:F2}x{instr.width_metres:F2}x{instr.depth_metres:F2}m");
+        }
+
         SetStatus($"Generating {instructions.Count} object(s)...");
 
         // Launch all object pipelines concurrently — progressive placement
@@ -371,13 +414,106 @@ public class ARIAOrchestrator : MonoBehaviour
         return jpeg;
     }
 
+    /// <summary>
+    /// Captures a rendered view with anchor labels and gaze crosshair overlaid.
+    /// Creates temporary TextMesh labels at each MRUK anchor position, renders
+    /// the scene, then destroys them. Claude sees labeled surfaces in the image.
+    /// </summary>
+    private async Task<byte[]> CaptureAnnotatedViewAsync()
+    {
+        Camera cam = Camera.main;
+        if (cam == null) return await CapturePassthroughFrameAsync();
+
+        var tempObjects = new List<GameObject>();
+
+        try
+        {
+            // Create labels at each registered anchor position
+            foreach (var kvp in _anchorRegistry)
+            {
+                string id = kvp.Key;
+                var anchor = kvp.Value;
+                if (anchor == null) continue;
+
+                Vector3 labelPos = anchor.transform.position;
+                // Offset label slightly toward camera so it doesn't clip into the surface
+                Vector3 toCamera = (cam.transform.position - labelPos).normalized;
+                labelPos += toCamera * 0.05f;
+
+                // Background shadow text (black, slightly behind)
+                var shadowGO = CreateTextMesh($"Label_Shadow_{id}", id,
+                    labelPos - toCamera * 0.002f, cam, Color.black, 0.06f);
+                tempObjects.Add(shadowGO);
+
+                // Foreground label text (yellow)
+                var labelGO = CreateTextMesh($"Label_{id}", id,
+                    labelPos, cam, Color.yellow, 0.06f);
+                tempObjects.Add(labelGO);
+            }
+
+            // Crosshair at gaze hit point
+            Ray gazeRay = new Ray(cam.transform.position, cam.transform.forward);
+            if (Physics.Raycast(gazeRay, out RaycastHit hit, 10f))
+            {
+                var crosshair = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                crosshair.name = "GazeCrosshair";
+                crosshair.transform.position = hit.point + hit.normal * 0.01f;
+                crosshair.transform.localScale = Vector3.one * 0.04f;
+                Destroy(crosshair.GetComponent<Collider>());
+                var shader = Shader.Find("Universal Render Pipeline/Unlit") ?? Shader.Find("Universal Render Pipeline/Lit");
+                if (shader != null)
+                {
+                    var mat = new Material(shader);
+                    mat.color = new Color(1f, 0f, 0f, 1f); // red
+                    crosshair.GetComponent<Renderer>().material = mat;
+                }
+                tempObjects.Add(crosshair);
+            }
+
+            // Render the annotated scene
+            await Task.Yield();
+            return await CaptureRenderedViewAsync();
+        }
+        finally
+        {
+            // Always clean up temp objects
+            foreach (var go in tempObjects)
+                if (go != null) Destroy(go);
+        }
+    }
+
+    private static GameObject CreateTextMesh(string name, string text,
+        Vector3 position, Camera cam, Color color, float charSize)
+    {
+        var go = new GameObject(name);
+        go.transform.position = position;
+        // Billboard: face the camera
+        Vector3 lookDir = go.transform.position - cam.transform.position;
+        if (lookDir.sqrMagnitude > 0.001f)
+            go.transform.rotation = Quaternion.LookRotation(lookDir.normalized);
+
+        var tm = go.AddComponent<TextMesh>();
+        tm.text = text;
+        tm.characterSize = charSize;
+        tm.fontSize = 64;
+        tm.anchor = TextAnchor.MiddleCenter;
+        tm.alignment = TextAlignment.Center;
+        tm.color = color;
+        // Use built-in font
+        tm.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+        var mr = go.GetComponent<MeshRenderer>();
+        if (mr != null && tm.font != null)
+            mr.material = tm.font.material;
+
+        return go;
+    }
+
     // -------------------------------------------------------------------------
     // MRUK serialisation
     // -------------------------------------------------------------------------
 
     private string SerializeMRUKData()
     {
-
         try
         {
             var room = MRUK.Instance?.GetCurrentRoom();
@@ -387,18 +523,68 @@ public class ARIAOrchestrator : MonoBehaviour
                 return MockMRUKJson();
             }
 
+            Camera cam = Camera.main;
+            _anchorRegistry.Clear();
+            var counters = new Dictionary<string, int>();
             var surfaces = new List<object>();
+
             foreach (var anchor in room.Anchors)
             {
                 var t = anchor.transform;
+                string rawLabel = anchor.Label.ToString();
+
+                // Assign short prefix for ID
+                string prefix = rawLabel switch
+                {
+                    "WALL_FACE"    => "WALL",
+                    "FLOOR"        => "FLOOR",
+                    "CEILING"      => "CEILING",
+                    "TABLE"        => "TABLE",
+                    "COUCH"        => "COUCH",
+                    "DOOR_FRAME"   => "DOOR",
+                    "WINDOW_FRAME" => "WINDOW",
+                    _              => "OTHER"
+                };
+                counters.TryGetValue(prefix, out int idx);
+                string anchorId = $"{prefix}_{idx}";
+                counters[prefix] = idx + 1;
+
+                _anchorRegistry[anchorId] = anchor;
+
+                // Size from PlaneRect (walls) or VolumeBounds (furniture)
+                float sizeW = 0f, sizeH = 0f;
+                if (anchor.PlaneRect.HasValue)
+                {
+                    sizeW = anchor.PlaneRect.Value.size.x;
+                    sizeH = anchor.PlaneRect.Value.size.y;
+                }
+                else if (anchor.VolumeBounds.HasValue)
+                {
+                    sizeW = anchor.VolumeBounds.Value.size.x;
+                    sizeH = anchor.VolumeBounds.Value.size.y;
+                }
+
+                // Screen position (viewport 0-1) so Claude can correlate anchor with image region
+                object screenPos = null;
+                if (cam != null)
+                {
+                    Vector3 vp = cam.WorldToViewportPoint(t.position);
+                    if (vp.z > 0) // in front of camera
+                        screenPos = new { x = Mathf.Round(vp.x * 100f) / 100f, y = Mathf.Round(vp.y * 100f) / 100f };
+                }
+
                 surfaces.Add(new
                 {
-                    label    = anchor.Label.ToString(),
-                    position = new { x = t.position.x,   y = t.position.y,   z = t.position.z   },
-                    normal   = new { x = t.forward.x,    y = t.forward.y,    z = t.forward.z    },
-                    scale    = new { x = t.localScale.x, y = t.localScale.y }
+                    id       = anchorId,
+                    label    = rawLabel,
+                    position = new { x = t.position.x, y = t.position.y, z = t.position.z },
+                    normal   = new { x = t.forward.x, y = t.forward.y, z = t.forward.z },
+                    size_metres = new { width = sizeW, height = sizeH },
+                    screen_position = screenPos
                 });
             }
+
+            Debug.Log($"[ARIA] Serialized {surfaces.Count} anchors ({_anchorRegistry.Count} registered)");
             return JsonConvert.SerializeObject(new { surfaces });
         }
         catch (Exception e)
@@ -446,7 +632,9 @@ public class ARIAOrchestrator : MonoBehaviour
         content.Add(new
         {
             type = "text",
-            text = $"Room layout:\n{mrukJson}\n\nUser command: {voiceCommand}"
+            text = $"Room layout (each surface has a unique ID matching labels in the image):\n{mrukJson}\n\n" +
+                   $"The RED DOT in the image marks where the user is currently looking (gaze crosshair).\n\n" +
+                   $"User command: {voiceCommand}"
         });
 
         string body = JsonConvert.SerializeObject(new
@@ -459,21 +647,30 @@ public class ARIAOrchestrator : MonoBehaviour
                          "- If the user says 'a bed', return exactly 1 object. 'a lamp and a table' = 2 objects.\n" +
                          "- ONLY placeable 3D furniture/objects. NOT floors, walls, ceilings, rugs, curtains.\n" +
                          "- Maximum 4 objects.\n\n" +
-                         "CONTEXTUAL REASONING (CRITICAL):\n" +
-                         "You receive the room layout (dimensions, surfaces, existing furniture) and optionally a passthrough camera image.\n" +
-                         "Use this context to decide:\n" +
-                         "- STYLE: Match the room's aesthetic. Modern room → sleek furniture. Traditional → classic. If the image shows wooden floors and warm tones, suggest warm-toned furniture.\n" +
-                         "- COLOR/MATERIAL: Complement existing room colors visible in the image. Don't clash.\n" +
-                         "- DIMENSIONS: Size objects proportionally to the room. A bed in a 3m-wide room should be narrower than in a 5m room. " +
-                         "A figurine on a table should be proportional to that table's dimensions. A bookshelf in a small room should be compact.\n" +
-                         "- PLACEMENT: Consider what's already in the room to avoid overlap.\n\n" +
-                         "PROMPT FIELD: Write a detailed image-generation prompt describing the object's style, color, material, and proportions. " +
-                         "Include context like 'matching the warm wood tones of the room' or 'compact modern design suitable for a small apartment'.\n\n" +
+                         "ANCHOR-AWARE PLACEMENT:\n" +
+                         "The image has YELLOW LABELS (e.g. WALL_0, WALL_1, TABLE_0, FLOOR_0) at each room surface.\n" +
+                         "A RED DOT shows where the user is looking (gaze crosshair).\n" +
+                         "The room JSON includes each anchor's 'id' matching these labels, plus 'screen_position' (0-1 viewport coords).\n" +
+                         "Use the crosshair position and labels to determine WHICH specific surface the user means.\n\n" +
+                         "DEICTIC REFERENCE RESOLUTION:\n" +
+                         "- 'that wall' / 'this wall' → the wall anchor nearest the crosshair/gaze\n" +
+                         "- 'the door' → the DOOR anchor visible near crosshair\n" +
+                         "- 'this corner' → two walls meeting near the crosshair; place objects on those walls and/or floor\n" +
+                         "- 'decorate it' / 'fill this space' → multiple objects on surfaces near the crosshair\n" +
+                         "- If no location specified, use the anchor nearest the crosshair\n\n" +
+                         "CONTEXTUAL REASONING:\n" +
+                         "- STYLE: Match the room's aesthetic from the image.\n" +
+                         "- COLOR/MATERIAL: Complement existing room colors. Don't clash.\n" +
+                         "- DIMENSIONS: Size proportionally to the room and target surface.\n" +
+                         "- PLACEMENT: Consider existing objects to avoid overlap.\n\n" +
+                         "PROMPT FIELD: Detailed image-generation description (style, color, material, proportions).\n\n" +
                          "Return a JSON array. Each element:\n" +
-                         "- prompt (string — detailed description for image generation, include style/color/material)\n" +
-                         "- surface_label (string: FLOOR/WALL_FACE/CEILING/TABLE)\n" +
-                         "- height_metres (float — real-world height, contextual to room)\n" +
-                         "- width_metres (float — real-world width, proportional to room/surface)\n" +
+                         "- prompt (string — detailed description for image generation)\n" +
+                         "- surface_label (string: FLOOR/WALL_FACE/CEILING/TABLE — the surface TYPE)\n" +
+                         "- anchor_id (string — specific anchor ID like 'WALL_2' or 'TABLE_0', from room JSON)\n" +
+                         "- near_anchor_id (string, optional — place near this anchor, e.g. 'on the floor near the door' → anchor_id='FLOOR_0', near_anchor_id='DOOR_0')\n" +
+                         "- height_metres (float — real-world height)\n" +
+                         "- width_metres (float — real-world width)\n" +
                          "- depth_metres (float — real-world depth)\n" +
                          "- category (string — object type, lowercase)\n" +
                          "- emits_light (bool)\n" +
@@ -641,10 +838,11 @@ public class ARIAOrchestrator : MonoBehaviour
                    "The user is wearing a VR headset with passthrough (they see the real room). They spawned a virtual object " +
                    "and now want you to decide the BEST placement and scale based on what you see.\n\n" +
                    "HOW TO USE THE IMAGE:\n" +
-                   "- This is a RAW passthrough camera image — only the real room is visible, no virtual objects or wireframe\n" +
-                   "- The IMAGE CENTER is where the user is looking\n" +
-                   "- The CENTER of the image is where the user is looking (their gaze target)\n" +
-                   "- Look at what SURFACE is at the center: is it a table/desk surface? A wall? The floor?\n" +
+                   "- This is an ANNOTATED view: real room + virtual objects + yellow anchor labels (WALL_0, TABLE_0 etc.) + red gaze dot\n" +
+                   "- You CAN see virtual objects already spawned in the scene — use this to avoid overlap\n" +
+                   "- The RED DOT marks where the user is looking (their gaze target)\n" +
+                   "- YELLOW LABELS show anchor IDs matching the room JSON data\n" +
+                   "- Look at what SURFACE is near the red dot: is it a table/desk surface? A wall? The floor?\n" +
                    "- Look at OBJECTS on that surface: keyboard, mouse, phone, bottles, cables — the virtual object must NOT overlap these\n" +
                    "- Look at CLEAR AREAS near the gaze center where the virtual object could fit\n" +
                    "- If the user is looking at a small area (e.g., corner of a desk), the object must be scaled DOWN to fit\n\n" +
@@ -670,21 +868,26 @@ public class ARIAOrchestrator : MonoBehaviour
                    "3. AVOID OVERLAP with real objects visible in the image\n" +
                    "   - Don't place on top of keyboards, mice, phones, shoes, bags, bottles\n" +
                    "   - Find the nearest CLEAR area to the gaze center\n\n" +
+                   "ANCHOR-AWARE PLACEMENT:\n" +
+                   "- Use the anchor IDs from the room JSON and image labels to specify WHICH surface\n" +
+                   "- Return anchor_id (e.g. 'WALL_2', 'TABLE_0') for precise placement\n" +
+                   "- 'that wall' / 'this side' → use the anchor nearest the red gaze dot\n\n" +
                    "Return JSON ONLY:\n" +
-                   "{\"surface_label\": \"TABLE\", \"scale_factor\": 0.1, \"category\": \"lamp\", " +
+                   "{\"surface_label\": \"TABLE\", \"anchor_id\": \"TABLE_0\", \"scale_factor\": 0.1, \"category\": \"lamp\", " +
                    "\"reasoning\": \"User looking at desk corner near keyboard, scaling to miniature to fit clear area\"}"
         });
 
         string body = JsonConvert.SerializeObject(new
         {
             model = "claude-sonnet-4-6",
-            max_tokens = 256,
+            max_tokens = 512,
             system = "You are the spatial reasoning AI for ARIA, a mixed reality furniture placement system on Meta Quest 3. " +
-                     "You receive: (1) a passthrough camera image of the real room, (2) MRUK room scan data with exact dimensions, " +
-                     "(3) user position and gaze direction. " +
-                     "Your job: decide surface_label and scale_factor for a virtual object. " +
+                     "You receive: (1) an annotated image showing real room + virtual objects + anchor labels + gaze dot, " +
+                     "(2) MRUK room scan data with anchor IDs and dimensions, (3) user position and gaze direction. " +
+                     "Your job: decide surface_label, anchor_id, and scale_factor for a virtual object. " +
                      "scale_factor is a SINGLE float for UNIFORM proportional scaling — NEVER change individual dimensions. " +
-                     "Analyze the image to identify the surface the user is looking at and find a clear area to place the object. " +
+                     "Use anchor IDs (WALL_0, TABLE_0, etc.) visible in the image and JSON to specify exact placement. " +
+                     "Analyze the image to see what's already spawned and avoid overlap. " +
                      "Return valid JSON only, no explanation outside the JSON.",
             messages = new[] { new { role = "user", content } }
         });
@@ -1206,8 +1409,10 @@ public class ARIAOrchestrator : MonoBehaviour
         scaleSystem?.ApplyScale(root, instr.height_metres, instr.category,
                                 instr.width_metres, instr.depth_metres);
 
-        // Place on the correct MRUK surface
-        placementEngine?.Place(root, instr.surface_label);
+        // Place on the correct MRUK surface — use specific anchor if Claude provided one
+        MRUKAnchor targetAnchor = GetAnchorById(instr.anchor_id);
+        MRUKAnchor nearAnchor = GetAnchorById(instr.near_anchor_id);
+        placementEngine?.Place(root, instr.surface_label, targetAnchor, nearAnchor);
 
         // Auto-fit: shrink if object clips walls/ceiling/furniture
 
@@ -1340,21 +1545,10 @@ public class ARIAOrchestrator : MonoBehaviour
         // Wait one frame for mesh renderers to initialize bounds properly
         await Task.Yield();
 
-        // Initial spawn: place 1.5m ahead at eye height, floating in air.
-        // Claude adjustment handles final placement on correct surface.
-        Camera cam = Camera.main;
-        if (cam != null)
-        {
-            Vector3 fwd = cam.transform.forward;
-            fwd.y = 0;
-            if (fwd.sqrMagnitude < 0.001f) fwd = Vector3.forward;
-            else fwd.Normalize();
-            root.transform.position = cam.transform.position + fwd * 1.5f;
-            root.transform.rotation = Quaternion.LookRotation(-fwd, Vector3.up);
-        }
+        // Place on the correct surface using the placement engine
+        placementEngine?.Place(root, surfaceLabel);
 
-        // Auto-fit to available MRUK space (won't hit other spawned objects due to layer)
-
+        // Auto-fit to available MRUK space
         var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
         if (fitRoom != null)
             placementEngine?.FitToAvailableSpace(root, fitRoom);
@@ -1403,9 +1597,11 @@ public class ARIAOrchestrator : MonoBehaviour
         Transform lastSpawn = root.GetChild(root.childCount - 1);
         string objName = lastSpawn.name;
 
-        SetStatus($"Capturing passthrough for Claude...");
-        // Raw passthrough only — no wireframe, no virtual objects in the image
-        byte[] jpeg = await CapturePassthroughFrameAsync();
+        SetStatus($"Capturing scene for Claude...");
+        // Annotated view: passthrough + virtual objects + anchor labels + gaze crosshair
+        // So Claude can see what's already spawned and where anchors are
+        string mrukJson = SerializeMRUKData();
+        byte[] jpeg = await CaptureAnnotatedViewAsync();
         if (jpeg == null)
         {
             SetStatus("Image capture failed.");
@@ -1414,9 +1610,7 @@ public class ARIAOrchestrator : MonoBehaviour
         }
 
         SetStatus($"Claude analyzing {objName} ({jpeg.Length/1024}KB image)...");
-        Debug.Log($"[ARIA] Sending to Claude: {objName}, image={jpeg.Length/1024}KB, key={_claudeKey.Substring(0,10)}...");
-
-        string mrukJson = SerializeMRUKData();
+        Debug.Log($"[ARIA] Sending to Claude: {objName}, image={jpeg.Length/1024}KB");
 
         // Get actual world-space bounds of the spawned object
         Bounds objBounds = CalculateMeshBounds(lastSpawn.gameObject);
@@ -1441,7 +1635,7 @@ public class ARIAOrchestrator : MonoBehaviour
         // Send passthrough image with rich context
         var refined = await CallClaudeAdjustmentAsync(instr, jpeg, mrukJson, gazePos, gazeFwd);
 
-        // Claude returns scale_factor (uniform) + surface_label + reasoning
+        // Claude returns scale_factor (uniform) + surface_label + anchor_id + reasoning
         float scaleFactor = refined.scale_factor > 0.01f ? refined.scale_factor : 1f;
         string surface = refined.surface_label ?? "FLOOR";
         string reasoning = refined.reasoning ?? "";
@@ -1453,8 +1647,10 @@ public class ARIAOrchestrator : MonoBehaviour
             Debug.Log($"[ARIA] Claude scale: {scaleFactor:F2}x (uniform)");
         }
 
-        // Re-place on the surface Claude decided
-        placementEngine?.Place(lastSpawn.gameObject, surface);
+        // Re-place on the specific anchor Claude decided
+        MRUKAnchor targetAnchor = GetAnchorById(refined.anchor_id);
+        placementEngine?.Place(lastSpawn.gameObject, surface, targetAnchor);
+        ARIADebugUI.AppendClaudeLog($"ADJUST: {objName}\n  → {refined.anchor_id ?? surface}, scale {scaleFactor:F2}x\n  {reasoning}");
 
 
         var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
@@ -1494,12 +1690,18 @@ public class ARIAOrchestrator : MonoBehaviour
         {
             ApplyShadowMode();
             // Update PTRL surface properties for the new mode
-            float hlOpacity = _shadowMode == ShadowMode.PointLight ? 0.5f : 0f;
+            float hlOpacity = _shadowMode == ShadowMode.PointLight ? 0.15f : 0f; // minimal wash, shadows still work
             float shadowInt = _shadowMode == ShadowMode.PointLight ? 1f : 0.75f;
+            bool wallsCastShadows = _shadowMode == ShadowMode.PointLight;
             foreach (var surface in _ptrlShadowSurfaces)
             {
                 if (surface == null) continue;
-                var mat = surface.GetComponent<Renderer>()?.material;
+                var rend = surface.GetComponent<Renderer>();
+                if (rend != null && surface.name.Contains("ShadowWall"))
+                    rend.shadowCastingMode = wallsCastShadows
+                        ? UnityEngine.Rendering.ShadowCastingMode.On
+                        : UnityEngine.Rendering.ShadowCastingMode.Off;
+                var mat = rend?.material;
                 if (mat != null)
                 {
                     mat.SetFloat("_HighlightOpacity", hlOpacity);
@@ -1544,14 +1746,20 @@ public class ARIAOrchestrator : MonoBehaviour
             }
 
             // Configure PTRL surface properties based on shadow mode
-            // Directional mode: highlights OFF (prevents white-wash), shadows only
-            // Point light mode: highlights ON (point light shadows work via highlight channel)
-            float hlOpacity = _shadowMode == ShadowMode.PointLight ? 0.5f : 0f;
+            float hlOpacity = _shadowMode == ShadowMode.PointLight ? 0.15f : 0f; // minimal wash, shadows still work
             float shadowInt = _shadowMode == ShadowMode.PointLight ? 1f : 0.75f;
+            bool wallsCastShadows = _shadowMode == ShadowMode.PointLight;
             foreach (var surface in _ptrlShadowSurfaces)
             {
                 if (surface == null) continue;
-                var mat = surface.GetComponent<Renderer>()?.material;
+                // Walls cast shadows in point light mode so light doesn't pass through them
+                // In directional mode, wall shadow casting creates ugly rectangles so keep it off
+                var rend = surface.GetComponent<Renderer>();
+                if (rend != null && surface.name.Contains("ShadowWall"))
+                    rend.shadowCastingMode = wallsCastShadows
+                        ? UnityEngine.Rendering.ShadowCastingMode.On
+                        : UnityEngine.Rendering.ShadowCastingMode.Off;
+                var mat = rend?.material;
                 if (mat != null)
                 {
                     mat.SetFloat("_HighlightOpacity", hlOpacity);
@@ -1633,8 +1841,8 @@ public class ARIAOrchestrator : MonoBehaviour
                     sceneDirectionalLight.transform.rotation = Quaternion.LookRotation(dir);
 
                 sceneDirectionalLight.shadows = LightShadows.Soft;
-                sceneDirectionalLight.shadowStrength = 0.85f;
-                sceneDirectionalLight.intensity = 0.15f;
+                sceneDirectionalLight.shadowStrength = 0.9f;
+                sceneDirectionalLight.intensity = 0.35f; // strong enough for visible shadows at distance
                 sceneDirectionalLight.color = _manualLights[0].GetComponent<Light>()?.color ?? Color.white;
             }
             else if (sceneDirectionalLight != null)
@@ -1834,7 +2042,7 @@ public class ARIAOrchestrator : MonoBehaviour
         light.type = LightType.Point;
         light.color = lightColor;
         light.intensity = lightIntensity;
-        light.range = 10f;
+        light.range = 4f; // 4m — realistic room light reach, won't flood entire room
         light.shadows = LightShadows.Soft;
         light.shadowStrength = 0.6f;
         light.shadowBias = 0.05f;
@@ -2273,6 +2481,8 @@ public class PlacementInstruction
 {
     public string   prompt;
     public string   surface_label;
+    public string   anchor_id;       // specific anchor (e.g. "WALL_2"), null = generic placement
+    public string   near_anchor_id;  // hint: place near this anchor (e.g. "DOOR_0" for "near the door")
     public float    height_metres;
     public float    width_metres;
     public float    depth_metres;

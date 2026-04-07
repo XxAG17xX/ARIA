@@ -18,22 +18,15 @@ public class ARIADebugUI : MonoBehaviour
     [SerializeField] private bool showDebugUI = true;
     [SerializeField] private int  fontSize    = 16;
 
-    [Header("Quick placement commands")]
-    [SerializeField] private string quickCommand1 = "put a tall floor lamp and a cozy armchair";
-    [SerializeField] private string quickCommand2 = "hang a framed landscape painting on the wall";
-    [SerializeField] private string quickCommand3 = "place a small potted plant on the table";
-
     private ARIAOrchestrator  _orchestrator;
     private VoiceSDKConnector _voiceConnector;
-    private string            _inputText = "put a reading lamp in the corner";
     private string            _status    = "Ready — look where you want objects, then tap a button.";
     private string            _partialTranscript = "";
 
     // Countdown state
     private bool   _countdownActive;
     private float  _countdownEnd;
-    private string _pendingCommand;
-    private System.Action _pendingAction; // for demo spawns
+    private System.Action _pendingAction;
     private const float CountdownSeconds = 3f;
 
     // Room scan removed — lighting now uses PTRL + single-frame analysis
@@ -68,10 +61,6 @@ public class ARIADebugUI : MonoBehaviour
         if (_claudeLog.Length > 3000) _claudeLog = _claudeLog.Substring(0, 3000);
     }
 
-    // IMGUI styles (editor)
-    private GUIStyle _panelStyle, _labelStyle, _bigLabelStyle;
-    private GUIStyle _countdownStyle, _buttonStyle, _fieldStyle;
-    private bool     _stylesInitialised;
 
     // -------------------------------------------------------------------------
     // Lifecycle
@@ -236,14 +225,9 @@ public class ARIADebugUI : MonoBehaviour
 
             if (_pendingAction != null)
             {
-                SetStatus("Spawning...");
+                SetStatus("Processing...");
                 _pendingAction.Invoke();
                 _pendingAction = null;
-            }
-            else
-            {
-                SetStatus("Capturing & sending...");
-                _orchestrator.ProcessVoiceCommand(_pendingCommand);
             }
         }
     }
@@ -367,24 +351,15 @@ public class ARIADebugUI : MonoBehaviour
 
         float y = 445f; // start from top
 
-        MakeLabel(_mainPanel.transform, "Title", "ARIA — Look at target, then tap:",
-            new Vector2(0, y), new Vector2(560, 36), 22, FontStyle.Bold, Color.white);
+        MakeLabel(_mainPanel.transform, "Title", "ARIA",
+            new Vector2(0, y), new Vector2(560, 36), 26, FontStyle.Bold, Color.white);
         y -= 50f;
 
-        // Quick command buttons
-        MakeButton(_mainPanel.transform, "Cmd1", quickCommand1,
-            new Vector2(0, y), new Vector2(560, 55), () => StartCountdown(quickCommand1));
-        y -= 65f;
-
-        MakeButton(_mainPanel.transform, "Cmd2", quickCommand2,
-            new Vector2(0, y), new Vector2(560, 55), () => StartCountdown(quickCommand2));
-        y -= 65f;
-
-        MakeButton(_mainPanel.transform, "Cmd3", quickCommand3,
-            new Vector2(0, y), new Vector2(560, 55), () => StartCountdown(quickCommand3));
-        y -= 75f;
-
-        // Room scan removed — lighting now uses single-frame analysis + PTRL shader
+        // Voice command — records speech, captures passthrough, sends to Claude + 3D gen pipeline
+        MakeButton(_mainPanel.transform, "BtnSpeak", "Speak to ARIA (voice command)",
+            new Vector2(0, y), new Vector2(560, 60),
+            () => StartVoiceCommand());
+        y -= 70f;
 
         // Lighting row
         _ptrlButton = MakeButtonWithRef(_mainPanel.transform, "BtnPTRL", "PTRL: OFF",
@@ -655,6 +630,43 @@ public class ARIADebugUI : MonoBehaviour
 
     private bool _waitingForVoice;
     private float _voiceTimeout;
+    private bool _voiceIsForNewCommand; // true = voice command pipeline, false = adjustment
+
+    private void StartVoiceCommand()
+    {
+        if (_voiceConnector != null && !_waitingForVoice)
+        {
+            SetStatus("Speak now... (7s timeout, or press trigger to skip)");
+            _waitingForVoice = true;
+            _voiceIsForNewCommand = true;
+            _voiceTimeout = Time.time + 7f;
+
+            if (_countdownPanel != null)
+            {
+                _countdownNumText = RemakeLabel(_countdownNumText, "Speak");
+                _countdownCmdText = RemakeLabel(_countdownCmdText, "Describe what you want & where");
+                ShowCountdownPanel(true);
+            }
+
+            _voiceConnector.RecordOneShot(transcript =>
+            {
+                _waitingForVoice = false;
+                SetStatus($"Heard: \"{transcript}\" — capturing room...");
+
+                if (_countdownCmdText != null)
+                    _countdownCmdText = RemakeLabel(_countdownCmdText, $"\"{transcript}\"");
+
+                // Brief countdown so user can look at target area for the annotated capture
+                StartCountdownForAction($"Spawning: {transcript}",
+                    () => _orchestrator.ProcessVoiceCommand(transcript));
+            });
+        }
+        else
+        {
+            // No voice SDK — fall back to text input (editor only)
+            SetStatus("No voice SDK — use text input.");
+        }
+    }
 
     private void StartVoiceAdjust()
     {
@@ -663,6 +675,7 @@ public class ARIADebugUI : MonoBehaviour
             // Step 1: Record voice command with 5-second timeout
             SetStatus("Speak now... (5s timeout, or press trigger to skip)");
             _waitingForVoice = true;
+            _voiceIsForNewCommand = false;
             _voiceTimeout = Time.time + 5f;
 
             if (_countdownPanel != null)
@@ -706,12 +719,20 @@ public class ARIADebugUI : MonoBehaviour
         {
             _waitingForVoice = false;
             _voiceConnector?.StopListening();
-
             ShowCountdownPanel(false);
 
-            SetStatus("Voice skipped — adjusting with visual context only...");
-            StartCountdownForAction("Claude adjustment",
-                () => _orchestrator.AdjustLastSpawnWithClaude());
+            if (_voiceIsForNewCommand)
+            {
+                // Voice command timed out — can't proceed without a command
+                SetStatus("No voice detected — try again.");
+            }
+            else
+            {
+                // Adjustment — proceed with visual context only
+                SetStatus("Voice skipped — adjusting with visual context only...");
+                StartCountdownForAction("Claude adjustment",
+                    () => _orchestrator.AdjustLastSpawnWithClaude());
+            }
         }
     }
 
@@ -927,21 +948,11 @@ public class ARIADebugUI : MonoBehaviour
             _statusText = RemakeLabel(_statusText, "Status: " + s);
     }
 
-    private void StartCountdown(string command)
-    {
-        if (_countdownActive) return;
-        _pendingCommand = command;
-        _pendingAction = null;
-        _countdownActive = true;
-        _countdownEnd = Time.time + CountdownSeconds;
-        BeginCountdownUI(command);
-    }
 
     private void StartCountdownForAction(string label, System.Action action)
     {
         if (_countdownActive) return;
         _pendingAction = action;
-        _pendingCommand = null;
         _countdownActive = true;
         _countdownEnd = Time.time + CountdownSeconds;
         BeginCountdownUI(label);
@@ -957,122 +968,10 @@ public class ARIADebugUI : MonoBehaviour
         }
     }
 
-    private void SendCommand(string overrideText = null)
-    {
-        string cmd = (overrideText ?? _inputText).Trim();
-        if (string.IsNullOrEmpty(cmd)) return;
-        SetStatus("Sending...");
-        _orchestrator.ProcessVoiceCommand(cmd);
-    }
-
     private static bool IsRunningOnQuest()
     {
         // Runtime check — true when headset is connected (Quest Link or APK)
         return OVRManager.isHmdPresent;
     }
 
-    // -------------------------------------------------------------------------
-    // Editor IMGUI (unchanged — only draws when NOT on Quest)
-    // -------------------------------------------------------------------------
-
-    private void OnGUI()
-    {
-        if (!showDebugUI || IsRunningOnQuest()) return;
-        InitStyles();
-
-        if (_countdownActive) { DrawCountdownOverlay(); return; }
-        DrawEditorUI();
-    }
-
-    private void DrawEditorUI()
-    {
-        float panelW = 420f, panelH = 240f;
-        float x = 20f, y = Screen.height - panelH - 20f;
-        GUI.Box(new Rect(x, y, panelW, panelH), GUIContent.none, _panelStyle);
-
-        float padding = 12f, inner = x + padding;
-        float lineH = fontSize + 8f, cy = y + padding;
-
-        GUI.Label(new Rect(inner, cy, panelW - padding * 2f, lineH),
-            "ARIA Debug (Editor)", _labelStyle);
-        cy += lineH + 4f;
-
-        GUI.Label(new Rect(inner, cy, 90f, lineH), "Command:", _labelStyle);
-        _inputText = GUI.TextField(
-            new Rect(inner + 95f, cy, panelW - padding * 2f - 95f, lineH), _inputText);
-        if (Event.current.type == EventType.KeyDown && Event.current.keyCode == KeyCode.Return)
-            SendCommand();
-        cy += lineH + 6f;
-
-        float btnW = (panelW - padding * 2f - 8f) / 2f;
-        if (GUI.Button(new Rect(inner, cy, btnW, lineH + 4f), "Send Command"))
-            SendCommand();
-        if (GUI.Button(new Rect(inner + btnW + 8f, cy, btnW, lineH + 4f), "Quick Test"))
-            SendCommand(quickCommand1);
-        cy += lineH + 6f;
-
-        float halfBtn = (panelW - padding * 2f - 8f) / 2f;
-        if (GUI.Button(new Rect(inner, cy, halfBtn, lineH + 4f), "PTRL: Toggle"))
-            _orchestrator.TogglePTRL();
-        if (GUI.Button(new Rect(inner + halfBtn + 8f, cy, halfBtn, lineH + 4f),
-            $"Shadows: {_orchestrator.CurrentShadowMode}"))
-            _orchestrator.CycleShadowMode();
-        cy += lineH + 10f;
-
-        if (!string.IsNullOrEmpty(_partialTranscript))
-        {
-            GUI.Label(new Rect(inner, cy, panelW - padding * 2f, lineH),
-                $"\"{_partialTranscript}\"", _labelStyle);
-            cy += lineH + 2f;
-        }
-
-        GUI.Label(new Rect(inner, cy, panelW - padding * 2f, lineH * 2f),
-            $"Status: {_status}", _labelStyle);
-    }
-
-    private void DrawCountdownOverlay()
-    {
-        float remaining = _countdownEnd - Time.time;
-        int display = Mathf.CeilToInt(remaining);
-        if (display < 1) display = 1;
-
-        GUI.Box(new Rect(0, 0, Screen.width, Screen.height), GUIContent.none, _panelStyle);
-        GUI.Label(new Rect(0, Screen.height * 0.3f, Screen.width, 200f),
-            display.ToString(), _countdownStyle);
-        GUI.Label(new Rect(0, Screen.height * 0.55f, Screen.width, 60f),
-            "Look at where you want objects placed...", _bigLabelStyle);
-        GUI.Label(new Rect(0, Screen.height * 0.65f, Screen.width, 40f),
-            $"\"{_pendingCommand}\"", _labelStyle);
-    }
-
-    private void InitStyles()
-    {
-        if (_stylesInitialised) return;
-        _stylesInitialised = true;
-
-        var panelTex = new Texture2D(1, 1);
-        panelTex.SetPixel(0, 0, new Color(0f, 0f, 0f, 0.72f));
-        panelTex.Apply();
-
-        _panelStyle = new GUIStyle(GUI.skin.box) { normal = { background = panelTex } };
-
-        _labelStyle = new GUIStyle(GUI.skin.label)
-        {
-            fontSize = fontSize, normal = { textColor = Color.white },
-            alignment = TextAnchor.MiddleCenter
-        };
-
-        _bigLabelStyle = new GUIStyle(GUI.skin.label)
-        {
-            fontSize = fontSize + 6, fontStyle = FontStyle.Bold,
-            normal = { textColor = Color.white }, alignment = TextAnchor.MiddleCenter
-        };
-
-        _countdownStyle = new GUIStyle(GUI.skin.label)
-        {
-            fontSize = 120, fontStyle = FontStyle.Bold,
-            normal = { textColor = new Color(1f, 0.85f, 0.2f) },
-            alignment = TextAnchor.MiddleCenter
-        };
-    }
 }

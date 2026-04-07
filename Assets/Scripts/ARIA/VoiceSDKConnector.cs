@@ -15,7 +15,7 @@ using Oculus.Voice;
 public class VoiceSDKConnector : MonoBehaviour
 {
     [Tooltip("Start listening automatically on launch. Disable for push-to-talk.")]
-    [SerializeField] private bool autoActivate = true;
+    [SerializeField] private bool autoActivate = false;
 
     [Tooltip("Minimum transcript length before forwarding to ARIA (filters noise).")]
     [SerializeField] private int minTranscriptLength = 3;
@@ -152,11 +152,9 @@ public class VoiceSDKConnector : MonoBehaviour
             return;
         }
 
-        _orchestrator.ProcessVoiceCommand(transcript);
-
-        // Re-activate for next command if auto mode
-        if (autoActivate)
-            _voice.Activate();
+        // Voice is now button-triggered only (Speak to ARIA button)
+        // If somehow a non-one-shot transcript comes through, ignore it
+        Debug.LogWarning($"[ARIA] Ignoring non-one-shot transcript: \"{transcript}\"");
     }
 
     private void OnDestroy()
