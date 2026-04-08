@@ -18,7 +18,7 @@ public class ARIAInteractable : MonoBehaviour
 
     [Header("Wall Snap")]
     [Tooltip("Maximum distance from a wall to trigger magnet snap (metres).")]
-    [SerializeField] private float wallSnapThreshold = 0.4f;
+    [SerializeField] private float wallSnapThreshold = 0.15f;
 
     [Header("Settle Detection")]
     [Tooltip("Seconds to wait before checking if object has settled after drop.")]
@@ -31,10 +31,19 @@ public class ARIAInteractable : MonoBehaviour
     private Coroutine _settleCoroutine;
     private bool _isGrabbed;
 
+    /// <summary>Original scale at spawn time — used to reset before FitToSurface so shrink isn't multiplicative.</summary>
+    [HideInInspector] public Vector3 originalScale = Vector3.one;
+
     private void Awake()
     {
         _rb = GetComponent<Rigidbody>();
         _placementEngine = FindFirstObjectByType<SemanticPlacementEngine>();
+    }
+
+    private void Start()
+    {
+        // Capture the post-placement scale as the "original" (after ApplyScale + FitToAvailableSpace)
+        originalScale = transform.localScale;
     }
 
     // ── Called by ARIADebugUI when A button pressed/released ────────────
@@ -126,7 +135,23 @@ public class ARIAInteractable : MonoBehaviour
             MRUKAnchor landedOn = _placementEngine.DetectSurfaceBelow(transform.position);
             if (landedOn != null)
             {
+                // Correct rotation to upright — floor/table items should stand up, not lie on side
+                if (category == SurfaceCategory.FloorItem)
+                {
+                    Vector3 euler = transform.eulerAngles;
+                    transform.rotation = Quaternion.Euler(0f, euler.y, 0f); // keep Y rotation, zero tilt
+                }
+
+                // Reset to original scale before fitting — prevents multiplicative shrink
+                transform.localScale = originalScale;
                 _placementEngine.FitToSurface(gameObject, landedOn, objectCategory);
+
+                // Snap bottom to surface — fixes floating after physics settle
+                Bounds b = ARIAOrchestrator.CalculateMeshBounds(gameObject);
+                float surfaceY = landedOn.transform.position.y;
+                float bottomToOrigin = transform.position.y - b.min.y;
+                transform.position = new Vector3(transform.position.x, surfaceY + bottomToOrigin, transform.position.z);
+
                 Debug.Log($"[ARIAInteractable] {gameObject.name} settled on {landedOn.name}");
             }
         }
@@ -172,6 +197,8 @@ public class ARIAInteractable : MonoBehaviour
             _rb.linearVelocity = Vector3.zero;
             _rb.angularVelocity = Vector3.zero;
 
+            // Reset to original scale before fitting — prevents multiplicative shrink
+            transform.localScale = originalScale;
             _placementEngine.FitToSurface(gameObject, wallAnchor, objectCategory);
 
             Debug.Log($"[ARIAInteractable] {gameObject.name} snapped to wall {wallAnchor.name} (dist={dist:F2}m)");

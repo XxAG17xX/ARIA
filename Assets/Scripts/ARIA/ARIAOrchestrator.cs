@@ -1736,8 +1736,20 @@ public class ARIAOrchestrator : MonoBehaviour
         if (hasOffset)
         {
             Vector3 offset = new Vector3(refined.position_offset[0], refined.position_offset[1], refined.position_offset[2]);
-            lastSpawn.position += offset;
-            Debug.Log($"[ARIA] Claude position offset: ({offset.x:F2}, {offset.y:F2}, {offset.z:F2})");
+
+            // If Place() already ran (anchor_id provided), it already set the correct Y for the surface.
+            // Zero out Y offset to avoid double-dipping (Claude often returns Y offset that duplicates
+            // what the anchor placement already did — e.g. "move down 0.21m to floor" when Place
+            // already snapped to floor).
+            // Only keep Y offset when NO anchor was used (pure offset from current position).
+            if (targetAnchor != null)
+                offset.y = 0f;
+
+            if (offset.sqrMagnitude > 0.001f)
+            {
+                lastSpawn.position += offset;
+                Debug.Log($"[ARIA] Claude position offset: ({offset.x:F2}, {offset.y:F2}, {offset.z:F2})");
+            }
         }
 
         string offsetStr = refined.position_offset != null && refined.position_offset.Length >= 3
@@ -1765,6 +1777,7 @@ public class ARIAOrchestrator : MonoBehaviour
 
     /// <summary>Whether PTRL is currently active. Used by DebugUI to gate selection.</summary>
     public bool IsPTRLActive => _ptrlActive;
+    public SemanticPlacementEngine GetPlacementEngine() => placementEngine;
     public ShadowMode CurrentShadowMode => _shadowMode;
 
     /// <summary>Cycles shadow mode. Only takes effect on next TogglePTRL call.</summary>

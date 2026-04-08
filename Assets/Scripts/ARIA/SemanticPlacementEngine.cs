@@ -36,6 +36,61 @@ public class SemanticPlacementEngine : MonoBehaviour
     // -------------------------------------------------------------------------
 
     /// <summary>
+    /// Detects which surface type the user is currently looking at via gaze raycast.
+    /// Returns "WALL_FACE", "TABLE", "FLOOR", etc. based on what the crosshair hits.
+    /// Falls back to <paramref name="defaultLabel"/> if nothing is hit.
+    /// </summary>
+    public string DetectGazeSurface(string defaultLabel = "FLOOR")
+    {
+        Camera cam = Camera.main;
+        if (cam == null) return defaultLabel;
+
+        Ray gazeRay = new Ray(cam.transform.position, cam.transform.forward);
+        if (!Physics.Raycast(gazeRay, out RaycastHit hit, 10f))
+            return defaultLabel;
+
+        // Check if we hit an EffectMesh surface — determine its MRUK anchor type
+        var room = MRUK.Instance?.GetCurrentRoom();
+        if (room == null) return defaultLabel;
+
+        // Find which anchor is closest to the hit point
+        float bestDist = 0.5f; // tolerance
+        string bestLabel = defaultLabel;
+        MRUKAnchor bestAnchor = null;
+
+        foreach (var anchor in room.Anchors)
+        {
+            float dist = Vector3.Distance(anchor.transform.position, hit.point);
+
+            // For walls, check plane distance instead of center distance
+            if (anchor.HasAnyLabel(MRUKAnchor.SceneLabels.WALL_FACE))
+            {
+                Vector3 toHit = hit.point - anchor.transform.position;
+                dist = Mathf.Abs(Vector3.Dot(toHit, anchor.transform.forward));
+            }
+
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                bestAnchor = anchor;
+            }
+        }
+
+        if (bestAnchor == null) return defaultLabel;
+
+        // Determine surface label from anchor type
+        if (bestAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.WALL_FACE)) return "WALL_FACE";
+        if (bestAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.TABLE))     return "TABLE";
+        if (bestAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.COUCH))     return "COUCH";
+        if (bestAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.CEILING))   return "CEILING";
+        if (bestAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.FLOOR))     return "FLOOR";
+
+        // Check hit normal: mostly vertical = horizontal surface (floor/table), mostly horizontal = wall
+        if (Mathf.Abs(hit.normal.y) > 0.7f) return "FLOOR"; // flat surface
+        return "WALL_FACE";
+    }
+
+    /// <summary>
     /// Positions <paramref name="obj"/> on the surface indicated by <paramref name="surfaceLabel"/>.
     /// Valid labels: FLOOR, WALL_FACE, CEILING, TABLE, COUCH, OTHER (defaults to FLOOR).
     /// </summary>

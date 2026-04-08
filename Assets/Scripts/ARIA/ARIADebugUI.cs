@@ -176,7 +176,12 @@ public class ARIADebugUI : MonoBehaviour
                 _orchestrator.PlaceLightAtCrosshair();
             // Right grip = grab/release nearest light OR spawned object
             if (OVRInput.Get(OVRInput.Button.SecondaryHandTrigger))
+            {
                 GrabNearest();
+                // While holding an object, thumbstick rotates it
+                if (_grabbedObject != null)
+                    RotateGrabbedObject();
+            }
             else
                 ReleaseGrabbed();
         }
@@ -393,19 +398,19 @@ public class ARIADebugUI : MonoBehaviour
             new Color(0.4f, 1f, 0.6f));
         y -= 40f;
 
-        MakeButton(_mainPanel.transform, "DemoBed", "Spawn Bed (floor)",
+        MakeButton(_mainPanel.transform, "DemoBed", "Spawn Bed",
             new Vector2(-145, y), new Vector2(270, 48),
-            () => StartCountdownForAction("Bed on floor",
+            () => StartCountdownForAction("Bed at crosshair",
                 () => { _orchestrator.SetUserContext("spawn a bed"); _orchestrator.SpawnBundledGlb("bed.glb", "FLOOR", 0.5f, "bed", 1.4f, 2.0f); }));
-        MakeButton(_mainPanel.transform, "DemoLamp", "Spawn Lamp (floor)",
+        MakeButton(_mainPanel.transform, "DemoLamp", "Spawn Lamp",
             new Vector2(145, y), new Vector2(270, 48),
-            () => StartCountdownForAction("Lamp on floor",
+            () => StartCountdownForAction("Lamp at crosshair",
                 () => { _orchestrator.SetUserContext("spawn a lamp"); _orchestrator.SpawnBundledGlb("lamp.glb", "FLOOR", 1.5f, "lamp"); }));
         y -= 58f;
 
-        MakeButton(_mainPanel.transform, "DemoWall", "Spawn Wall Art (wall)",
+        MakeButton(_mainPanel.transform, "DemoWall", "Spawn Wall Art",
             new Vector2(0, y), new Vector2(560, 48),
-            () => StartCountdownForAction("Wall art on wall",
+            () => StartCountdownForAction("Wall art at crosshair",
                 () => { _orchestrator.SetUserContext("hang a painting on the wall"); _orchestrator.SpawnBundledGlb("wall_art.glb", "WALL_FACE", 0.6f, "wall_art", 0.8f, 0.05f); }));
         y -= 58f;
 
@@ -852,6 +857,34 @@ public class ARIADebugUI : MonoBehaviour
             SetStatus($"Dropped {_grabbedObject.gameObject.name}");
             _grabbedObject.EndGrab(); // triggers gravity or wall snap
             _grabbedObject = null;
+        }
+    }
+
+    /// <summary>
+    /// While holding an object with right grip, use thumbsticks to rotate it.
+    /// Right thumbstick X: turn left/right (Y axis). Left thumbstick Y: tilt forward/back (X axis).
+    /// This lets the user straighten a fallen lamp or tilt a bed before releasing.
+    /// </summary>
+    private void RotateGrabbedObject()
+    {
+        if (_grabbedObject == null) return;
+
+        float rotSpeed = 120f * Time.deltaTime; // degrees per second
+
+        // Right thumbstick X → rotate around Y axis (turn left/right)
+        Vector2 rightStick = OVRInput.Get(OVRInput.Axis2D.SecondaryThumbstick);
+        if (Mathf.Abs(rightStick.x) > 0.15f)
+            _grabbedObject.transform.Rotate(Vector3.up, rightStick.x * rotSpeed, Space.World);
+
+        // Right thumbstick Y → rotate around X axis (tilt forward/back)
+        if (Mathf.Abs(rightStick.y) > 0.15f)
+            _grabbedObject.transform.Rotate(Vector3.right, -rightStick.y * rotSpeed, Space.World);
+
+        // A button: reset rotation to upright (quick fix)
+        if (OVRInput.GetDown(OVRInput.Button.One))
+        {
+            _grabbedObject.transform.rotation = Quaternion.identity;
+            SetStatus("Rotation reset to upright");
         }
     }
 
