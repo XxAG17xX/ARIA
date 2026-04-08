@@ -174,11 +174,11 @@ public class ARIADebugUI : MonoBehaviour
             // Left grip = place light at crosshair (no menu needed)
             if (OVRInput.GetDown(OVRInput.Button.PrimaryHandTrigger) && !_menuVisible)
                 _orchestrator.PlaceLightAtCrosshair();
-            // Right grip = grab/release nearest light source
+            // Right grip = grab/release nearest light OR spawned object
             if (OVRInput.Get(OVRInput.Button.SecondaryHandTrigger))
-                GrabNearestLight();
-            else if (_grabbedLight != null)
-                ReleaseLight();
+                GrabNearest();
+            else
+                ReleaseGrabbed();
         }
 
         // X button: cycle selection / delete (only when menu is NOT visible)
@@ -759,75 +759,124 @@ public class ARIADebugUI : MonoBehaviour
 
     // Light grab state
     private GameObject _grabbedLight;
-    private float _grabDistance;
+    private ARIAInteractable _grabbedObject;
+    private Vector3 _grabOffset; // offset from controller to object at grab time
 
-    private void GrabNearestLight()
+    /// <summary>Right grip held: grab nearest light OR spawned object, move with controller.</summary>
+    private void GrabNearest()
     {
-        if (_grabbedLight != null)
+        // Already holding something — move it with controller
+        if (_grabbedLight != null || _grabbedObject != null)
         {
-            // Already grabbing — move light to right controller position
-            Vector3 controllerPos = OVRInput.GetLocalControllerPosition(OVRInput.Controller.RTouch);
-            Quaternion controllerRot = OVRInput.GetLocalControllerRotation(OVRInput.Controller.RTouch);
-            Camera cam = Camera.main;
-            if (cam != null)
-            {
-                Transform trackingSpace = cam.transform.parent;
-                if (trackingSpace != null)
-                    controllerPos = trackingSpace.TransformPoint(controllerPos);
-            }
-            _grabbedLight.transform.position = controllerPos + (controllerRot * Vector3.forward) * 0.1f;
+            Vector3 controllerPos = GetRightControllerWorldPos();
+            Quaternion controllerRot = GetRightControllerWorldRot();
+            Vector3 targetPos = controllerPos + (controllerRot * Vector3.forward) * 0.15f;
 
-            // While grabbing during PTRL, show the sphere so user can see where they're placing it
-            if (_orchestrator.IsPTRLActive)
+            if (_grabbedLight != null)
             {
-                foreach (var r in _grabbedLight.GetComponentsInChildren<Renderer>())
-                    r.enabled = true;
+                _grabbedLight.transform.position = targetPos;
+                if (_orchestrator.IsPTRLActive)
+                    foreach (var r in _grabbedLight.GetComponentsInChildren<Renderer>())
+                        r.enabled = true;
+            }
+            else if (_grabbedObject != null)
+            {
+                _grabbedObject.transform.position = targetPos + _grabOffset;
             }
             return;
         }
 
-        // Find nearest manual light to right controller
-        Vector3 rPos = OVRInput.GetLocalControllerPosition(OVRInput.Controller.RTouch);
-        Camera c = Camera.main;
-        if (c != null)
-        {
-            Transform ts = c.transform.parent;
-            if (ts != null) rPos = ts.TransformPoint(rPos);
-        }
+        // Nothing grabbed yet — find nearest grabbable thing
+        Vector3 rPos = GetRightControllerWorldPos();
+        float nearestDist = 0.6f; // grab radius
+        GameObject nearestLight = null;
+        ARIAInteractable nearestObj = null;
 
-        float nearest = 0.5f; // grab radius (wider when PTRL on since spheres are invisible)
+        // Check lights
         foreach (var go in FindObjectsByType<Light>(FindObjectsSortMode.None))
         {
             if (go.name.StartsWith("ARIA_ManualLight"))
             {
                 float dist = Vector3.Distance(go.transform.position, rPos);
-                if (dist < nearest)
+                if (dist < nearestDist)
                 {
-                    nearest = dist;
-                    _grabbedLight = go.gameObject;
+                    nearestDist = dist;
+                    nearestLight = go.gameObject;
+                    nearestObj = null;
                 }
             }
         }
 
-        if (_grabbedLight != null)
-            SetStatus($"Grabbed light — move to reposition, shadows update live");
+        // Check spawned objects (closer ones win)
+        foreach (var interactable in FindObjectsByType<ARIAInteractable>(FindObjectsSortMode.None))
+        {
+            float dist = Vector3.Distance(interactable.transform.position, rPos);
+            if (dist < nearestDist)
+            {
+                nearestDist = dist;
+                nearestObj = interactable;
+                nearestLight = null;
+            }
+        }
+
+        if (nearestLight != null)
+        {
+            _grabbedLight = nearestLight;
+            SetStatus("Grabbed light — move to reposition");
+        }
+        else if (nearestObj != null)
+        {
+            _grabbedObject = nearestObj;
+            _grabOffset = nearestObj.transform.position - rPos; // preserve offset so object doesn't jump
+            nearestObj.StartGrab();
+            SetStatus($"Grabbed {nearestObj.gameObject.name}");
+        }
     }
 
-    private void ReleaseLight()
+    /// <summary>Right grip released: drop whatever we're holding.</summary>
+    private void ReleaseGrabbed()
     {
         if (_grabbedLight != null)
         {
-            // Hide sphere again if PTRL is active
             if (_orchestrator.IsPTRLActive)
-            {
                 foreach (var r in _grabbedLight.GetComponentsInChildren<Renderer>())
                     r.enabled = false;
-            }
 
             SetStatus($"Light dropped at {_grabbedLight.transform.position:F1}");
             Debug.Log($"[ARIA] Light released at {_grabbedLight.transform.position}");
             _grabbedLight = null;
         }
+
+        if (_grabbedObject != null)
+        {
+            SetStatus($"Dropped {_grabbedObject.gameObject.name}");
+            _grabbedObject.EndGrab(); // triggers gravity or wall snap
+            _grabbedObject = null;
+        }
+    }
+
+    private Vector3 GetRightControllerWorldPos()
+    {
+        Vector3 pos = OVRInput.GetLocalControllerPosition(OVRInput.Controller.RTouch);
+        Camera cam = Camera.main;
+        if (cam != null)
+        {
+            Transform ts = cam.transform.parent;
+            if (ts != null) pos = ts.TransformPoint(pos);
+        }
+        return pos;
+    }
+
+    private Quaternion GetRightControllerWorldRot()
+    {
+        Quaternion rot = OVRInput.GetLocalControllerRotation(OVRInput.Controller.RTouch);
+        Camera cam = Camera.main;
+        if (cam != null)
+        {
+            Transform ts = cam.transform.parent;
+            if (ts != null) rot = ts.rotation * rot;
+        }
+        return rot;
     }
 
     private int _selectedIndex = -1;

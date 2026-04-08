@@ -556,6 +556,7 @@ public class SemanticPlacementEngine : MonoBehaviour
 
     private float GetFloorHeight(MRUKRoom room)
     {
+        if (room == null) return 0f;
         var floorAnchor = room.Anchors.FirstOrDefault(
             a => a.HasAnyLabel(MRUKAnchor.SceneLabels.FLOOR));
         return floorAnchor != null ? floorAnchor.transform.position.y : 0f;
@@ -749,15 +750,22 @@ public class SemanticPlacementEngine : MonoBehaviour
             shrinkRatio = Mathf.Max(shrinkRatio, 0.1f); // never below 10%
             obj.transform.localScale *= shrinkRatio;
 
-            // Re-snap Y to surface after scaling
+            // Re-snap Y to surface after scaling so object doesn't float
+            Bounds nb = GetObjectBounds(obj);
+            float bottomOffset = obj.transform.position.y - nb.min.y;
             if (surfaceAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.TABLE) ||
                 surfaceAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.COUCH))
             {
-                Bounds nb = GetObjectBounds(obj);
                 float surfaceY = surfaceAnchor.transform.position.y;
-                float bottomOffset = obj.transform.position.y - nb.min.y;
                 obj.transform.position = new Vector3(
                     obj.transform.position.x, surfaceY + bottomOffset, obj.transform.position.z);
+            }
+            else if (surfaceAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.FLOOR))
+            {
+                // Floor: snap bottom to floor height
+                float floorY = GetFloorHeight(MRUK.Instance?.GetCurrentRoom());
+                obj.transform.position = new Vector3(
+                    obj.transform.position.x, floorY + bottomOffset, obj.transform.position.z);
             }
 
             Debug.Log($"[SemanticPlacement] FitToSurface: shrunk \"{obj.name}\" by {shrinkRatio:F2}x for {surfaceAnchor.name}");

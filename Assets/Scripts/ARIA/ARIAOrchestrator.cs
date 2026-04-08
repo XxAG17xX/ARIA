@@ -692,17 +692,24 @@ public class ARIAOrchestrator : MonoBehaviour
                          "CONTEXTUAL REASONING:\n" +
                          "- STYLE: Match the room's aesthetic from the image.\n" +
                          "- COLOR/MATERIAL: Complement existing room colors. Don't clash.\n" +
-                         "- DIMENSIONS: Size proportionally to the room and target surface.\n" +
                          "- PLACEMENT: Consider existing objects to avoid overlap.\n\n" +
+                         "SIZING RULES (critical):\n" +
+                         "- ALWAYS check the target surface's size_metres in the room JSON before deciding dimensions.\n" +
+                         "- The object must FIT on its target surface. If a wall is 2.5m wide, a painting should be ≤1.0m wide.\n" +
+                         "- If a table is 0.8m × 0.6m, a vase on it should be ≤0.15m wide, not 0.5m.\n" +
+                         "- For FLOOR objects: use real-world furniture size but check the room has space. A bed in a 3m×3m room should be ~1.9m, not 2.5m.\n" +
+                         "- For WALL objects: painting/art should be proportional to the wall — roughly 30-50% of wall width, never more than 70%.\n" +
+                         "- For TABLE objects: must fit on the table surface with room to spare.\n" +
+                         "- Return the NATURAL real-world dimensions — the system will auto-shrink if still too big.\n\n" +
                          "PROMPT FIELD: Detailed image-generation description (style, color, material, proportions).\n\n" +
                          "Return a JSON array. Each element:\n" +
                          "- prompt (string — detailed description for image generation)\n" +
                          "- surface_label (string: FLOOR/WALL_FACE/CEILING/TABLE — the surface TYPE)\n" +
                          "- anchor_id (string — specific anchor ID like 'WALL_2' or 'TABLE_0', from room JSON)\n" +
                          "- near_anchor_id (string, optional — place near this anchor, e.g. 'on the floor near the door' → anchor_id='FLOOR_0', near_anchor_id='DOOR_0')\n" +
-                         "- height_metres (float — real-world height)\n" +
-                         "- width_metres (float — real-world width)\n" +
-                         "- depth_metres (float — real-world depth)\n" +
+                         "- height_metres (float — real-world height, must fit the target surface)\n" +
+                         "- width_metres (float — real-world width, must fit the target surface)\n" +
+                         "- depth_metres (float — real-world depth, must fit the target surface)\n" +
                          "- category (string — object type, lowercase)\n" +
                          "- emits_light (bool)\n" +
                          "- light_type (string: 'point'/'spot', only if emits_light)\n" +
@@ -1896,7 +1903,7 @@ public class ARIAOrchestrator : MonoBehaviour
                 sceneDirectionalLight.intensity = 0.5f;
             }
 
-            // Point lights: color/illumination only, NO shadows
+            // Point lights: dim fill only, NO shadows — directional does the heavy lifting
             foreach (var lightGO in _manualLights)
             {
                 if (lightGO == null) continue;
@@ -1905,6 +1912,8 @@ public class ARIAOrchestrator : MonoBehaviour
                 {
                     light.enabled = true;
                     light.shadows = LightShadows.None;
+                    light.intensity = Mathf.Min(light.intensity, 1.0f); // cap to ambient fill level
+                    light.range = 4f; // short range so it doesn't dominate
                 }
             }
         }
@@ -2428,36 +2437,7 @@ public class ARIAOrchestrator : MonoBehaviour
             ls.y > 0.0001f ? bounds.size.y / ls.y : bounds.size.y,
             ls.z > 0.0001f ? bounds.size.z / ls.z : bounds.size.z);
 
-        // Hand grab — requires Interaction SDK Building Block in scene (OVRInteractionComprehensive)
-        try
-        {
-            var grabbableType = System.Type.GetType("Oculus.Interaction.Grabbable, Oculus.Interaction.Runtime");
-            var handGrabType = System.Type.GetType("Oculus.Interaction.HandGrab.HandGrabInteractable, Oculus.Interaction.Runtime");
-
-            if (grabbableType != null)
-            {
-                var grabbable = root.AddComponent(grabbableType);
-
-                // Configure Grabbable for throw-on-release (so isKinematic toggles on release)
-                var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
-                var throwField = grabbableType.GetField("_throwWhenUnselected", flags);
-                var forceField = grabbableType.GetField("_forceKinematicDisabled", flags);
-
-                throwField?.SetValue(grabbable, true);
-                forceField?.SetValue(grabbable, true);
-            }
-
-            if (handGrabType != null)
-                root.AddComponent(handGrabType);
-
-            Debug.Log($"[ARIA] Hand grab enabled on {root.name} ({surfCat})");
-        }
-        catch (System.Exception e)
-        {
-            Debug.LogWarning($"[ARIA] Hand grab setup skipped: {e.Message}");
-        }
-
-        // ARIAInteractable — handles post-release behavior (gravity drop / wall snap)
+        // ARIAInteractable — handles grab (right grip via ARIADebugUI) + post-release behavior
         var interactable = root.AddComponent<ARIAInteractable>();
         interactable.category = surfCat;
         interactable.objectCategory = category ?? root.name;
