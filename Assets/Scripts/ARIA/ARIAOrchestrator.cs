@@ -54,7 +54,7 @@ public class ARIAOrchestrator : MonoBehaviour
     [Tooltip("Which API to use for 3D mesh generation. Switch to save credits.")]
     [SerializeField] private MeshProvider meshProvider = MeshProvider.Tripo3D;
 
-    // API keys — hardcoded for development, removed before git push
+    // API keys — set locally, stripped for git push
     private string _claudeKey  = "";
     private string _geminiKey  = "";
     private string _hitemAccessKey = "";
@@ -426,9 +426,24 @@ public class ARIAOrchestrator : MonoBehaviour
 
         var tempObjects = new List<GameObject>();
 
+        // Hide EffectMesh wireframe during capture — blue wireframe confuses Claude
+        // Anchor labels provide spatial info instead
+        var effectMesh = FindFirstObjectByType<Meta.XR.MRUtilityKit.EffectMesh>();
+        bool wasWireframeVisible = false;
+        if (effectMesh != null)
+        {
+            wasWireframeVisible = !effectMesh.HideMesh;
+            if (wasWireframeVisible)
+            {
+                foreach (Transform child in effectMesh.transform)
+                    child.gameObject.SetActive(false);
+                effectMesh.HideMesh = true;
+            }
+        }
+
         try
         {
-            // Create labels at each registered anchor position
+            // Create small labels at anchors that are visible to the camera
             foreach (var kvp in _anchorRegistry)
             {
                 string id = kvp.Key;
@@ -436,18 +451,25 @@ public class ARIAOrchestrator : MonoBehaviour
                 if (anchor == null) continue;
 
                 Vector3 labelPos = anchor.transform.position;
-                // Offset label slightly toward camera so it doesn't clip into the surface
-                Vector3 toCamera = (cam.transform.position - labelPos).normalized;
+                // Skip anchors behind the camera
+                Vector3 toAnchor = labelPos - cam.transform.position;
+                if (Vector3.Dot(toAnchor, cam.transform.forward) < 0) continue;
+
+                // Scale label size by distance so they're readable but not huge
+                float dist = toAnchor.magnitude;
+                float charSize = Mathf.Clamp(dist * 0.012f, 0.015f, 0.04f);
+
+                Vector3 toCamera = -toAnchor.normalized;
                 labelPos += toCamera * 0.05f;
 
                 // Background shadow text (black, slightly behind)
                 var shadowGO = CreateTextMesh($"Label_Shadow_{id}", id,
-                    labelPos - toCamera * 0.002f, cam, Color.black, 0.06f);
+                    labelPos - toCamera * 0.002f, cam, Color.black, charSize);
                 tempObjects.Add(shadowGO);
 
                 // Foreground label text (yellow)
                 var labelGO = CreateTextMesh($"Label_{id}", id,
-                    labelPos, cam, Color.yellow, 0.06f);
+                    labelPos, cam, Color.yellow, charSize);
                 tempObjects.Add(labelGO);
             }
 
@@ -479,6 +501,14 @@ public class ARIAOrchestrator : MonoBehaviour
             // Always clean up temp objects
             foreach (var go in tempObjects)
                 if (go != null) Destroy(go);
+
+            // Restore wireframe if it was visible before capture
+            if (wasWireframeVisible && effectMesh != null)
+            {
+                foreach (Transform child in effectMesh.transform)
+                    child.gameObject.SetActive(true);
+                effectMesh.HideMesh = false;
+            }
         }
     }
 
@@ -495,7 +525,7 @@ public class ARIAOrchestrator : MonoBehaviour
         var tm = go.AddComponent<TextMesh>();
         tm.text = text;
         tm.characterSize = charSize;
-        tm.fontSize = 64;
+        tm.fontSize = 36;
         tm.anchor = TextAnchor.MiddleCenter;
         tm.alignment = TextAlignment.Center;
         tm.color = color;
@@ -836,45 +866,43 @@ public class ARIAOrchestrator : MonoBehaviour
                    "=== YOUR TASK ===\n" +
                    "You are the spatial reasoning AI for ARIA, a mixed reality interior design system on Meta Quest 3.\n" +
                    "The user is wearing a VR headset with passthrough (they see the real room). They spawned a virtual object " +
-                   "and now want you to decide the BEST placement and scale based on what you see.\n\n" +
+                   "and now want you to ADJUST it based on their voice command.\n\n" +
+                   "*** PRIORITY RULE — WORDS OVERRIDE GAZE ***\n" +
+                   "The user's VOICE COMMAND is the PRIMARY instruction. Follow it literally.\n" +
+                   "- 'move up 20cm' → position_offset [0, 0.2, 0]. Do NOT move to where the red dot is.\n" +
+                   "- 'make it bigger' → increase scale_factor. Do NOT relocate the object.\n" +
+                   "- 'put it on that wall' → use the red dot to resolve WHICH wall, then anchor_id.\n" +
+                   "- 'move it left' → position_offset [-0.3, 0, 0]. Do NOT re-place on a different surface.\n" +
+                   "The red gaze dot is ONLY used to resolve deictic words: 'that', 'this', 'there', 'here'.\n" +
+                   "If the user gives a specific direction/distance, USE EXACTLY THAT — ignore gaze position.\n\n" +
                    "HOW TO USE THE IMAGE:\n" +
-                   "- This is an ANNOTATED view: real room + virtual objects + yellow anchor labels (WALL_0, TABLE_0 etc.) + red gaze dot\n" +
-                   "- You CAN see virtual objects already spawned in the scene — use this to avoid overlap\n" +
-                   "- The RED DOT marks where the user is looking (their gaze target)\n" +
-                   "- YELLOW LABELS show anchor IDs matching the room JSON data\n" +
-                   "- Look at what SURFACE is near the red dot: is it a table/desk surface? A wall? The floor?\n" +
-                   "- Look at OBJECTS on that surface: keyboard, mouse, phone, bottles, cables — the virtual object must NOT overlap these\n" +
-                   "- Look at CLEAR AREAS near the gaze center where the virtual object could fit\n" +
-                   "- If the user is looking at a small area (e.g., corner of a desk), the object must be scaled DOWN to fit\n\n" +
+                   "- ANNOTATED view: real room + virtual objects + yellow anchor labels (WALL_0, TABLE_0 etc.) + red gaze dot\n" +
+                   "- You CAN see virtual objects already spawned — use this to avoid overlap\n" +
+                   "- RED DOT = user's gaze. Only relevant for 'that/this/there' resolution, NOT for movement commands\n" +
+                   "- YELLOW LABELS = anchor IDs matching room JSON data\n\n" +
                    "HOW TO USE MRUK DATA:\n" +
-                   "- The room scan gives you exact dimensions of walls, floor, ceiling, furniture in metres\n" +
-                   "- Use these to determine maximum possible size (object can't be bigger than the room)\n" +
+                   "- Room scan gives exact dimensions of walls, floor, ceiling, furniture in metres\n" +
                    "- surface_label tells the placement engine WHICH real surface to attach the object to\n" +
-                   "- Cross-reference the image (what you SEE) with the MRUK data (exact measurements)\n\n" +
+                   "- Only change surface_label if the user explicitly asks to move to a different surface\n\n" +
                    "RULES:\n" +
                    "1. surface_label: FLOOR / WALL_FACE / TABLE / BED / COUCH / CEILING\n" +
-                   "   - Judge from the IMAGE what surface the user is looking at\n" +
-                   "   - TABLE = desk, table, any horizontal elevated surface with objects on it\n" +
-                   "   - FLOOR = ground/floor visible in the image\n" +
-                   "   - WALL_FACE = vertical wall surface\n\n" +
-                   "2. scale_factor: A SINGLE float (0.02 to 2.0) for UNIFORM proportional resize\n" +
-                   "   - 1.0 = current size (real-world furniture scale)\n" +
-                   "   - 0.1 = miniature/figurine (10% of real size, good for placing on desks)\n" +
-                   "   - 0.05 = tiny decorative item\n" +
-                   "   - NEVER change height/width/depth independently — ONLY scale_factor\n" +
-                   "   - If surface is TABLE: scale_factor should be 0.05–0.2 (miniature to fit on desk)\n" +
-                   "   - If surface is FLOOR: scale_factor 0.5–1.0 (real furniture size, fit the room)\n" +
-                   "   - If surface is WALL_FACE: scale_factor 0.3–0.8 (painting/art size)\n\n" +
-                   "3. AVOID OVERLAP with real objects visible in the image\n" +
-                   "   - Don't place on top of keyboards, mice, phones, shoes, bags, bottles\n" +
-                   "   - Find the nearest CLEAR area to the gaze center\n\n" +
-                   "ANCHOR-AWARE PLACEMENT:\n" +
-                   "- Use the anchor IDs from the room JSON and image labels to specify WHICH surface\n" +
-                   "- Return anchor_id (e.g. 'WALL_2', 'TABLE_0') for precise placement\n" +
-                   "- 'that wall' / 'this side' → use the anchor nearest the red gaze dot\n\n" +
+                   "   - Keep the CURRENT surface unless user says to change it\n" +
+                   "   - TABLE = desk, table, any horizontal elevated surface\n\n" +
+                   "2. scale_factor: SINGLE float (0.02 to 2.0) for UNIFORM resize\n" +
+                   "   - 1.0 = keep current size. Only change if user asks for size change.\n\n" +
+                   "3. position_offset: [x, y, z] metres to MOVE the object from CURRENT position\n" +
+                   "   - x = right(+)/left(-), y = up(+)/down(-), z = forward(+)/backward(-)\n" +
+                   "   - 'move up 20cm' → [0, 0.2, 0]\n" +
+                   "   - 'slide left a bit' → [-0.2, 0, 0]\n" +
+                   "   - 'raise it higher' → [0, 0.3, 0]\n" +
+                   "   - If NOT moving, set [0, 0, 0]\n\n" +
+                   "4. anchor_id: Only set if user wants to RELOCATE to a specific surface\n" +
+                   "   - 'put it on that wall' → anchor_id = nearest wall anchor to red dot\n" +
+                   "   - 'move up 20cm' → keep current anchor_id or omit (NO relocation)\n\n" +
                    "Return JSON ONLY:\n" +
-                   "{\"surface_label\": \"TABLE\", \"anchor_id\": \"TABLE_0\", \"scale_factor\": 0.1, \"category\": \"lamp\", " +
-                   "\"reasoning\": \"User looking at desk corner near keyboard, scaling to miniature to fit clear area\"}"
+                   "{\"surface_label\": \"FLOOR\", \"anchor_id\": \"FLOOR_0\", \"scale_factor\": 1.0, " +
+                   "\"position_offset\": [0, 0.2, 0], \"category\": \"lamp\", " +
+                   "\"reasoning\": \"User asked to move up 20cm, keeping on floor, raising by offset\"}"
         });
 
         string body = JsonConvert.SerializeObject(new
@@ -882,13 +910,14 @@ public class ARIAOrchestrator : MonoBehaviour
             model = "claude-sonnet-4-6",
             max_tokens = 512,
             system = "You are the spatial reasoning AI for ARIA, a mixed reality furniture placement system on Meta Quest 3. " +
-                     "You receive: (1) an annotated image showing real room + virtual objects + anchor labels + gaze dot, " +
-                     "(2) MRUK room scan data with anchor IDs and dimensions, (3) user position and gaze direction. " +
-                     "Your job: decide surface_label, anchor_id, and scale_factor for a virtual object. " +
-                     "scale_factor is a SINGLE float for UNIFORM proportional scaling — NEVER change individual dimensions. " +
-                     "Use anchor IDs (WALL_0, TABLE_0, etc.) visible in the image and JSON to specify exact placement. " +
-                     "Analyze the image to see what's already spawned and avoid overlap. " +
-                     "Return valid JSON only, no explanation outside the JSON.",
+                     "CRITICAL: The user's VOICE COMMAND takes absolute priority over gaze direction. " +
+                     "If they say 'move up 20cm', apply position_offset [0,0.2,0] — do NOT relocate to the gaze dot. " +
+                     "Only use gaze to resolve 'that/this/there' references. " +
+                     "You receive: annotated image + MRUK data + user voice command. " +
+                     "Return JSON with surface_label, anchor_id, scale_factor, position_offset, category, reasoning. " +
+                     "position_offset [x,y,z] moves the object (x=right, y=up, z=forward). " +
+                     "Only change surface_label/anchor_id if user explicitly wants to RELOCATE. " +
+                     "Return valid JSON only.",
             messages = new[] { new { role = "user", content } }
         });
 
@@ -1635,7 +1664,7 @@ public class ARIAOrchestrator : MonoBehaviour
         // Send passthrough image with rich context
         var refined = await CallClaudeAdjustmentAsync(instr, jpeg, mrukJson, gazePos, gazeFwd);
 
-        // Claude returns scale_factor (uniform) + surface_label + anchor_id + reasoning
+        // Claude returns scale_factor + surface_label + anchor_id + position_offset + reasoning
         float scaleFactor = refined.scale_factor > 0.01f ? refined.scale_factor : 1f;
         string surface = refined.surface_label ?? "FLOOR";
         string reasoning = refined.reasoning ?? "";
@@ -1647,15 +1676,36 @@ public class ARIAOrchestrator : MonoBehaviour
             Debug.Log($"[ARIA] Claude scale: {scaleFactor:F2}x (uniform)");
         }
 
-        // Re-place on the specific anchor Claude decided
+        // Only re-place if Claude explicitly wants to RELOCATE (gave an anchor_id)
+        // If Claude just wants to move/scale, skip Place() to preserve current position
         MRUKAnchor targetAnchor = GetAnchorById(refined.anchor_id);
-        placementEngine?.Place(lastSpawn.gameObject, surface, targetAnchor);
-        ARIADebugUI.AppendClaudeLog($"ADJUST: {objName}\n  → {refined.anchor_id ?? surface}, scale {scaleFactor:F2}x\n  {reasoning}");
+        bool hasOffset = refined.position_offset != null && refined.position_offset.Length >= 3
+            && (Mathf.Abs(refined.position_offset[0]) > 0.001f ||
+                Mathf.Abs(refined.position_offset[1]) > 0.001f ||
+                Mathf.Abs(refined.position_offset[2]) > 0.001f);
 
+        if (targetAnchor != null)
+        {
+            // Claude wants to relocate to a specific anchor
+            placementEngine?.Place(lastSpawn.gameObject, surface, targetAnchor);
 
-        var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
-        if (fitRoom != null)
-            placementEngine?.FitToAvailableSpace(lastSpawn.gameObject, fitRoom);
+            var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
+            if (fitRoom != null)
+                placementEngine?.FitToAvailableSpace(lastSpawn.gameObject, fitRoom);
+        }
+        // else: no relocation — just apply offset/scale from current position
+
+        // Apply position offset AFTER fit — so Claude's "move up 20cm" actually sticks
+        if (hasOffset)
+        {
+            Vector3 offset = new Vector3(refined.position_offset[0], refined.position_offset[1], refined.position_offset[2]);
+            lastSpawn.position += offset;
+            Debug.Log($"[ARIA] Claude position offset: ({offset.x:F2}, {offset.y:F2}, {offset.z:F2})");
+        }
+
+        string offsetStr = refined.position_offset != null && refined.position_offset.Length >= 3
+            ? $", offset ({refined.position_offset[0]:F2},{refined.position_offset[1]:F2},{refined.position_offset[2]:F2})" : "";
+        ARIADebugUI.AppendClaudeLog($"ADJUST: {objName}\n  → {refined.anchor_id ?? surface}, scale {scaleFactor:F2}x{offsetStr}\n  {reasoning}");
 
 
         SetStatus($"Claude: {objName} → {surface}, scale {scaleFactor:F2}x. {reasoning}");
@@ -1691,7 +1741,7 @@ public class ARIAOrchestrator : MonoBehaviour
             ApplyShadowMode();
             // Update PTRL surface properties for the new mode
             float hlOpacity = _shadowMode == ShadowMode.PointLight ? 0.15f : 0f; // minimal wash, shadows still work
-            float shadowInt = _shadowMode == ShadowMode.PointLight ? 1f : 0.75f;
+            float shadowInt = _shadowMode == ShadowMode.PointLight ? 6f : 0.85f; // 6x for strong point light shadows
             bool wallsCastShadows = _shadowMode == ShadowMode.PointLight;
             foreach (var surface in _ptrlShadowSurfaces)
             {
@@ -1747,7 +1797,7 @@ public class ARIAOrchestrator : MonoBehaviour
 
             // Configure PTRL surface properties based on shadow mode
             float hlOpacity = _shadowMode == ShadowMode.PointLight ? 0.15f : 0f; // minimal wash, shadows still work
-            float shadowInt = _shadowMode == ShadowMode.PointLight ? 1f : 0.75f;
+            float shadowInt = _shadowMode == ShadowMode.PointLight ? 6f : 0.85f; // 6x for strong point light shadows
             bool wallsCastShadows = _shadowMode == ShadowMode.PointLight;
             foreach (var surface in _ptrlShadowSurfaces)
             {
@@ -1829,7 +1879,7 @@ public class ARIAOrchestrator : MonoBehaviour
     {
         if (_shadowMode == ShadowMode.Directional)
         {
-            // Directional light aimed from first sphere toward objects — sharp shadows, one direction
+            // Directional light aimed from first sphere toward objects — sharp shadows
             if (sceneDirectionalLight != null && _manualLights.Count > 0)
             {
                 Vector3 lightPos = _manualLights[0].transform.position;
@@ -1840,15 +1890,17 @@ public class ARIAOrchestrator : MonoBehaviour
                 if (dir.sqrMagnitude > 0.01f)
                     sceneDirectionalLight.transform.rotation = Quaternion.LookRotation(dir);
 
+                // Directional intensity: scale up from sampled light for strong shadows
+                float sampledIntensity = _manualLights[0].GetComponent<Light>()?.intensity ?? 2f;
                 sceneDirectionalLight.shadows = LightShadows.Soft;
-                sceneDirectionalLight.shadowStrength = 0.9f;
-                sceneDirectionalLight.intensity = 0.35f; // strong enough for visible shadows at distance
+                sceneDirectionalLight.shadowStrength = 0.95f;
+                sceneDirectionalLight.intensity = Mathf.Clamp(sampledIntensity * 0.7f, 0.8f, 2.0f);
                 sceneDirectionalLight.color = _manualLights[0].GetComponent<Light>()?.color ?? Color.white;
             }
             else if (sceneDirectionalLight != null)
             {
                 sceneDirectionalLight.shadows = LightShadows.None;
-                sceneDirectionalLight.intensity = 0.3f;
+                sceneDirectionalLight.intensity = 0.5f;
             }
 
             // Point lights: color/illumination only, NO shadows
@@ -1874,18 +1926,23 @@ public class ARIAOrchestrator : MonoBehaviour
                 sceneDirectionalLight.transform.rotation = Quaternion.Euler(90, 0, 0);
             }
 
-            // Each point light casts its own shadows (cubemap, diverging, per-object direction)
+            // Each point light casts its own shadows — aggressive intensity for visible shadows
             foreach (var lightGO in _manualLights)
             {
                 if (lightGO == null) continue;
                 var light = lightGO.GetComponent<Light>();
                 if (light != null)
                 {
+                    // Aggressive intensity boost — point lights need a LOT more power for visible shadows
+                    float height = lightGO.transform.position.y;
+                    float heightBoost = Mathf.Clamp(height * 4f, 3f, 15f);
+                    light.intensity = Mathf.Max(light.intensity, heightBoost);
+                    light.range = Mathf.Max(8f, height * 3f); // wide range for shadow coverage
                     light.enabled = true;
                     light.shadows = LightShadows.Soft;
                     light.shadowStrength = 1f;
-                    light.shadowBias = 0.05f;
-                    light.shadowNormalBias = 0.4f;
+                    light.shadowBias = 0.02f;
+                    light.shadowNormalBias = 0.3f;
                 }
             }
         }
@@ -2033,7 +2090,7 @@ public class ARIAOrchestrator : MonoBehaviour
         // Spawn 1m in front of user with default white light
         Vector3 lightPos = cam.transform.position + cam.transform.forward * 1f;
         Color lightColor = new Color(1f, 0.95f, 0.85f); // default warm white
-        float lightIntensity = 2f;
+        float lightIntensity = 5f; // strong enough for visible point light shadows
 
         var lightGO = new GameObject($"ARIA_ManualLight_{_manualLights.Count}");
         lightGO.transform.position = lightPos;
@@ -2042,11 +2099,11 @@ public class ARIAOrchestrator : MonoBehaviour
         light.type = LightType.Point;
         light.color = lightColor;
         light.intensity = lightIntensity;
-        light.range = 4f; // 4m — realistic room light reach, won't flood entire room
+        light.range = 6f; // 6m — enough reach for point light shadows
         light.shadows = LightShadows.Soft;
-        light.shadowStrength = 0.6f;
-        light.shadowBias = 0.05f;
-        light.shadowNormalBias = 0.4f;
+        light.shadowStrength = 1f;
+        light.shadowBias = 0.02f;
+        light.shadowNormalBias = 0.3f;
 
         // Visual indicator — small glowing sphere
         var indicator = GameObject.CreatePrimitive(PrimitiveType.Sphere);
@@ -2182,7 +2239,7 @@ public class ARIAOrchestrator : MonoBehaviour
 
         // Sample 4x4 grid for color (our SH-inspired contribution)
         Color lightColor = new Color(1f, 0.95f, 0.85f);
-        float lightIntensity = 2f;
+        float lightIntensity = 5f; // strong baseline for visible shadows
 
         if (jpeg != null && jpeg.Length > 1000)
         {
@@ -2207,7 +2264,7 @@ public class ARIAOrchestrator : MonoBehaviour
                 if (avgColor.grayscale > 0.05f)
                 {
                     lightColor = Color.Lerp(Color.white, avgColor, 0.7f);
-                    lightIntensity = Mathf.Clamp(maxBright * 3f, 1f, 4f);
+                    lightIntensity = Mathf.Clamp(maxBright * 5f, 3f, 10f);
                 }
 
                 // ── Edge sampling: ambient room color (fakes bounce light) ──
@@ -2287,7 +2344,7 @@ public class ARIAOrchestrator : MonoBehaviour
         light.intensity = instr.light_intensity;
         light.range     = instr.light_range;
         light.shadows   = LightShadows.Soft;
-        light.shadowStrength = 0.8f;
+        light.shadowStrength = 1f;
 
         if (instr.light_color != null && instr.light_color.Length == 3)
             light.color = new Color(instr.light_color[0], instr.light_color[1], instr.light_color[2]);
@@ -2483,6 +2540,7 @@ public class PlacementInstruction
     public string   surface_label;
     public string   anchor_id;       // specific anchor (e.g. "WALL_2"), null = generic placement
     public string   near_anchor_id;  // hint: place near this anchor (e.g. "DOOR_0" for "near the door")
+    public float[]  position_offset; // [x,y,z] metres offset for fine adjustment (move up/left/forward)
     public float    height_metres;
     public float    width_metres;
     public float    depth_metres;

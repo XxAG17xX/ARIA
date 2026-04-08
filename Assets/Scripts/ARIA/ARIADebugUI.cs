@@ -7,6 +7,7 @@
 // Editor: IMGUI text field + buttons (same as before).
 
 using System.Collections.Generic;
+using System.Linq;
 using UnityEngine;
 using UnityEngine.UI;
 using UnityEngine.EventSystems;
@@ -424,6 +425,11 @@ public class ARIADebugUI : MonoBehaviour
             () => ToggleEffectMesh());
         y -= 52f;
 
+        MakeButton(_mainPanel.transform, "BtnAnchors", "Toggle Anchors",
+            new Vector2(0, y), new Vector2(560, 44),
+            () => ToggleAnchorLabels());
+        y -= 52f;
+
         // Transcript
         _transcriptText = MakeLabel(_mainPanel.transform, "Transcript", "",
             new Vector2(0, y), new Vector2(560, 28), 16, FontStyle.Italic, Color.grey);
@@ -613,6 +619,16 @@ public class ARIADebugUI : MonoBehaviour
         else
         {
             if (_logCanvasGO != null) _logCanvasGO.SetActive(false);
+
+            // If adjustment is pending and user just closed UI, launch capture now
+            if (_adjustmentPending)
+            {
+                _adjustmentPending = false;
+                ShowCountdownPanel(false);
+                SetStatus("Capturing scene for Claude...");
+                ARIADebugUI.AppendClaudeLog("UI hidden — capturing annotated view for adjustment...");
+                _orchestrator.AdjustLastSpawnWithClaude();
+            }
         }
 
         if (_reticle != null) _reticle.SetActive(_menuVisible);
@@ -672,39 +688,43 @@ public class ARIADebugUI : MonoBehaviour
     {
         if (_voiceConnector != null && !_waitingForVoice)
         {
-            // Step 1: Record voice command with 5-second timeout
-            SetStatus("Speak now... (5s timeout, or press trigger to skip)");
+            // Step 1: Record voice — trigger finishes recording (doesn't skip)
+            SetStatus("Speak what to adjust... press trigger when done");
             _waitingForVoice = true;
             _voiceIsForNewCommand = false;
-            _voiceTimeout = Time.time + 5f;
+            _voiceTimeout = Time.time + 10f;
 
             if (_countdownPanel != null)
             {
                 _countdownNumText = RemakeLabel(_countdownNumText, "Speak");
-                _countdownCmdText = RemakeLabel(_countdownCmdText, "Say what to adjust, or press trigger to skip");
+                _countdownCmdText = RemakeLabel(_countdownCmdText, "Describe the change, press trigger when done");
                 ShowCountdownPanel(true);
             }
 
             _voiceConnector.RecordOneShot(transcript =>
             {
                 _waitingForVoice = false;
-                SetStatus($"Heard: \"{transcript}\" — now look at target...");
                 _orchestrator.SetUserContext(transcript);
 
                 if (_countdownCmdText != null)
-                    _countdownCmdText = RemakeLabel(_countdownCmdText, $"\"{transcript}\"");
+                    _countdownCmdText = RemakeLabel(_countdownCmdText, $"\"{transcript}\"\nClose UI (Y), then look at target");
+                SetStatus($"Heard: \"{transcript}\" — close UI, look at target, system will capture");
 
-                StartCountdownForAction("Claude adjustment",
-                    () => _orchestrator.AdjustLastSpawnWithClaude());
+                // Don't start countdown yet — wait for user to close UI
+                // The capture happens in LaunchAdjustmentAfterUIHidden
+                _adjustmentPending = true;
             });
         }
         else
         {
-            // No voice SDK or already waiting — skip voice, go straight to countdown
-            StartCountdownForAction("Claude adjustment",
-                () => _orchestrator.AdjustLastSpawnWithClaude());
+            // No voice SDK — proceed with visual context only
+            _orchestrator.SetUserContext("");
+            _adjustmentPending = true;
+            SetStatus("Close UI (Y), look at target — system will capture");
         }
     }
+
+    private bool _adjustmentPending;
 
     private void CheckVoiceTimeout()
     {
@@ -719,19 +739,20 @@ public class ARIADebugUI : MonoBehaviour
         {
             _waitingForVoice = false;
             _voiceConnector?.StopListening();
-            ShowCountdownPanel(false);
 
             if (_voiceIsForNewCommand)
             {
-                // Voice command timed out — can't proceed without a command
+                ShowCountdownPanel(false);
                 SetStatus("No voice detected — try again.");
             }
             else
             {
-                // Adjustment — proceed with visual context only
-                SetStatus("Voice skipped — adjusting with visual context only...");
-                StartCountdownForAction("Claude adjustment",
-                    () => _orchestrator.AdjustLastSpawnWithClaude());
+                // Adjustment: trigger = done talking, proceed to capture
+                // If no transcript came through callback, proceed with visual context only
+                if (_countdownCmdText != null)
+                    _countdownCmdText = RemakeLabel(_countdownCmdText, "Close UI (Y), look at target");
+                SetStatus("Close UI (Y), look at what to adjust — system will capture");
+                _adjustmentPending = true;
             }
         }
     }
@@ -928,6 +949,76 @@ public class ARIADebugUI : MonoBehaviour
         }
 
         SetStatus(_effectMeshHidden ? "Room wireframe OFF" : "Room wireframe ON");
+    }
+
+    private bool _anchorsVisible;
+    private readonly List<GameObject> _anchorLabelObjects = new();
+
+    private void ToggleAnchorLabels()
+    {
+        _anchorsVisible = !_anchorsVisible;
+
+        if (!_anchorsVisible)
+        {
+            foreach (var go in _anchorLabelObjects)
+                if (go != null) Destroy(go);
+            _anchorLabelObjects.Clear();
+            SetStatus("Anchor labels OFF");
+            return;
+        }
+
+        // Build anchor registry if not already populated
+        _orchestrator.GetType().GetMethod("SerializeMRUKData",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
+            ?.Invoke(_orchestrator, null);
+
+        var room = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
+        if (room == null) { SetStatus("No room data"); _anchorsVisible = false; return; }
+
+        Camera cam = Camera.main;
+        var counters = new Dictionary<string, int>();
+
+        foreach (var anchor in room.Anchors)
+        {
+            string rawLabel = anchor.Label.ToString();
+            string prefix = rawLabel switch
+            {
+                "WALL_FACE" => "WALL", "FLOOR" => "FLOOR", "CEILING" => "CEIL",
+                "TABLE" => "TABLE", "COUCH" => "COUCH", "DOOR_FRAME" => "DOOR",
+                "WINDOW_FRAME" => "WIN", _ => "OTHER"
+            };
+            counters.TryGetValue(prefix, out int idx);
+            string id = $"{prefix}_{idx}";
+            counters[prefix] = idx + 1;
+
+            Vector3 pos = anchor.transform.position;
+            float dist = cam != null ? Vector3.Distance(cam.transform.position, pos) : 2f;
+            float charSize = Mathf.Clamp(dist * 0.012f, 0.015f, 0.04f);
+
+            // Shadow
+            var shadow = new GameObject($"AnchorLabel_Shadow_{id}");
+            shadow.transform.position = pos + (cam != null ? (cam.transform.position - pos).normalized * 0.048f : Vector3.forward * 0.048f);
+            var tmS = shadow.AddComponent<TextMesh>();
+            tmS.text = id; tmS.characterSize = charSize; tmS.fontSize = 36;
+            tmS.anchor = TextAnchor.MiddleCenter; tmS.color = Color.black;
+            tmS.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            shadow.GetComponent<MeshRenderer>().material = tmS.font.material;
+            shadow.AddComponent<BillboardFaceCamera>();
+            _anchorLabelObjects.Add(shadow);
+
+            // Label
+            var label = new GameObject($"AnchorLabel_{id}");
+            label.transform.position = pos + (cam != null ? (cam.transform.position - pos).normalized * 0.05f : Vector3.forward * 0.05f);
+            var tm = label.AddComponent<TextMesh>();
+            tm.text = id; tm.characterSize = charSize; tm.fontSize = 36;
+            tm.anchor = TextAnchor.MiddleCenter; tm.color = Color.yellow;
+            tm.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+            label.GetComponent<MeshRenderer>().material = tm.font.material;
+            label.AddComponent<BillboardFaceCamera>();
+            _anchorLabelObjects.Add(label);
+        }
+
+        SetStatus($"Anchors ON — {counters.Values.Sum()} labels");
     }
 
     private void ShowCountdownPanel(bool show)

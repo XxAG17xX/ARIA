@@ -611,6 +611,7 @@ public class SemanticPlacementEngine : MonoBehaviour
     /// Measures available clearance around the object using MRUK room data
     /// and shrinks the object if it clips walls, ceiling, or furniture.
     /// Called AFTER Place() so the object is already positioned.
+    /// Only adjusts Y for floor-level objects — wall/table/ceiling placements keep their Y.
     /// </summary>
     public void FitToAvailableSpace(GameObject obj, MRUKRoom room)
     {
@@ -618,7 +619,6 @@ public class SemanticPlacementEngine : MonoBehaviour
 
         Bounds b = GetObjectBounds(obj);
         Vector3 objPos = obj.transform.position;
-        float currentScale = obj.transform.localScale.x; // assume uniform
 
         // Measure clearance in each direction from object center
         float clearX = MeasureClearance(room, objPos, Vector3.right, b.extents.x * 2f);
@@ -630,6 +630,10 @@ public class SemanticPlacementEngine : MonoBehaviour
             a => a.HasAnyLabel(MRUKAnchor.SceneLabels.CEILING));
         float ceilingY = ceilAnchor != null ? ceilAnchor.transform.position.y : 2.8f;
         float clearY = ceilingY - floorY;
+
+        // Determine if object is near floor level (within 0.3m above floor surface)
+        // Wall, table, and ceiling placements should NOT have their Y reset
+        bool isOnFloor = (objPos.y - floorY) < (b.extents.y + 0.3f);
 
         // Object dimensions in world space
         float objW = b.size.x;
@@ -648,23 +652,19 @@ public class SemanticPlacementEngine : MonoBehaviour
             shrinkFactor = Mathf.Max(shrinkFactor, 0.1f); // never shrink below 10%
             obj.transform.localScale *= shrinkFactor;
 
-            // Re-place on floor after shrinking (recalculate Y)
-            Bounds newBounds = GetObjectBounds(obj);
-            Vector3 pos = obj.transform.position;
-            pos.y = floorY + newBounds.extents.y;
-            obj.transform.position = pos;
+            // Only re-snap Y to floor if object was actually on the floor
+            if (isOnFloor)
+            {
+                Bounds newBounds = GetObjectBounds(obj);
+                Vector3 pos = obj.transform.position;
+                pos.y = floorY + newBounds.extents.y;
+                obj.transform.position = pos;
+            }
 
             Debug.Log($"[SemanticPlacement] FitToSpace: shrunk \"{obj.name}\" by {shrinkFactor:F2}x " +
-                      $"(clearance: X={clearX:F2}m Z={clearZ:F2}m Y={clearY:F2}m)");
+                      $"(clearance: X={clearX:F2}m Z={clearZ:F2}m Y={clearY:F2}m, onFloor={isOnFloor})");
         }
-        else
-        {
-            // Just fix Y position (bottom on floor)
-            Bounds newBounds = GetObjectBounds(obj);
-            Vector3 pos = obj.transform.position;
-            pos.y = floorY + newBounds.extents.y;
-            obj.transform.position = pos;
-        }
+        // If no shrinking needed, do NOT touch Y — preserve wall/table/ceiling positioning
     }
 
     /// <summary>Measures clearance from position in a direction using physics + MRUK.</summary>
