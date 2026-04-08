@@ -1,6 +1,6 @@
 # ARIA — Adaptive Reality and Intelligent Authoring
 
-> AI-driven spatial interior design with perceptual lighting in Mixed Reality
+> Voice-driven generative interior design with spatial AI reasoning in Mixed Reality
 
 **Author:** Kartik Gupta (guptak1@tcd.ie) | **Platform:** Meta Quest 3 | **Unity 6000.3.8f1 LTS, URP**
 
@@ -8,82 +8,98 @@
 
 ## What Is ARIA?
 
-ARIA places AI-generated 3D furniture in your real room through Mixed Reality. Speak a command, and ARIA uses multimodal AI to understand your room's layout, style, and lighting — then generates, places, scales, and lights virtual objects so they blend naturally with the real environment.
+ARIA generates and places 3D furniture in your real room through Mixed Reality on Meta Quest 3. Speak a natural command — "put a red lamp near the door" — and ARIA uses multimodal AI to understand your room, generate a contextually appropriate 3D object, place it on the correct real-world surface at the right scale, and light it to match your environment. You can then physically grab objects, move them between surfaces, and they auto-resize to fit.
 
-Two modes:
-- **Full pipeline:** Voice command -> Claude spatial reasoning -> Gemini image -> Tripo3D mesh -> contextual placement + lighting
-- **Demo mode:** Pre-generated 3D models placed instantly using room scan data, with optional Claude-powered refinement via passthrough image analysis
+**Full pipeline:** Voice → Claude spatial reasoning (sees annotated passthrough + room scan) → Gemini image → Tripo3D mesh → anchor-aware placement + canonical scaling + PTRL lighting
+
+**Demo mode:** Pre-bundled 3D models placed instantly via room scan data — zero API credits
 
 ---
 
 ## Pipeline Architecture
 
 ```
-Voice command (Wit.ai STT)
-  |
+Voice command (Meta Voice SDK / Wit.ai)
+  │
+  v
+Annotated Room Capture
+  - Passthrough camera frame + yellow anchor labels (WALL_0, TABLE_1...)
+  - Red gaze crosshair at raycast hit point
+  - Virtual objects visible, wireframe hidden
+  - MRUK room JSON with indexed anchor IDs + dimensions + viewport coords
+  │
   v
 Claude API (multimodal spatial reasoning)
-  - Receives: passthrough camera image + MRUK room scan data + voice transcript
-  - Decides: what objects, what style/color/material, what dimensions
-  - Outputs: PlacementInstructions (surface, scale, category, light properties)
-  |
+  - Receives: annotated image + room JSON + voice transcript + user position/gaze
+  - Resolves deictic references: "that wall" → WALL_2 (nearest to gaze dot)
+  - Decides: object style, dimensions, surface_label, anchor_id, near_anchor_id
+  - Voice commands override gaze (explicit prompt priority rule)
+  │
   v
 Gemini (reference image generation)
-  |
+  │
   v
-Claude refinement (optional — compares reference image to room context)
-  |
+Claude refinement (optional — compares reference image to room context, adjusts dimensions)
+  │
   v
-Tripo3D / HiTEM3D (textured 3D GLB mesh generation)
-  |
+Tripo3D (textured 3D GLB mesh generation)
+  │
   v
-Runtime placement + lighting:
-  - EnvironmentRaycastManager  -> depth-based surface placement (Meta SDK)
-  - SemanticPlacementEngine    -> MRUK anchor-aware placement for pipeline objects
-  - ScaleInferenceSystem       -> proportional scaling from Claude dimensions
-  - Multi-light detection      -> passthrough brightness analysis, ceiling projection
-  - PTRL HighlightsAndShadows  -> shadows + highlights on real room surfaces (Meta SDK)
-  - Claude post-spawn adjustment -> voice + passthrough refinement of position/scale
+Runtime Systems:
+  - ScaleInferenceSystem       → uniform scaling from Claude dimensions, canonical cap
+  - SemanticPlacementEngine    → anchor-aware MRUK placement, collision-aware spiral
+  - FitToAvailableSpace        → room-level shrink (walls, ceiling), surface-aware Y
+  - FitToSurface               → surface-specific proportional resize + canonical max
+  - ARIAInteractable           → gravity drop (floor items) / wall magnet snap (wall items)
+  - PTRL HighlightsAndShadows  → shadows on real surfaces (directional + point light modes)
+  - Claude post-spawn adjustment → voice + annotated capture refinement
 ```
 
 ---
 
 ## Key Features
 
-### Placement
-- **EnvironmentRaycastManager** (Meta Depth API) for accurate surface detection — objects land on floors, walls, tables at the exact gaze point
-- **MRUK-aware collision avoidance** — objects fit within room boundaries, don't overlap furniture
-- **Gaze-directed** — look at where you want the object, 3-2-1 countdown, it appears there
+### Anchor-Aware Spatial Placement
+- **Deictic reference resolution** — "put a painting on THAT wall" → Claude sees gaze dot near WALL_2 label, returns `anchor_id: "WALL_2"`
+- **MRUK collision-aware placement** — golden-angle spiral search avoids real furniture + virtual objects
+- **Surface-specific placement** — floor (gaze raycast), wall (plane intersection + PlaneRect clamping), table/couch (volume top surface)
+- **Proximity hints** — "near the door" → `near_anchor_id: "DOOR_0"` nudges position toward that anchor
+- **Gaze-directed** — 3-2-1 countdown, object appears where crosshair points
 
-### Lighting (Primary Research Contribution)
-- **Multi-light source detection** from passthrough camera: 16x16 brightness grid -> greedy clustering -> projected to 3D ceiling positions via MRUK height data
-- **SH ambient probe** (Ramamoorthi & Hanrahan 2001) computed from passthrough frame for fill light
-- **PTRL HighlightsAndShadows shader** (Meta SDK) renders shadows and highlights on real room surfaces from detected virtual lights
-- **Per-object directional light** from nearest detected ceiling light for correct shadow direction
-- **ARIA vs Default toggle** for before/after comparison
+### Smart Scaling & Canonical Dimensions
+- **Uniform proportional scaling** — height-based, never squashes/stretches objects
+- **35+ category canonical dictionary** — real-world dimensions (bed: 1.4×0.5×2.0m, lamp: 0.3×1.5×0.3m)
+- **Surface-aware fit** — objects shrink proportionally to fit tables, couches, beds, or any volume surface
+- **Never grow beyond real-world size** — a bed can shrink to fit a table, but never expands beyond bed-sized
 
-### AI Integration
-- **Claude multimodal reasoning** — sees your room (passthrough + MRUK) and decides contextually appropriate placement
-- **Voice-assisted adjustment** — speak what you want ("move this to the table, make it smaller"), Claude adjusts with visual + spatial context
-- **All spawned objects listed** in Claude context so it reasons about the full scene, not just one object
+### Physical Interaction
+- **Grab with right grip** — hold to move objects with controller, release to drop
+- **Floor items** (bed, lamp, chair) — fall with gravity, land on surfaces, auto-resize + upright correction
+- **Wall items** (painting, clock, mirror) — magnet-snap to nearest wall within 15cm, or fall if too far
+- **Right thumbstick** — rotate grabbed objects (X=turn, Y=tilt)
+- **Left thumbstick** — scale grabbed objects (forward=bigger, backward=smaller)
+- **A button** — reset rotation to upright while holding
+- **Surface detection** — DetectSurfaceBelow checks all volume anchors (TABLE, BED, COUCH, OTHER, STORAGE)
 
-### Quest 3 Features
+### Lighting (PTRL-based)
+- **Manual light sphere placement** — left grip spawns sphere, grab + position at real ceiling light, confirm → passthrough color sampling
+- **Dual shadow modes** — Directional (sharp parallel shadows) / Point Light (per-object cubemap shadows)
+- **PTRL shadow surfaces** — invisible floor, wall, and ceiling planes with Meta's HighlightsAndShadows shader
+- **Point light shadow boosting** — ShadowIntensity 6.0, intensity height×4, range height×3 for visible cubemap shadows
+- **Wireframe independent** — EffectMesh visibility and PTRL toggle are separate controls
+
+### Voice-Driven Adjustment
+- **Conversational refinement** — "make it bigger", "move it left", "put it on that wall"
+- **Words override gaze** — explicit prompt priority prevents relocation when user wants positional offset
+- **Annotated capture** — Claude sees virtual objects + anchor labels + gaze dot for spatial context
+- **Scale factor capped** — Claude's adjustments bounded by canonical real-world dimensions
+
+### Quest 3 Platform
 - VR Canvas UI with gaze pointer (Y to toggle, trigger to click)
-- Passthrough camera access for lighting estimation
-- MRUK room scan with EffectMesh visualization
-- Occlusion via EnvironmentDepthManager
-- Boundary suppression for MR passthrough
-
----
-
-## Original Engineering Contributions
-
-| Contribution | Description |
-|---|---|
-| **Multi-light detection** | Detects multiple real light source positions from passthrough camera analysis. Existing tools (PTRL, QuestCameraKit) only provide manual light placement or single-direction estimation. Our clustering algorithm finds distinct sources and projects them to 3D world positions. |
-| **Claude spatial reasoning pipeline** | Multimodal AI that sees the room (image + scan data + voice) and reasons about furniture style, scale, placement. No prior Quest 3 project combines LLM reasoning with MRUK spatial data for interior design. |
-| **Voice-driven adjustment** | Post-spawn refinement where user speaks intent ("put this on the table corner") and Claude re-evaluates with fresh passthrough capture. |
-| **End-to-end generation** | Voice -> AI reasoning -> image generation -> 3D mesh -> contextual placement -> perceptual lighting. Complete pipeline from natural language to placed, lit object. |
+- Passthrough camera for room capture + lighting estimation
+- MRUK room scan with EffectMesh wireframe visualization
+- Environment depth occlusion enabled at startup
+- One-shot voice recording (no ambient speech capture)
 
 ---
 
@@ -91,17 +107,17 @@ Runtime placement + lighting:
 
 | Component | Technology |
 |---|---|
-| Platform | Meta Quest 3, Unity 6 URP |
-| Room scanning | Meta MRUK + EffectMesh + EnvironmentRaycastManager |
-| Surface placement | EnvironmentRaycastManager (depth API) + SemanticPlacementEngine |
+| Platform | Meta Quest 3, Unity 6000.3.8f1 LTS, URP |
+| Room scanning | Meta MRUK + EffectMesh (DeviceWithPrefabFallback) |
+| Surface placement | SemanticPlacementEngine (MRUK anchors, collision-aware spiral) |
 | Shadow rendering | PTRL HighlightsAndShadows shader (Meta SDK) |
-| Light detection | Custom multi-light clustering from passthrough frames |
-| Spatial reasoning | Claude API (claude-sonnet-4-6, multimodal) |
+| Lighting | Manual light spheres + passthrough color sampling |
+| Spatial reasoning | Claude API (claude-sonnet-4-6, multimodal vision) |
 | Image generation | Gemini 2.5 Flash |
-| 3D generation | Tripo3D / HiTEM3D (switchable) |
+| 3D generation | Tripo3D (GLB mesh with textures) |
 | Runtime GLB loading | GLTFast 6.18 |
-| Voice input | Meta Voice SDK (Wit.ai) |
-| Ambient lighting | Spherical Harmonics L2 probe |
+| Voice input | Meta Voice SDK (Wit.ai, one-shot mode) |
+| Interaction | Controller grip grab + ARIAInteractable (gravity/wall snap) |
 
 ---
 
@@ -109,17 +125,17 @@ Runtime placement + lighting:
 
 ```
 Assets/Scripts/ARIA/
-  ARIAOrchestrator.cs              <- Pipeline controller, API calls, spawn logic
-  SemanticPlacementEngine.cs       <- MRUK surface placement (pipeline objects)
-  ScaleInferenceSystem.cs          <- Proportional real-world scaling
-  SphericalHarmonicsLightingEstimator.cs  <- Multi-light detection + SH probe
-  ShadowReceiverSetup.cs           <- PTRL shader on EffectMesh surfaces
-  ARIADebugUI.cs                   <- VR Canvas UI (gaze pointer, buttons)
-  VoiceSDKConnector.cs             <- Wit.ai bridge to orchestrator
+  ARIAOrchestrator.cs              <- Pipeline controller, API calls, PTRL, anchor registry
+  ARIADebugUI.cs                   <- VR Canvas UI, gaze pointer, controller grab, voice input
+  ARIAInteractable.cs              <- Post-grab behavior: gravity drop / wall magnet snap
+  SemanticPlacementEngine.cs       <- MRUK placement, FitToSurface, FindNearestWall, DetectSurfaceBelow
+  ScaleInferenceSystem.cs          <- Uniform scaling, canonical dimensions dictionary
+  VoiceSDKConnector.cs             <- Wit.ai bridge, one-shot recording mode
+  ShadowReceiverSetup.cs           <- PTRL material creation from HighlightsAndShadows shader
+  SphericalHarmonicsLightingEstimator.cs  <- Legacy SH probe (kept for reference)
+  BillboardFaceCamera.cs           <- Anchor label billboarding
 
-Assets/StreamingAssets/
-  GLBCache/                        <- Pre-generated demo models (bed, lamp, wall_art)
-  config.json                      <- API keys (gitignored)
+Assets/StreamingAssets/GLBCache/   <- Pre-bundled demo models (bed.glb, lamp.glb, wall_art.glb)
 ```
 
 ---
@@ -127,41 +143,39 @@ Assets/StreamingAssets/
 ## How to Run
 
 ### Quest 3 (primary target)
-1. Create `Assets/StreamingAssets/config.json` with API keys
-2. Build via File -> Build Profiles -> Meta Quest
+1. API keys are hardcoded in ARIAOrchestrator.cs (stripped before git push)
+2. Build via File → Build Profiles → Meta Quest 3
 3. Deploy APK via Meta Quest Developer Hub
-4. In headset: press **Y** to open menu
-5. Demo spawn: tap Spawn Bed/Lamp/Wall Art -> 3-2-1 countdown -> look at target
-6. Adjust: tap "Adjust with Claude" -> speak intent -> look at target
-7. Lighting: tap "Apply Lighting" -> "ARIA vs Default" to compare
-
-### Editor (testing)
-1. Open `ARIATestScene.unity`, ensure `Assets/config.json` exists
-2. Hit Play -> bottom-left debug panel -> type command -> Send
+4. In headset:
+   - **Y** to open menu
+   - **"Speak to ARIA"** → voice command → 3-2-1 countdown → look at target surface
+   - **Demo spawns** → Spawn Bed / Lamp / Wall Art (zero credits)
+   - **"Adjust with Claude"** → speak adjustment → close UI (Y) → look at object
+   - **Left grip** → place light sphere → position → Confirm → PTRL toggle for shadows
+   - **Right grip** → grab objects → move → release (gravity or wall snap)
+   - **"Toggle Anchors"** → see MRUK anchor labels in room
+   - **"Shadow Mode"** → cycle Directional ↔ Point Light
 
 ---
 
-## Config
+## Controller Reference
 
-Create `Assets/StreamingAssets/config.json` (gitignored):
-```json
-{
-  "claude_key": "sk-ant-...",
-  "gemini_key": "AIza...",
-  "hitem_access_key": "ak_...",
-  "hitem_secret_key": "sk_...",
-  "tripo_key": "tsk_..."
-}
-```
-
-Automatically copied to device persistent storage on first launch.
+| Button | Action |
+|--------|--------|
+| Y (left) | Toggle UI menu |
+| Left grip | Place light sphere at crosshair |
+| Right grip (hold) | Grab nearest object or light |
+| Right thumbstick | Rotate grabbed object (X=turn, Y=tilt) |
+| Left thumbstick Y | Scale grabbed object (fwd=bigger, back=smaller) |
+| A button | Reset grabbed object rotation to upright |
+| X button | Cycle selection / delete selected object |
+| Right trigger | UI button click (gaze pointer) |
 
 ---
 
 ## Acknowledgements
 
-- Meta MRUK, PTRL, EnvironmentRaycastManager, Depth API
-- [MRRealLightCapture](https://github.com/hellomixedworld/MRRealLightCapture) — cubemap lighting concepts
-- [QuestCameraKit](https://github.com/xrdevrob/QuestCameraKit) — passthrough camera reference
+- Meta MRUK, PTRL HighlightsAndShadows, Depth API, Voice SDK
+- Anthropic Claude API, Google Gemini, Tripo3D
+- [GLTFast](https://github.com/atteneder/glTFast) — runtime GLB loading
 - [Unity-MRMotifs](https://github.com/oculus-samples/Unity-MRMotifs) — grounding shadow shader reference
-- Anthropic Claude, Google Gemini, Tripo3D APIs
