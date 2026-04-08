@@ -49,6 +49,69 @@ public class ScaleInferenceSystem : MonoBehaviour
         { "stool",      0.65f },
     };
 
+    // Canonical real-world dimensions (width, height, depth) in metres.
+    // Used by FitToSurface to cap object size to real-world proportions.
+    private static readonly Dictionary<string, Vector3> CanonicalDimensions = new()
+    {
+        { "bed",        new Vector3(1.4f,  0.5f,  2.0f) },
+        { "lamp",       new Vector3(0.3f,  1.5f,  0.3f) },
+        { "floor lamp", new Vector3(0.3f,  1.5f,  0.3f) },
+        { "desk lamp",  new Vector3(0.2f,  0.45f, 0.2f) },
+        { "chair",      new Vector3(0.5f,  0.9f,  0.5f) },
+        { "armchair",   new Vector3(0.8f,  0.9f,  0.8f) },
+        { "table",      new Vector3(1.2f,  0.75f, 0.8f) },
+        { "desk",       new Vector3(1.2f,  0.75f, 0.6f) },
+        { "bookshelf",  new Vector3(0.8f,  1.8f,  0.3f) },
+        { "bookcase",   new Vector3(0.8f,  1.8f,  0.3f) },
+        { "plant",      new Vector3(0.3f,  0.6f,  0.3f) },
+        { "sofa",       new Vector3(2.0f,  0.85f, 0.9f) },
+        { "couch",      new Vector3(2.0f,  0.85f, 0.9f) },
+        { "monitor",    new Vector3(0.6f,  0.45f, 0.2f) },
+        { "tv",         new Vector3(1.0f,  0.6f,  0.1f) },
+        { "television", new Vector3(1.0f,  0.6f,  0.1f) },
+        { "painting",   new Vector3(0.8f,  0.6f,  0.05f) },
+        { "wall_art",   new Vector3(0.8f,  0.6f,  0.05f) },
+        { "picture",    new Vector3(0.5f,  0.5f,  0.05f) },
+        { "clock",      new Vector3(0.25f, 0.25f, 0.05f) },
+        { "mirror",     new Vector3(0.5f,  0.8f,  0.05f) },
+        { "shelf",      new Vector3(0.8f,  0.3f,  0.25f) },
+        { "poster",     new Vector3(0.6f,  0.9f,  0.02f) },
+        { "frame",      new Vector3(0.4f,  0.5f,  0.05f) },
+        { "vase",       new Vector3(0.15f, 0.3f,  0.15f) },
+        { "mug",        new Vector3(0.08f, 0.1f,  0.08f) },
+        { "cup",        new Vector3(0.08f, 0.1f,  0.08f) },
+        { "book",       new Vector3(0.15f, 0.03f, 0.22f) },
+        { "candle",     new Vector3(0.06f, 0.15f, 0.06f) },
+        { "lantern",    new Vector3(0.15f, 0.3f,  0.15f) },
+        { "rug",        new Vector3(2.0f,  0.02f, 1.5f) },
+        { "carpet",     new Vector3(2.5f,  0.02f, 2.0f) },
+        { "pillow",     new Vector3(0.4f,  0.15f, 0.4f) },
+        { "cushion",    new Vector3(0.4f,  0.15f, 0.4f) },
+        { "stool",      new Vector3(0.35f, 0.65f, 0.35f) },
+    };
+
+    /// <summary>
+    /// Returns canonical real-world (width, height, depth) for a category.
+    /// Supports exact match and partial substring matching.
+    /// Returns Vector3.zero if no match found.
+    /// </summary>
+    public static Vector3 GetCanonicalDimensions(string category)
+    {
+        if (string.IsNullOrEmpty(category)) return Vector3.zero;
+        string key = category.ToLowerInvariant();
+
+        if (CanonicalDimensions.TryGetValue(key, out var dims))
+            return dims;
+
+        // Partial match (e.g. "modern floor lamp" → "floor lamp" → "lamp")
+        foreach (var kv in CanonicalDimensions)
+        {
+            if (key.Contains(kv.Key) || kv.Key.Contains(key))
+                return kv.Value;
+        }
+        return Vector3.zero;
+    }
+
     private const float MinScale = 0.05f;
     private const float MaxScale = 3.0f;
 

@@ -682,6 +682,173 @@ public class SemanticPlacementEngine : MonoBehaviour
 
 
     // -------------------------------------------------------------------------
+    // Surface-aware fit — scale to fit specific surface, cap at canonical size
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Shrinks object proportionally to fit a specific MRUK surface (table, wall, etc).
+    /// Never grows beyond canonical real-world dimensions for the category.
+    /// Called AFTER FitToAvailableSpace (room-level) for surface-specific refinement.
+    /// </summary>
+    public void FitToSurface(GameObject obj, MRUKAnchor surfaceAnchor, string category)
+    {
+        if (obj == null || surfaceAnchor == null) return;
+
+        Bounds objBounds = GetObjectBounds(obj);
+        Vector3 canonical = ScaleInferenceSystem.GetCanonicalDimensions(category);
+        float shrinkRatio = 1f;
+
+        if (surfaceAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.TABLE) ||
+            surfaceAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.COUCH))
+        {
+            // Table/couch: compare object footprint (X,Z) against surface top area
+            if (surfaceAnchor.VolumeBounds.HasValue)
+            {
+                Vector2 surfSize = surfaceAnchor.VolumeBounds.Value.size; // local 2D
+                float surfW = surfSize.x;
+                float surfD = surfSize.y; // VolumeBounds Y is depth in world XZ
+
+                float ratioX = objBounds.size.x > 0.01f ? surfW / objBounds.size.x : 1f;
+                float ratioZ = objBounds.size.z > 0.01f ? surfD / objBounds.size.z : 1f;
+                shrinkRatio = Mathf.Min(ratioX, ratioZ, 1f); // never grow
+
+                // Leave a 10% margin so object doesn't fill entire surface
+                if (shrinkRatio < 0.95f)
+                    shrinkRatio *= 0.9f;
+            }
+        }
+        else if (surfaceAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.WALL_FACE))
+        {
+            // Wall: compare object face (X,Y) against wall PlaneRect
+            if (surfaceAnchor.PlaneRect.HasValue)
+            {
+                Rect wallRect = surfaceAnchor.PlaneRect.Value;
+                float ratioX = objBounds.size.x > 0.01f ? wallRect.width / objBounds.size.x : 1f;
+                float ratioY = objBounds.size.y > 0.01f ? wallRect.height / objBounds.size.y : 1f;
+                shrinkRatio = Mathf.Min(ratioX, ratioY, 1f);
+
+                // Leave 15% margin on walls (don't fill edge to edge)
+                if (shrinkRatio < 0.95f)
+                    shrinkRatio *= 0.85f;
+            }
+        }
+        // FLOOR: no surface-specific shrink (FitToAvailableSpace handles room-level)
+
+        // Enforce canonical max: if object currently exceeds canonical dimensions, shrink
+        if (canonical.y > 0.01f)
+        {
+            float canonRatioY = canonical.y / Mathf.Max(objBounds.size.y, 0.001f);
+            float canonRatioX = canonical.x > 0.01f ? canonical.x / Mathf.Max(objBounds.size.x, 0.001f) : 1f;
+            float canonRatioZ = canonical.z > 0.01f ? canonical.z / Mathf.Max(objBounds.size.z, 0.001f) : 1f;
+            float canonCap = Mathf.Min(canonRatioY, canonRatioX, canonRatioZ, 1f);
+            shrinkRatio = Mathf.Min(shrinkRatio, canonCap);
+        }
+
+        if (shrinkRatio < 0.95f)
+        {
+            shrinkRatio = Mathf.Max(shrinkRatio, 0.1f); // never below 10%
+            obj.transform.localScale *= shrinkRatio;
+
+            // Re-snap Y to surface after scaling
+            if (surfaceAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.TABLE) ||
+                surfaceAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.COUCH))
+            {
+                Bounds nb = GetObjectBounds(obj);
+                float surfaceY = surfaceAnchor.transform.position.y;
+                float bottomOffset = obj.transform.position.y - nb.min.y;
+                obj.transform.position = new Vector3(
+                    obj.transform.position.x, surfaceY + bottomOffset, obj.transform.position.z);
+            }
+
+            Debug.Log($"[SemanticPlacement] FitToSurface: shrunk \"{obj.name}\" by {shrinkRatio:F2}x for {surfaceAnchor.name}");
+            ARIADebugUI.AppendClaudeLog($"  → fit to {surfaceAnchor.name} ({shrinkRatio:F2}x)");
+        }
+    }
+
+    /// <summary>
+    /// Finds the nearest MRUK wall anchor to a world position.
+    /// Returns the distance. Outputs surface position, normal, and anchor.
+    /// </summary>
+    public float FindNearestWall(Vector3 position, out Vector3 surfacePos, out Vector3 wallNormal, out MRUKAnchor wallAnchor)
+    {
+        surfacePos = position;
+        wallNormal = Vector3.forward;
+        wallAnchor = null;
+
+        var room = MRUK.Instance?.GetCurrentRoom();
+        if (room == null) return float.MaxValue;
+
+        float bestDist = float.MaxValue;
+        foreach (var anchor in room.Anchors)
+        {
+            if (!anchor.HasAnyLabel(MRUKAnchor.SceneLabels.WALL_FACE)) continue;
+
+            Vector3 wallCenter = anchor.transform.position;
+            // Project position onto the wall plane
+            Vector3 toPos = position - wallCenter;
+            Vector3 normal = anchor.transform.forward;
+            float dist = Mathf.Abs(Vector3.Dot(toPos, normal));
+
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                surfacePos = wallCenter + normal * Vector3.Dot(toPos - normal * dist, normal); // closest point on wall plane
+                // Simpler: project onto wall plane
+                surfacePos = position - normal * Vector3.Dot(toPos, normal);
+                wallNormal = normal;
+                wallAnchor = anchor;
+            }
+        }
+        return bestDist;
+    }
+
+    /// <summary>
+    /// Detects which MRUK surface (FLOOR, TABLE, COUCH) is directly below a position.
+    /// Returns the anchor, or null if none found.
+    /// </summary>
+    public MRUKAnchor DetectSurfaceBelow(Vector3 position)
+    {
+        var room = MRUK.Instance?.GetCurrentRoom();
+        if (room == null) return null;
+
+        // Check tables/couches first (they're above floor)
+        MRUKAnchor bestVolume = null;
+        float bestVolumeDist = float.MaxValue;
+        foreach (var anchor in room.Anchors)
+        {
+            if (!anchor.HasAnyLabel(MRUKAnchor.SceneLabels.TABLE) &&
+                !anchor.HasAnyLabel(MRUKAnchor.SceneLabels.COUCH)) continue;
+
+            float surfaceY = anchor.transform.position.y;
+            float yDiff = position.y - surfaceY;
+
+            // Object should be above or at the surface (within 0.5m)
+            if (yDiff >= -0.05f && yDiff < 0.5f)
+            {
+                // Check XZ proximity — object should be roughly over the surface
+                Vector3 anchorPos = anchor.transform.position;
+                float xzDist = Vector2.Distance(
+                    new Vector2(position.x, position.z),
+                    new Vector2(anchorPos.x, anchorPos.z));
+
+                float surfaceRadius = anchor.VolumeBounds.HasValue
+                    ? Mathf.Max(anchor.VolumeBounds.Value.size.x, anchor.VolumeBounds.Value.size.y) * 0.6f
+                    : 0.5f;
+
+                if (xzDist < surfaceRadius && yDiff < bestVolumeDist)
+                {
+                    bestVolumeDist = yDiff;
+                    bestVolume = anchor;
+                }
+            }
+        }
+        if (bestVolume != null) return bestVolume;
+
+        // Fallback: floor
+        return room.Anchors.FirstOrDefault(a => a.HasAnyLabel(MRUKAnchor.SceneLabels.FLOOR));
+    }
+
+    // -------------------------------------------------------------------------
     // Geometry helpers
     // -------------------------------------------------------------------------
 

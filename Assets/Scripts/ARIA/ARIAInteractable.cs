@@ -1,0 +1,249 @@
+// ARIAInteractable.cs
+// Handles post-grab-release behavior for spawned virtual objects.
+// Floor items: gravity drop onto nearest surface, then proportional resize.
+// Wall items: magnet-snap to nearest wall within threshold, or fall if too far.
+//
+// Detects grab release by monitoring Rigidbody.isKinematic transitions —
+// Meta's Grabbable sets isKinematic=false on release when configured with
+// _throwWhenUnselected=true and _forceKinematicDisabled=true.
+
+using System.Collections;
+using UnityEngine;
+using Meta.XR.MRUtilityKit;
+
+public enum SurfaceCategory { FloorItem, WallItem }
+
+public class ARIAInteractable : MonoBehaviour
+{
+    [Header("Surface Classification")]
+    public SurfaceCategory category = SurfaceCategory.FloorItem;
+    public string objectCategory = ""; // text category ("bed", "painting", etc.)
+
+    [Header("Wall Snap")]
+    [Tooltip("Maximum distance from a wall to trigger magnet snap (metres).")]
+    [SerializeField] private float wallSnapThreshold = 0.4f;
+
+    [Header("Settle Detection")]
+    [Tooltip("Seconds to wait before checking if object has settled after drop.")]
+    [SerializeField] private float settleDelay = 0.8f;
+    [Tooltip("Maximum seconds to wait for object to stop moving.")]
+    [SerializeField] private float settleTimeout = 5f;
+
+    private Rigidbody _rb;
+    private SemanticPlacementEngine _placementEngine;
+    private bool _wasKinematicLastFrame = true;
+    private Coroutine _settleCoroutine;
+
+    private void Awake()
+    {
+        _rb = GetComponent<Rigidbody>();
+        _placementEngine = FindFirstObjectByType<SemanticPlacementEngine>();
+    }
+
+    private void Update()
+    {
+        if (_rb == null) return;
+
+        bool isKinematic = _rb.isKinematic;
+
+        // Detect release: kinematic was true (during grab), now false (released)
+        if (_wasKinematicLastFrame && !isKinematic)
+        {
+            OnReleased();
+        }
+        // Detect re-grab: was non-kinematic (falling), now kinematic (grabbed again)
+        else if (!_wasKinematicLastFrame && isKinematic)
+        {
+            OnReGrabbed();
+        }
+
+        _wasKinematicLastFrame = isKinematic;
+    }
+
+    private void OnReleased()
+    {
+        Debug.Log($"[ARIAInteractable] {gameObject.name} released (category={category})");
+
+        if (_settleCoroutine != null)
+            StopCoroutine(_settleCoroutine);
+
+        if (category == SurfaceCategory.WallItem)
+        {
+            TryWallSnap();
+        }
+        else
+        {
+            ApplyGravityDrop();
+        }
+    }
+
+    private void OnReGrabbed()
+    {
+        // Cancel any settle coroutine if user grabs the object mid-fall
+        if (_settleCoroutine != null)
+        {
+            StopCoroutine(_settleCoroutine);
+            _settleCoroutine = null;
+        }
+        // Re-enable gravity for next release
+        if (category == SurfaceCategory.FloorItem && _rb != null)
+            _rb.useGravity = true;
+
+        Debug.Log($"[ARIAInteractable] {gameObject.name} re-grabbed");
+    }
+
+    // ── Floor items: fall with gravity, resize on landing ──────────────────
+
+    private void ApplyGravityDrop()
+    {
+        if (_rb == null) return;
+
+        // Verify there's something below to land on (EffectMesh colliders)
+        if (!Physics.Raycast(transform.position, Vector3.down, 10f))
+        {
+            // No ground below — stay kinematic to avoid falling forever
+            _rb.isKinematic = true;
+            _rb.useGravity = false;
+            Debug.LogWarning($"[ARIAInteractable] No ground below {gameObject.name}, keeping kinematic");
+            return;
+        }
+
+        _rb.useGravity = true;
+        _rb.isKinematic = false;
+        _settleCoroutine = StartCoroutine(WaitForSettle());
+    }
+
+    private IEnumerator WaitForSettle()
+    {
+        yield return new WaitForSeconds(settleDelay);
+
+        float elapsed = 0f;
+        while (elapsed < settleTimeout)
+        {
+            // Abort if re-grabbed
+            if (_rb == null || _rb.isKinematic)
+            {
+                _settleCoroutine = null;
+                yield break;
+            }
+
+            if (_rb.linearVelocity.sqrMagnitude < 0.003f) // velocity < ~5cm/s
+            {
+                break;
+            }
+
+            elapsed += Time.deltaTime;
+            yield return null;
+        }
+
+        // Freeze in place
+        if (_rb != null)
+        {
+            _rb.isKinematic = true;
+            _rb.useGravity = false;
+            _rb.linearVelocity = Vector3.zero;
+            _rb.angularVelocity = Vector3.zero;
+        }
+
+        // Detect what surface we landed on and resize
+        if (_placementEngine != null)
+        {
+            MRUKAnchor landedOn = _placementEngine.DetectSurfaceBelow(transform.position);
+            if (landedOn != null)
+            {
+                _placementEngine.FitToSurface(gameObject, landedOn, objectCategory);
+                Debug.Log($"[ARIAInteractable] {gameObject.name} settled on {landedOn.name}");
+            }
+        }
+
+        _settleCoroutine = null;
+    }
+
+    // ── Wall items: snap to nearest wall or fall ───────────────────────────
+
+    private void TryWallSnap()
+    {
+        if (_placementEngine == null || _rb == null)
+        {
+            ApplyGravityDrop(); // fallback
+            return;
+        }
+
+        float dist = _placementEngine.FindNearestWall(
+            transform.position, out Vector3 surfacePos, out Vector3 wallNormal, out MRUKAnchor wallAnchor);
+
+        if (dist <= wallSnapThreshold && wallAnchor != null)
+        {
+            // Snap to wall
+            Bounds b = ARIAOrchestrator.CalculateMeshBounds(gameObject);
+            float halfDepth = Mathf.Min(b.extents.x, b.extents.z);
+
+            // Position: on the wall surface, offset by half-depth so object doesn't clip
+            Vector3 snapPos = surfacePos + wallNormal * (halfDepth + 0.03f);
+            // Keep the Y position where user released (user chose the height)
+            snapPos.y = transform.position.y;
+
+            // Clamp Y within wall bounds
+            if (wallAnchor.PlaneRect.HasValue)
+            {
+                Vector3 localPos = wallAnchor.transform.InverseTransformPoint(snapPos);
+                Rect rect = wallAnchor.PlaneRect.Value;
+                localPos.y = Mathf.Clamp(localPos.y, rect.yMin + b.extents.y, rect.yMax - b.extents.y);
+                snapPos = wallAnchor.transform.TransformPoint(localPos);
+            }
+
+            transform.position = snapPos;
+            transform.rotation = Quaternion.LookRotation(wallNormal, Vector3.up);
+
+            // Freeze
+            _rb.isKinematic = true;
+            _rb.useGravity = false;
+            _rb.linearVelocity = Vector3.zero;
+            _rb.angularVelocity = Vector3.zero;
+
+            // Resize to fit wall
+            _placementEngine.FitToSurface(gameObject, wallAnchor, objectCategory);
+
+            Debug.Log($"[ARIAInteractable] {gameObject.name} snapped to wall {wallAnchor.name} (dist={dist:F2}m)");
+            ARIADebugUI.AppendClaudeLog($"{gameObject.name} snapped to {wallAnchor.name}");
+        }
+        else
+        {
+            // Too far from wall — fall with gravity
+            Debug.Log($"[ARIAInteractable] {gameObject.name} too far from wall ({dist:F2}m), dropping");
+            ApplyGravityDrop();
+        }
+    }
+
+    // ── Classification helper ─────────────────────────────────────────────
+
+    private static readonly string[] WallCategories =
+    {
+        "painting", "wall_art", "clock", "mirror", "shelf", "poster",
+        "picture", "frame", "wall decor", "sconce", "tapestry"
+    };
+
+    /// <summary>
+    /// Determines if an object is a floor item (gravity) or wall item (magnet snap).
+    /// </summary>
+    public static SurfaceCategory ClassifyObject(string category, string surfaceLabel)
+    {
+        // Explicit wall surface from Claude
+        if (!string.IsNullOrEmpty(surfaceLabel) &&
+            surfaceLabel.Equals("WALL_FACE", System.StringComparison.OrdinalIgnoreCase))
+            return SurfaceCategory.WallItem;
+
+        // Category-based classification
+        if (!string.IsNullOrEmpty(category))
+        {
+            string lower = category.ToLowerInvariant();
+            foreach (string wallCat in WallCategories)
+            {
+                if (lower.Contains(wallCat))
+                    return SurfaceCategory.WallItem;
+            }
+        }
+
+        return SurfaceCategory.FloorItem;
+    }
+}

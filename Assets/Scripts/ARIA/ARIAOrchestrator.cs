@@ -10,6 +10,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Threading.Tasks;
 using GLTFast;
@@ -1449,6 +1450,12 @@ public class ARIAOrchestrator : MonoBehaviour
         if (fitRoom != null)
             placementEngine?.FitToAvailableSpace(root, fitRoom);
 
+        // Surface-specific fit: shrink to surface if too big, cap at canonical real-world size
+        MRUKAnchor fitAnchor = GetAnchorById(instr.anchor_id);
+        if (fitAnchor == null)
+            fitAnchor = placementEngine?.DetectSurfaceBelow(root.transform.position);
+        if (fitAnchor != null)
+            placementEngine?.FitToSurface(root, fitAnchor, instr.category);
 
         // Lighting + interaction setup
         // Lighting is handled by PTRL toggle, not per-spawn
@@ -1456,7 +1463,7 @@ public class ARIAOrchestrator : MonoBehaviour
         if (instr.emits_light) AddVirtualLight(root, instr);
 
         if (enablePhysics)
-            AddPhysicsAndInteraction(root);
+            AddPhysicsAndInteraction(root, instr.category, instr.surface_label);
 
         if (_previews.TryGetValue(instr.prompt, out var preview))
         {
@@ -1582,12 +1589,16 @@ public class ARIAOrchestrator : MonoBehaviour
         if (fitRoom != null)
             placementEngine?.FitToAvailableSpace(root, fitRoom);
 
+        // Surface-specific fit: shrink to surface if too big, cap at canonical size
+        MRUKAnchor demoAnchor = placementEngine?.DetectSurfaceBelow(root.transform.position);
+        if (demoAnchor != null)
+            placementEngine?.FitToSurface(root, demoAnchor, category);
 
         // Reset layer so future raycasts CAN hit this object
         root.layer = 0;
 
-        // Physics
-        if (enablePhysics) AddPhysicsAndInteraction(root);
+        // Physics + interaction (gravity for floor items, wall snap for wall items)
+        if (enablePhysics) AddPhysicsAndInteraction(root, category, surfaceLabel);
 
         // Reflection probe
         AddReflectionProbe(root);
@@ -1669,6 +1680,25 @@ public class ARIAOrchestrator : MonoBehaviour
         string surface = refined.surface_label ?? "FLOOR";
         string reasoning = refined.reasoning ?? "";
 
+        // Cap scale_factor: never exceed canonical real-world dimensions
+        if (scaleFactor > 1f)
+        {
+            Bounds curBounds = CalculateMeshBounds(lastSpawn.gameObject);
+            Vector3 canonical = ScaleInferenceSystem.GetCanonicalDimensions(objName);
+            if (canonical.y > 0.01f)
+            {
+                float maxY = canonical.y / Mathf.Max(curBounds.size.y, 0.001f);
+                float maxX = canonical.x > 0.01f ? canonical.x / Mathf.Max(curBounds.size.x, 0.001f) : 10f;
+                float maxZ = canonical.z > 0.01f ? canonical.z / Mathf.Max(curBounds.size.z, 0.001f) : 10f;
+                float maxAllowed = Mathf.Min(maxY, maxX, maxZ, 10f);
+                if (scaleFactor > maxAllowed)
+                {
+                    Debug.Log($"[ARIA] Claude scale {scaleFactor:F2}x capped to canonical max {maxAllowed:F2}x");
+                    scaleFactor = Mathf.Max(maxAllowed, 0.1f);
+                }
+            }
+        }
+
         // Apply uniform scale (proportional, no deformation)
         if (scaleFactor > 0.01f && Mathf.Abs(scaleFactor - 1f) > 0.05f)
         {
@@ -1677,7 +1707,6 @@ public class ARIAOrchestrator : MonoBehaviour
         }
 
         // Only re-place if Claude explicitly wants to RELOCATE (gave an anchor_id)
-        // If Claude just wants to move/scale, skip Place() to preserve current position
         MRUKAnchor targetAnchor = GetAnchorById(refined.anchor_id);
         bool hasOffset = refined.position_offset != null && refined.position_offset.Length >= 3
             && (Mathf.Abs(refined.position_offset[0]) > 0.001f ||
@@ -1686,14 +1715,15 @@ public class ARIAOrchestrator : MonoBehaviour
 
         if (targetAnchor != null)
         {
-            // Claude wants to relocate to a specific anchor
             placementEngine?.Place(lastSpawn.gameObject, surface, targetAnchor);
 
             var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
             if (fitRoom != null)
                 placementEngine?.FitToAvailableSpace(lastSpawn.gameObject, fitRoom);
+
+            // Surface-specific fit after relocation
+            placementEngine?.FitToSurface(lastSpawn.gameObject, targetAnchor, objName);
         }
-        // else: no relocation — just apply offset/scale from current position
 
         // Apply position offset AFTER fit — so Claude's "move up 20cm" actually sticks
         if (hasOffset)
@@ -2371,8 +2401,11 @@ public class ARIAOrchestrator : MonoBehaviour
     // Physics + Interaction SDK setup (called once on final spawn)
     // -------------------------------------------------------------------------
 
-    private static void AddPhysicsAndInteraction(GameObject root)
+    private static void AddPhysicsAndInteraction(GameObject root, string category = null, string surfaceLabel = null)
     {
+        // Classify: floor item (gravity) or wall item (magnet snap)
+        SurfaceCategory surfCat = ARIAInteractable.ClassifyObject(category, surfaceLabel);
+
         // Ensure all renderers on virtual objects CAST shadows (for PTRL shadow floor)
         foreach (var r in root.GetComponentsInChildren<Renderer>())
         {
@@ -2380,10 +2413,10 @@ public class ARIAOrchestrator : MonoBehaviour
             r.receiveShadows = true;
         }
 
-        // Rigidbody — kinematic so objects stay exactly where placed (no drift/wobble)
+        // Rigidbody — starts kinematic (placed precisely), gravity set by category
         var rb           = root.AddComponent<Rigidbody>();
-        rb.useGravity    = false;
-        rb.isKinematic   = true;
+        rb.isKinematic   = true; // always start kinematic (Meta Grabbable handles toggle)
+        rb.useGravity    = (surfCat == SurfaceCategory.FloorItem); // floor items fall when released
 
         // BoxCollider auto-sized to mesh bounds (convert world→local space)
         var bounds = CalculateMeshBounds(root);
@@ -2396,18 +2429,40 @@ public class ARIAOrchestrator : MonoBehaviour
             ls.z > 0.0001f ? bounds.size.z / ls.z : bounds.size.z);
 
         // Hand grab — requires Interaction SDK Building Block in scene (OVRInteractionComprehensive)
-
         try
         {
-            root.AddComponent(System.Type.GetType("Oculus.Interaction.Grabbable, Oculus.Interaction.Runtime"));
-            root.AddComponent(System.Type.GetType("Oculus.Interaction.HandGrab.HandGrabInteractable, Oculus.Interaction.Runtime"));
-            Debug.Log($"[ARIA] Hand grab enabled on {root.name}");
+            var grabbableType = System.Type.GetType("Oculus.Interaction.Grabbable, Oculus.Interaction.Runtime");
+            var handGrabType = System.Type.GetType("Oculus.Interaction.HandGrab.HandGrabInteractable, Oculus.Interaction.Runtime");
+
+            if (grabbableType != null)
+            {
+                var grabbable = root.AddComponent(grabbableType);
+
+                // Configure Grabbable for throw-on-release (so isKinematic toggles on release)
+                var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+                var throwField = grabbableType.GetField("_throwWhenUnselected", flags);
+                var forceField = grabbableType.GetField("_forceKinematicDisabled", flags);
+
+                throwField?.SetValue(grabbable, true);
+                forceField?.SetValue(grabbable, true);
+            }
+
+            if (handGrabType != null)
+                root.AddComponent(handGrabType);
+
+            Debug.Log($"[ARIA] Hand grab enabled on {root.name} ({surfCat})");
         }
         catch (System.Exception e)
         {
             Debug.LogWarning($"[ARIA] Hand grab setup skipped: {e.Message}");
         }
 
+        // ARIAInteractable — handles post-release behavior (gravity drop / wall snap)
+        var interactable = root.AddComponent<ARIAInteractable>();
+        interactable.category = surfCat;
+        interactable.objectCategory = category ?? root.name;
+
+        Debug.Log($"[ARIA] Interactable: {root.name} → {surfCat}");
     }
 
     // -------------------------------------------------------------------------
