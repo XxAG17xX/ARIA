@@ -754,10 +754,16 @@ public class SemanticPlacementEngine : MonoBehaviour
         Vector3 canonical = ScaleInferenceSystem.GetCanonicalDimensions(category);
         float shrinkRatio = 1f;
 
-        if (surfaceAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.TABLE) ||
-            surfaceAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.COUCH))
+        // Any volume anchor with a flat top (TABLE, COUCH, BED, OTHER, STORAGE, etc.)
+        bool isVolumeSurface = !surfaceAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.FLOOR) &&
+                               !surfaceAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.CEILING) &&
+                               !surfaceAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.WALL_FACE) &&
+                               !surfaceAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.DOOR_FRAME) &&
+                               !surfaceAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.WINDOW_FRAME);
+
+        if (isVolumeSurface)
         {
-            // Table/couch: compare object footprint (X,Z) against surface top area
+            // Volume surface: compare object footprint (X,Z) against surface top area
             if (surfaceAnchor.VolumeBounds.HasValue)
             {
                 Vector2 surfSize = surfaceAnchor.VolumeBounds.Value.size; // local 2D
@@ -775,17 +781,10 @@ public class SemanticPlacementEngine : MonoBehaviour
         }
         else if (surfaceAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.WALL_FACE))
         {
-            // Wall: compare object face (X,Y) against wall PlaneRect
-            if (surfaceAnchor.PlaneRect.HasValue)
+            // Wall items: no auto-resize — paintings/art keep their spawned size.
+            // Wall placement + PlaneRect clamping in PlaceOnSpecificWall handles positioning.
+            if (false) // wall resize disabled — was shrinking paintings too aggressively
             {
-                Rect wallRect = surfaceAnchor.PlaneRect.Value;
-                float ratioX = objBounds.size.x > 0.01f ? wallRect.width / objBounds.size.x : 1f;
-                float ratioY = objBounds.size.y > 0.01f ? wallRect.height / objBounds.size.y : 1f;
-                shrinkRatio = Mathf.Min(ratioX, ratioY, 1f);
-
-                // Leave 15% margin on walls (don't fill edge to edge)
-                if (shrinkRatio < 0.95f)
-                    shrinkRatio *= 0.85f;
             }
         }
         // FLOOR: no surface-specific shrink (FitToAvailableSpace handles room-level)
@@ -808,9 +807,9 @@ public class SemanticPlacementEngine : MonoBehaviour
             // Re-snap Y to surface after scaling so object doesn't float
             Bounds nb = GetObjectBounds(obj);
             float bottomOffset = obj.transform.position.y - nb.min.y;
-            if (surfaceAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.TABLE) ||
-                surfaceAnchor.HasAnyLabel(MRUKAnchor.SceneLabels.COUCH))
+            if (isVolumeSurface)
             {
+                // Snap bottom to top of volume surface (table, bed, couch, etc.)
                 float surfaceY = surfaceAnchor.transform.position.y;
                 obj.transform.position = new Vector3(
                     obj.transform.position.x, surfaceY + bottomOffset, obj.transform.position.z);
@@ -866,21 +865,28 @@ public class SemanticPlacementEngine : MonoBehaviour
     }
 
     /// <summary>
-    /// Detects which MRUK surface (FLOOR, TABLE, COUCH) is directly below a position.
-    /// Returns the anchor, or null if none found.
+    /// Detects which MRUK surface is directly below a position.
+    /// Checks ALL volume anchors (TABLE, COUCH, BED, OTHER, STORAGE, etc.)
+    /// as any flat-topped object is a valid landing surface.
+    /// Returns the anchor, or falls back to FLOOR.
     /// </summary>
     public MRUKAnchor DetectSurfaceBelow(Vector3 position)
     {
         var room = MRUK.Instance?.GetCurrentRoom();
         if (room == null) return null;
 
-        // Check tables/couches first (they're above floor)
+        // Check ALL volume anchors (anything with a flat top surface above the floor)
         MRUKAnchor bestVolume = null;
         float bestVolumeDist = float.MaxValue;
         foreach (var anchor in room.Anchors)
         {
-            if (!anchor.HasAnyLabel(MRUKAnchor.SceneLabels.TABLE) &&
-                !anchor.HasAnyLabel(MRUKAnchor.SceneLabels.COUCH)) continue;
+            // Skip floor, ceiling, walls — we want volume objects with flat tops
+            if (anchor.HasAnyLabel(MRUKAnchor.SceneLabels.FLOOR) ||
+                anchor.HasAnyLabel(MRUKAnchor.SceneLabels.CEILING) ||
+                anchor.HasAnyLabel(MRUKAnchor.SceneLabels.WALL_FACE) ||
+                anchor.HasAnyLabel(MRUKAnchor.SceneLabels.DOOR_FRAME) ||
+                anchor.HasAnyLabel(MRUKAnchor.SceneLabels.WINDOW_FRAME)) continue;
+            // Everything else (TABLE, COUCH, BED, OTHER, STORAGE, etc.) is a potential surface
 
             float surfaceY = anchor.transform.position.y;
             float yDiff = position.y - surfaceY;

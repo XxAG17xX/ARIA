@@ -149,20 +149,9 @@ public class ScaleInferenceSystem : MonoBehaviour
         float scaleX = scaleY; // default: uniform from height
         float scaleZ = scaleY;
 
-        // If Claude provided width/depth, use non-uniform scaling
-        bool proportional = targetWidthMetres > 0.01f || targetDepthMetres > 0.01f;
-        if (proportional)
-        {
-            if (targetWidthMetres > 0.01f && nativeW > 0.0001f)
-                scaleX = targetWidthMetres / nativeW;
-            if (targetDepthMetres > 0.01f && nativeD > 0.0001f)
-                scaleZ = targetDepthMetres / nativeD;
-        }
-
-        // Clamp each axis
-        scaleX = Mathf.Clamp(scaleX, MinScale, MaxScale);
+        // ALWAYS uniform scaling — use height as the reference, never squash/stretch
+        // Claude's width/depth are informational but we only scale proportionally
         scaleY = Mathf.Clamp(scaleY, MinScale, MaxScale);
-        scaleZ = Mathf.Clamp(scaleZ, MinScale, MaxScale);
 
         // Sanity-check against room height (if known)
         if (roomHeightMetres > 0.1f)
@@ -176,18 +165,13 @@ public class ScaleInferenceSystem : MonoBehaviour
             }
         }
 
-        obj.transform.localScale = proportional
-            ? new Vector3(scaleX, scaleY, scaleZ)
-            : Vector3.one * scaleY;
+        obj.transform.localScale = Vector3.one * scaleY; // uniform — no squashing ever
 
         // Resize any existing BoxCollider to new bounds
         ResizeCollider(obj);
 
-        string scaleStr = proportional
-            ? $"scale=({scaleX:F3}, {scaleY:F3}, {scaleZ:F3})"
-            : $"scale={scaleY:F3}";
         Debug.Log($"[ScaleInference] \"{obj.name}\": native=({nativeW:F3}×{nativeH:F3}×{nativeD:F3})m, " +
-                  $"target=({targetWidthMetres:F2}×{targetH:F2}×{targetDepthMetres:F2})m, {scaleStr}");
+                  $"target h={targetH:F2}m, uniform scale={scaleY:F3}");
     }
 
     // -------------------------------------------------------------------------

@@ -59,7 +59,7 @@ public class ARIADebugUI : MonoBehaviour
     {
         string timestamp = System.DateTime.Now.ToString("HH:mm:ss");
         _claudeLog = $"[{timestamp}] {msg}\n\n{_claudeLog}";
-        if (_claudeLog.Length > 3000) _claudeLog = _claudeLog.Substring(0, 3000);
+        if (_claudeLog.Length > 8000) _claudeLog = _claudeLog.Substring(0, 8000);
     }
 
 
@@ -435,10 +435,10 @@ public class ARIADebugUI : MonoBehaviour
             () => ToggleAnchorLabels());
         y -= 52f;
 
-        // Transcript
+        // Transcript — taller to show full voice input
         _transcriptText = MakeLabel(_mainPanel.transform, "Transcript", "",
-            new Vector2(0, y), new Vector2(560, 28), 16, FontStyle.Italic, Color.grey);
-        y -= 32f;
+            new Vector2(0, y), new Vector2(560, 60), 14, FontStyle.Italic, Color.grey);
+        y -= 64f;
 
         // Status
         _statusText = MakeLabel(_mainPanel.transform, "Status",
@@ -464,7 +464,7 @@ public class ARIADebugUI : MonoBehaviour
             new Vector2(0, -60), new Vector2(560, 40), 22, FontStyle.Normal, Color.white);
 
         _countdownCmdText = MakeLabel(_countdownPanel.transform, "CCmd", "",
-            new Vector2(0, -110), new Vector2(560, 30), 16, FontStyle.Italic, Color.grey);
+            new Vector2(0, -120), new Vector2(560, 80), 14, FontStyle.Italic, Color.grey);
 
         Debug.Log("[ARIA] VR Canvas UI created.");
     }
@@ -885,6 +885,21 @@ public class ARIADebugUI : MonoBehaviour
         {
             _grabbedObject.transform.rotation = Quaternion.identity;
             SetStatus("Rotation reset to upright");
+        }
+
+        // Left thumbstick Y: scale up/down (forward = bigger, backward = smaller)
+        Vector2 leftStick = OVRInput.Get(OVRInput.Axis2D.PrimaryThumbstick);
+        if (Mathf.Abs(leftStick.y) > 0.15f)
+        {
+            float scaleSpeed = 1f + leftStick.y * Time.deltaTime * 2f; // smooth proportional scaling
+            _grabbedObject.transform.localScale *= scaleSpeed;
+            // Clamp: never below 5% or above 5x of original
+            Vector3 orig = _grabbedObject.originalScale;
+            Vector3 cur = _grabbedObject.transform.localScale;
+            cur.x = Mathf.Clamp(cur.x, orig.x * 0.05f, orig.x * 5f);
+            cur.y = Mathf.Clamp(cur.y, orig.y * 0.05f, orig.y * 5f);
+            cur.z = Mathf.Clamp(cur.z, orig.z * 0.05f, orig.z * 5f);
+            _grabbedObject.transform.localScale = cur;
         }
     }
 

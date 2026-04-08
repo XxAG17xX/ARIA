@@ -1907,7 +1907,7 @@ public class ARIAOrchestrator : MonoBehaviour
                 float sampledIntensity = _manualLights[0].GetComponent<Light>()?.intensity ?? 2f;
                 sceneDirectionalLight.shadows = LightShadows.Soft;
                 sceneDirectionalLight.shadowStrength = 0.95f;
-                sceneDirectionalLight.intensity = Mathf.Clamp(sampledIntensity * 0.7f, 0.8f, 2.0f);
+                sceneDirectionalLight.intensity = Mathf.Clamp(sampledIntensity * 1.5f, 1.5f, 4.0f);
                 sceneDirectionalLight.color = _manualLights[0].GetComponent<Light>()?.color ?? Color.white;
             }
             else if (sceneDirectionalLight != null)
