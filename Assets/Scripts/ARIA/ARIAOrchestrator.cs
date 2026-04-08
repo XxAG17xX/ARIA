@@ -1739,25 +1739,7 @@ public class ARIAOrchestrator : MonoBehaviour
         if (_ptrlActive)
         {
             ApplyShadowMode();
-            // Update PTRL surface properties for the new mode
-            float hlOpacity = _shadowMode == ShadowMode.PointLight ? 0.15f : 0f; // minimal wash, shadows still work
-            float shadowInt = _shadowMode == ShadowMode.PointLight ? 6f : 0.85f; // 6x for strong point light shadows
-            bool wallsCastShadows = _shadowMode == ShadowMode.PointLight;
-            foreach (var surface in _ptrlShadowSurfaces)
-            {
-                if (surface == null) continue;
-                var rend = surface.GetComponent<Renderer>();
-                if (rend != null && surface.name.Contains("ShadowWall"))
-                    rend.shadowCastingMode = wallsCastShadows
-                        ? UnityEngine.Rendering.ShadowCastingMode.On
-                        : UnityEngine.Rendering.ShadowCastingMode.Off;
-                var mat = rend?.material;
-                if (mat != null)
-                {
-                    mat.SetFloat("_HighlightOpacity", hlOpacity);
-                    mat.SetFloat("_ShadowIntensity", shadowInt);
-                }
-            }
+            UpdatePTRLSurfaceProperties();
         }
         string modeLabel = _shadowMode == ShadowMode.Directional ? "Directional" : "Point Light";
         SetStatus($"Shadow mode: {modeLabel}");
@@ -1796,26 +1778,7 @@ public class ARIAOrchestrator : MonoBehaviour
             }
 
             // Configure PTRL surface properties based on shadow mode
-            float hlOpacity = _shadowMode == ShadowMode.PointLight ? 0.15f : 0f; // minimal wash, shadows still work
-            float shadowInt = _shadowMode == ShadowMode.PointLight ? 6f : 0.85f; // 6x for strong point light shadows
-            bool wallsCastShadows = _shadowMode == ShadowMode.PointLight;
-            foreach (var surface in _ptrlShadowSurfaces)
-            {
-                if (surface == null) continue;
-                // Walls cast shadows in point light mode so light doesn't pass through them
-                // In directional mode, wall shadow casting creates ugly rectangles so keep it off
-                var rend = surface.GetComponent<Renderer>();
-                if (rend != null && surface.name.Contains("ShadowWall"))
-                    rend.shadowCastingMode = wallsCastShadows
-                        ? UnityEngine.Rendering.ShadowCastingMode.On
-                        : UnityEngine.Rendering.ShadowCastingMode.Off;
-                var mat = rend?.material;
-                if (mat != null)
-                {
-                    mat.SetFloat("_HighlightOpacity", hlOpacity);
-                    mat.SetFloat("_ShadowIntensity", shadowInt);
-                }
-            }
+            UpdatePTRLSurfaceProperties();
 
             // Make sure EffectMesh surfaces don't cast shadows
             var effectMesh = FindFirstObjectByType<Meta.XR.MRUtilityKit.EffectMesh>();
@@ -1944,6 +1907,38 @@ public class ARIAOrchestrator : MonoBehaviour
                     light.shadowBias = 0.02f;
                     light.shadowNormalBias = 0.3f;
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Updates PTRL surface shader properties for the current shadow mode.
+    /// Walls always receiveShadows=true, never cast shadows (avoids self-shadowing and rectangular artifacts).
+    /// </summary>
+    private void UpdatePTRLSurfaceProperties()
+    {
+        // Point light: strong shadow, slight highlight. Directional: moderate shadow, slight highlight.
+        float hlOpacity = _shadowMode == ShadowMode.PointLight ? 0.15f : 0.08f;
+        float shadowInt = _shadowMode == ShadowMode.PointLight ? 6f : 0.85f;
+
+        foreach (var surface in _ptrlShadowSurfaces)
+        {
+            if (surface == null) continue;
+            var rend = surface.GetComponent<Renderer>();
+            if (rend == null) continue;
+
+            // Walls: NEVER cast shadows (avoids rectangular shadow artifacts in directional
+            // AND self-shadowing darkness in point light). Always receive shadows so objects
+            // cast visible shadows onto walls.
+            // Floor + ceiling: never cast shadows either, just receive.
+            rend.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
+            rend.receiveShadows = true;
+
+            var mat = rend.material;
+            if (mat != null)
+            {
+                mat.SetFloat("_HighlightOpacity", hlOpacity);
+                mat.SetFloat("_ShadowIntensity", shadowInt);
             }
         }
     }
