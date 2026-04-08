@@ -353,7 +353,7 @@ public class ARIADebugUI : MonoBehaviour
 
         // ── Main panel ──────────────────────────────────────────────────────
         _mainPanel = MakePanel(canvasGO.transform, "MainPanel",
-            Vector2.zero, new Vector2(600, 950), new Color(0f, 0f, 0f, 0.75f));
+            Vector2.zero, new Vector2(600, 1000), new Color(0f, 0f, 0f, 0.75f));
 
         float y = 445f; // start from top
 
@@ -413,6 +413,38 @@ public class ARIADebugUI : MonoBehaviour
             () => StartCountdownForAction("Wall art at crosshair",
                 () => { _orchestrator.SetUserContext("hang a painting on the wall"); _orchestrator.SpawnBundledGlb("wall_art.glb", "WALL_FACE", 0.6f, "wall_art", 0.8f, 0.05f); }));
         y -= 58f;
+
+        // Tripo quality toggle
+        MakeButton(_mainPanel.transform, "BtnTripoQ", "3D Quality: Standard",
+            new Vector2(0, y), new Vector2(560, 36),
+            () => {
+                bool hq = _orchestrator.ToggleTripoQuality();
+                var btn = _mainPanel.transform.Find("BtnTripoQ");
+                if (btn != null)
+                {
+                    var txt = btn.GetComponentInChildren<Text>();
+                    if (txt != null) txt.text = hq
+                        ? "3D Quality: HIGH"
+                        : "3D Quality: Standard";
+                }
+                if (hq)
+                    AppendClaudeLog("3D QUALITY → HIGH\n" +
+                        "  Model: Tripo v3.1-20260211\n" +
+                        "  Polygons: 30,000 faces\n" +
+                        "  Texture: detailed (high-res)\n" +
+                        "  Geometry: detailed (Ultra Mode)\n" +
+                        "  PBR: ON (metallic/roughness maps)\n" +
+                        "  ~2-3x credits per object");
+                else
+                    AppendClaudeLog("3D QUALITY → Standard\n" +
+                        "  Model: Tripo v2.5-20250123\n" +
+                        "  Polygons: 10,000 faces\n" +
+                        "  Texture: standard\n" +
+                        "  Geometry: standard\n" +
+                        "  PBR: OFF\n" +
+                        "  Lowest credit cost");
+            });
+        y -= 42f;
 
         // Adjust with Claude — user looks at target, then presses
         MakeButton(_mainPanel.transform, "BtnAdjust", "Adjust with Claude (speak + look)",

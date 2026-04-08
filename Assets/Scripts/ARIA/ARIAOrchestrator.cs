@@ -55,6 +55,16 @@ public class ARIAOrchestrator : MonoBehaviour
     [Tooltip("Which API to use for 3D mesh generation. Switch to save credits.")]
     [SerializeField] private MeshProvider meshProvider = MeshProvider.Tripo3D;
 
+    /// <summary>High quality Tripo mode: v3.1, 30k faces, detailed textures + geometry, PBR.</summary>
+    private bool _tripoHighQuality = false;
+    public bool TripoHighQuality => _tripoHighQuality;
+    public bool ToggleTripoQuality()
+    {
+        _tripoHighQuality = !_tripoHighQuality;
+        Debug.Log($"[ARIA] Tripo quality: {(_tripoHighQuality ? "HIGH (v3.1, 30k, detailed)" : "STANDARD (v2.5, 10k)")}");
+        return _tripoHighQuality;
+    }
+
     // API keys — set locally, stripped for git push
     private string _claudeKey  = "";
     private string _geminiKey  = "";
@@ -1313,17 +1323,30 @@ public class ARIAOrchestrator : MonoBehaviour
 
     private async Task<string> TripoCreateTaskAsync(string fileToken)
     {
-        // Cheapest config: draft quality, low face count, no PBR
-        string body = JsonConvert.SerializeObject(new
+        // Quality settings based on toggle
+        string modelVer   = _tripoHighQuality ? "v3.1-20260211" : "v2.5-20250123";
+        int    faceLimit   = _tripoHighQuality ? 30000 : 10000;
+        string texQuality  = _tripoHighQuality ? "detailed" : "standard";
+        bool   usePBR      = _tripoHighQuality || enablePBR;
+
+        var taskParams = new Dictionary<string, object>
         {
-            type = "image_to_model",
-            file = new { type = "png", file_token = fileToken },
-            model_version   = "default",
-            face_limit      = 10000,       // bare minimum for testing
-            texture          = true,        // need texture for visual demo
-            pbr              = enablePBR,    // PBR maps for metallic/shiny objects (costs more credits)
-            auto_size        = true
-        });
+            { "type",            "image_to_model" },
+            { "file",            new { type = "png", file_token = fileToken } },
+            { "model_version",   modelVer },
+            { "face_limit",      faceLimit },
+            { "texture",         true },
+            { "texture_quality", texQuality },
+            { "pbr",             usePBR },
+            { "auto_size",       true }
+        };
+
+        // geometry_quality "detailed" (Ultra Mode) only supported on v3.0+
+        if (_tripoHighQuality)
+            taskParams["geometry_quality"] = "detailed";
+
+        string body = JsonConvert.SerializeObject(taskParams);
+        Debug.Log($"[ARIA] Tripo task: {modelVer}, {faceLimit} faces, tex={texQuality}, pbr={usePBR}");
 
         using var req = new UnityWebRequest("https://api.tripo3d.ai/v2/openapi/task", "POST");
         req.uploadHandler   = new UploadHandlerRaw(Encoding.UTF8.GetBytes(body));

@@ -94,6 +94,12 @@ Runtime Systems:
 - **Annotated capture** — Claude sees virtual objects + anchor labels + gaze dot for spatial context
 - **Scale factor capped** — Claude's adjustments bounded by canonical real-world dimensions
 
+### 3D Generation Quality Toggle
+- **Standard mode** — Tripo v2.5, 10k polygons, standard textures, no PBR (lowest credit cost)
+- **High Quality mode** — Tripo v3.1, 30k polygons, detailed textures, Ultra geometry, PBR maps (2-3x credits)
+- Toggle via UI button — current settings displayed in ARIA Log panel
+- Quest 3 safe: 2-3 objects at 30k faces = 90k total triangles, well within mobile GPU budget
+
 ### Quest 3 Platform
 - VR Canvas UI with gaze pointer (Y to toggle, trigger to click)
 - Passthrough camera for room capture + lighting estimation
@@ -114,7 +120,7 @@ Runtime Systems:
 | Lighting | Manual light spheres + passthrough color sampling |
 | Spatial reasoning | Claude API (claude-sonnet-4-6, multimodal vision) |
 | Image generation | Gemini 2.5 Flash |
-| 3D generation | Tripo3D (GLB mesh with textures) |
+| 3D generation | Tripo3D v2.5/v3.1 (GLB, standard/detailed quality toggle) |
 | Runtime GLB loading | GLTFast 6.18 |
 | Voice input | Meta Voice SDK (Wit.ai, one-shot mode) |
 | Interaction | Controller grip grab + ARIAInteractable (gravity/wall snap) |
