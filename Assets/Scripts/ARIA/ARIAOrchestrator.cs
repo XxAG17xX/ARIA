@@ -244,7 +244,13 @@ public class ARIAOrchestrator : MonoBehaviour
         // Set the anchor and all its children (EffectMesh-generated MeshCollider objects) to GlobalMesh layer
         SetLayerRecursive(globalMeshAnchor.gameObject, globalMeshLayer);
         int count = globalMeshAnchor.GetComponentsInChildren<MeshCollider>().Length;
-        Debug.Log($"[ARIA] Global Mesh assigned to layer {globalMeshLayer} — {count} MeshCollider(s) found.");
+
+        // Hide Global Mesh renderers on startup — user toggles with "Toggle Global Mesh" button.
+        // EffectMesh defaults hideMesh=false so the Global Mesh starts visible (solid cyan).
+        foreach (var r in globalMeshAnchor.GetComponentsInChildren<MeshRenderer>())
+            r.enabled = false;
+
+        Debug.Log($"[ARIA] Global Mesh assigned to layer {globalMeshLayer} — {count} MeshCollider(s). Renderers hidden (toggle to show).");
     }
 
     private static void SetLayerRecursive(GameObject go, int layer)
@@ -480,18 +486,17 @@ public class ARIAOrchestrator : MonoBehaviour
         var tempObjects = new List<GameObject>();
 
         // Hide EffectMesh wireframe during capture — blue wireframe confuses Claude
-        // Anchor labels provide spatial info instead
+        // Use the DebugUI's state (not effectMesh.HideMesh which we no longer control)
         var effectMesh = FindFirstObjectByType<Meta.XR.MRUtilityKit.EffectMesh>();
-        bool wasWireframeVisible = false;
+        var debugUI = GetComponent<ARIADebugUI>();
+        bool wasWireframeVisible = debugUI != null && !debugUI.IsEffectMeshHidden;
+        bool wasGlobalMeshVisible = debugUI != null && debugUI.IsGlobalMeshVisible;
+
         if (effectMesh != null)
         {
-            wasWireframeVisible = !effectMesh.HideMesh;
-            if (wasWireframeVisible)
-            {
-                foreach (Transform child in effectMesh.transform)
-                    child.gameObject.SetActive(false);
-                effectMesh.HideMesh = true;
-            }
+            // Hide ALL EffectMesh visuals for clean capture
+            var hideAllFilter = new LabelFilter(~(MRUKAnchor.SceneLabels)0); // match nothing
+            effectMesh.ToggleEffectMeshVisibility(false); // hide everything
         }
 
         try
@@ -576,12 +581,24 @@ public class ARIAOrchestrator : MonoBehaviour
             foreach (var go in tempObjects)
                 if (go != null) Destroy(go);
 
-            // Restore wireframe if it was visible before capture
-            if (wasWireframeVisible && effectMesh != null)
+            // Restore wireframe + Global Mesh to whatever state user had before capture
+            if (effectMesh != null)
             {
-                foreach (Transform child in effectMesh.transform)
-                    child.gameObject.SetActive(true);
-                effectMesh.HideMesh = false;
+                if (wasWireframeVisible)
+                {
+                    // Restore anchor wireframe (excluding Global Mesh)
+                    var filter = new LabelFilter(~MRUKAnchor.SceneLabels.GLOBAL_MESH);
+                    effectMesh.ToggleEffectMeshVisibility(true, filter);
+                }
+
+                // Restore Global Mesh visibility independently
+                var room = MRUK.Instance?.GetCurrentRoom();
+                var gma = room?.GetGlobalMeshAnchor();
+                if (gma != null)
+                {
+                    foreach (var r in gma.GetComponentsInChildren<MeshRenderer>())
+                        r.enabled = wasGlobalMeshVisible;
+                }
             }
         }
     }

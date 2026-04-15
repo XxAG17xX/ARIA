@@ -222,23 +222,19 @@ public class ARIADebugUI : MonoBehaviour
                 if (Mathf.Abs(scrollInput) > 0.2f)
                 {
                     _logScrollOffset += scrollInput * Time.deltaTime * 800f;
-                    _logScrollOffset = Mathf.Max(0f, _logScrollOffset); // can't scroll above top
+                    _logScrollOffset = Mathf.Max(0f, _logScrollOffset);
                     _logScrollDirty = true;
                 }
             }
 
-            // Update log text + apply scroll offset within clipped viewport
+            // Update log text when content changes or scroll moves
             if (_logText.text != _claudeLog || _logScrollDirty)
             {
                 _logScrollDirty = false;
                 if (_logText.text != _claudeLog)
                     _logText = RemakeLabel(_logText, _claudeLog);
-                // Move text down inside viewport = scroll up (text anchored to top)
-                var logRT = _logText.GetComponent<RectTransform>();
-                logRT.anchorMin = new Vector2(0.5f, 1f);
-                logRT.anchorMax = new Vector2(0.5f, 1f);
-                logRT.pivot = new Vector2(0.5f, 1f);
-                logRT.anchoredPosition = new Vector2(0f, _logScrollOffset);
+                // ALWAYS re-apply top anchoring + scroll (RemakeLabel resets to default center anchors)
+                FixLogTextAnchoring(_logScrollOffset);
             }
         }
 
@@ -811,7 +807,12 @@ public class ARIADebugUI : MonoBehaviour
                     Vector3 lookDir = (cam.transform.position - logPos).normalized;
                     lookDir.y = 0;
                     _logCanvasGO.transform.rotation = Quaternion.LookRotation(-lookDir);
-                    if (_logText != null) _logText = RemakeLabel(_logText, _claudeLog);
+                    if (_logText != null)
+                    {
+                        _logScrollOffset = 0f; // reset scroll to top when menu opens
+                        _logText = RemakeLabel(_logText, _claudeLog);
+                        FixLogTextAnchoring(0f);
+                    }
                 }
             }
         }
@@ -1225,33 +1226,44 @@ public class ARIADebugUI : MonoBehaviour
         }
     }
 
+    /// <summary>
+    /// Fixes log text RectTransform after RemakeLabel (which resets to default center anchors).
+    /// Anchors to top of viewport, applies scroll offset.
+    /// </summary>
+    private void FixLogTextAnchoring(float scrollOffset)
+    {
+        if (_logText == null) return;
+        var rt = _logText.GetComponent<RectTransform>();
+        rt.anchorMin = new Vector2(0.5f, 1f);
+        rt.anchorMax = new Vector2(0.5f, 1f);
+        rt.pivot = new Vector2(0.5f, 1f);
+        rt.sizeDelta = new Vector2(480, 4000);
+        rt.anchoredPosition = new Vector2(0f, scrollOffset);
+    }
+
     private bool _effectMeshHidden;
+    public bool IsEffectMeshHidden => _effectMeshHidden;
 
     private void ToggleEffectMesh()
     {
         _effectMeshHidden = !_effectMeshHidden;
 
-        // Get Global Mesh anchor so we can SKIP it (independent toggle)
-        var room = MRUK.Instance?.GetCurrentRoom();
-        var globalMeshAnchor = room?.GetGlobalMeshAnchor();
-
         var effectMesh = FindFirstObjectByType<Meta.XR.MRUtilityKit.EffectMesh>();
         if (effectMesh != null)
         {
-            foreach (Transform child in effectMesh.transform)
-            {
-                // Skip Global Mesh children — they have their own toggle
-                if (globalMeshAnchor != null && child.IsChildOf(globalMeshAnchor.transform))
-                    continue;
-                child.gameObject.SetActive(!_effectMeshHidden);
-            }
-            effectMesh.HideMesh = _effectMeshHidden;
+            // Use EffectMesh's own API with a LabelFilter that EXCLUDES Global Mesh.
+            // ~GLOBAL_MESH = everything EXCEPT GLOBAL_MESH.
+            // EffectMesh renderers are parented to each anchor (not to EffectMesh GO),
+            // so GetComponentsInChildren won't find them — must use the official API.
+            var filter = new LabelFilter(~MRUKAnchor.SceneLabels.GLOBAL_MESH);
+            effectMesh.ToggleEffectMeshVisibility(!_effectMeshHidden, filter);
         }
 
         SetStatus(_effectMeshHidden ? "Room wireframe OFF" : "Room wireframe ON");
     }
 
     private bool _globalMeshVisible;
+    public bool IsGlobalMeshVisible => _globalMeshVisible;
     private Material _globalMeshWireframeMat;
 
     private void ToggleGlobalMesh()
