@@ -81,6 +81,14 @@ public class ARIAInteractable : MonoBehaviour
 
     public bool IsGrabbed => _isGrabbed;
 
+    // called by orchestrator after Claude adjustment changes position/scale.
+    // triggers gravity so the object settles naturally on the Global Mesh.
+    public void TriggerGravitySettle()
+    {
+        if (_isGrabbed) return; // don't mess with grabbed objects
+        ApplyGravityDrop();
+    }
+
     // ── Floor items: fall with gravity, resize on landing ──────────────
 
     private void ApplyGravityDrop()
@@ -101,7 +109,7 @@ public class ARIAInteractable : MonoBehaviour
         _settleCoroutine = StartCoroutine(WaitForSettle());
     }
 
-    private IEnumerator WaitForSettle()
+    public IEnumerator WaitForSettle()
     {
         yield return new WaitForSeconds(settleDelay);
 
@@ -137,13 +145,11 @@ public class ARIAInteractable : MonoBehaviour
             MRUKAnchor landedOn = _placementEngine.DetectSurfaceBelow(transform.position);
 
             // Snap Y to the ACTUAL surface (GlobalMesh or EnvironmentRaycast) not just the anchor plane.
-            // This ensures objects rest on real geometry (books, boxes, clutter) not flat anchor planes.
             float actualSurfaceY = landedOn?.transform.position.y ?? 0f;
             int globalMeshLayer = LayerMask.GetMask("GlobalMesh");
             Vector3 rayOrigin = transform.position + Vector3.up * 0.5f;
             if (Physics.Raycast(rayOrigin, Vector3.down, out RaycastHit meshHit, 2f, globalMeshLayer))
             {
-                // GlobalMesh hit — use its Y (higher than anchor = clutter surface)
                 actualSurfaceY = Mathf.Max(actualSurfaceY, meshHit.point.y);
             }
 

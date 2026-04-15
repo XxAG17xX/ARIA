@@ -393,8 +393,11 @@ public class ARIAOrchestrator : MonoBehaviour
         ARIADebugUI.AppendClaudeLog($"VOICE: \"{transcript}\"\nAnchors: {_anchorRegistry.Count} ({string.Join(", ", _anchorRegistry.Keys)})");
 
         // Capture annotated view — passthrough + wireframe + anchor labels + gaze crosshair
-        SetStatus("Capturing annotated view...");
-        byte[] jpeg = await CaptureAnnotatedViewAsync();
+        // clean capture — no anchor labels, just passthrough + virtual objects + gaze dot.
+        // Claude identifies surfaces from MRUK JSON data (positions, dimensions, screen_position)
+        // + gaze direction, not from visual labels which confuse it into wrong anchor_ids.
+        SetStatus("Capturing view...");
+        byte[] jpeg = await CaptureCleanViewAsync();
         ARIADebugUI.AppendClaudeLog($"IMAGE: {(jpeg != null ? jpeg.Length / 1024 + "KB" : "null")}");
 
         SetStatus("Asking Claude...");
@@ -523,6 +526,68 @@ public class ARIAOrchestrator : MonoBehaviour
     /// Creates temporary TextMesh labels at each MRUK anchor position, renders
     /// the scene, then destroys them. Claude sees labeled surfaces in the image.
     /// </summary>
+    // clean capture for adjustment — only gaze dot, no anchor labels.
+    // labels confuse Claude into returning anchor_ids that override gaze placement.
+    private async Task<byte[]> CaptureCleanViewAsync()
+    {
+        Camera cam = Camera.main;
+        if (cam == null) return await CapturePassthroughFrameAsync();
+
+        var tempObjects = new List<GameObject>();
+
+        // hide wireframe + global mesh during capture
+        var effectMesh = FindFirstObjectByType<Meta.XR.MRUtilityKit.EffectMesh>();
+        var debugUI = GetComponent<ARIADebugUI>();
+        bool wasWireframeVisible = debugUI != null && !debugUI.IsEffectMeshHidden;
+        bool wasGlobalMeshVisible = debugUI != null && debugUI.IsGlobalMeshVisible;
+        if (effectMesh != null)
+            effectMesh.ToggleEffectMeshVisibility(false);
+
+        try
+        {
+            // only gaze dot — NO anchor labels
+            Ray gazeRay = new Ray(cam.transform.position, cam.transform.forward);
+            Vector3 crosshairPos = Vector3.zero;
+            Vector3 crosshairNormal = Vector3.up;
+            bool crosshairHit = false;
+
+            var envMgr = FindFirstObjectByType<Meta.XR.EnvironmentRaycastManager>();
+            if (envMgr != null && envMgr.Raycast(gazeRay, out var envHit, 10f))
+            { crosshairPos = envHit.point; crosshairNormal = envHit.normal; crosshairHit = true; }
+            else if (Physics.Raycast(gazeRay, out RaycastHit hit, 10f))
+            { crosshairPos = hit.point; crosshairNormal = hit.normal; crosshairHit = true; }
+
+            if (crosshairHit)
+            {
+                var dot = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+                dot.name = "GazeDot";
+                dot.transform.position = crosshairPos + crosshairNormal * 0.01f;
+                dot.transform.localScale = Vector3.one * 0.02f;
+                Destroy(dot.GetComponent<Collider>());
+                var shader = Shader.Find("Universal Render Pipeline/Unlit") ?? Shader.Find("Universal Render Pipeline/Lit");
+                if (shader != null) { var m = new Material(shader); m.color = Color.red; dot.GetComponent<Renderer>().material = m; }
+                tempObjects.Add(dot);
+            }
+
+            await Task.Yield();
+            return await CaptureRenderedViewAsync();
+        }
+        finally
+        {
+            foreach (var go in tempObjects) if (go != null) Destroy(go);
+            if (effectMesh != null)
+            {
+                if (wasWireframeVisible)
+                { var filter = new LabelFilter(~MRUKAnchor.SceneLabels.GLOBAL_MESH); effectMesh.ToggleEffectMeshVisibility(true, filter); }
+                var room = MRUK.Instance?.GetCurrentRoom();
+                var gma = room?.GetGlobalMeshAnchor();
+                if (gma != null)
+                    foreach (var r in gma.GetComponentsInChildren<MeshRenderer>()) r.enabled = wasGlobalMeshVisible;
+            }
+        }
+    }
+
+    // full annotated capture for main pipeline — anchor labels + gaze dot + virtual objects
     private async Task<byte[]> CaptureAnnotatedViewAsync()
     {
         Camera cam = Camera.main;
@@ -802,25 +867,41 @@ public class ARIAOrchestrator : MonoBehaviour
             });
         }
 
+        // tell Claude which anchor the gaze is on (or above)
+        string gazeAnchorInfo = "";
+        if (_commandGazeValid && _commandGazeAnchor != null)
+        {
+            var pe = placementEngine;
+            bool isClutter = pe != null && pe.IsPointOnClutter(_commandGazeHitPoint, _commandGazeAnchor);
+            gazeAnchorInfo = $"Gaze hits: {_commandGazeAnchor.name}" +
+                (isClutter ? " (on clutter/real object ABOVE this anchor's surface)" : " (on the anchor surface itself)") +
+                $" at world pos ({_commandGazeHitPoint.x:F2}, {_commandGazeHitPoint.y:F2}, {_commandGazeHitPoint.z:F2})\n";
+        }
+
         content.Add(new
         {
             type = "text",
             text = $"Room layout:\n{mrukJson}\n\n" +
                    $"User position: ({userPos.x:F2}, {userPos.y:F2}, {userPos.z:F2})\n" +
                    $"Gaze direction: ({gazeFwd.x:F2}, {gazeFwd.y:F2}, {gazeFwd.z:F2})\n" +
-                   "RED DOT = EnvironmentRaycast hit (where user is pointing).\n" +
-                   "YELLOW LABELS = anchor IDs matching room JSON.\n\n" +
+                   $"{gazeAnchorInfo}" +
+                   "RED DOT in the image = where user is pointing (EnvironmentRaycast hit on real surface).\n" +
+                   "The object MUST spawn at the red dot position. Use room JSON for anchor matching.\n\n" +
                    $"User command: \"{voiceCommand}\""
         });
 
         string systemPrompt = "You are ARIA's spatial AI for Meta Quest 3. Return ONLY a JSON array.\n" +
             "Generate ONLY what the user asked for. Max 4 objects.\n" +
-            "RED DOT = where user is looking. Use for 'here/there/that wall'.\n" +
+            "RED DOT = where user is pointing. The system places objects AT that exact point.\n" +
+            "You do NOT need to specify anchor_id or surface_label — the code handles placement from the gaze point.\n" +
             "Objects must fit target surface (check size_metres in room JSON).\n\n" +
-            "Each object: {prompt, surface_label, anchor_id, near_anchor_id, " +
+            "placement_target decides HOW to place:\n" +
+            "- 'on_clutter': place ON whatever real object is at the red dot (book, box, suitcase)\n" +
+            "- 'excluding_clutter': place on clear surface BESIDE whatever is at the red dot\n" +
+            "- 'anchor': place at the red dot on the surface itself (floor, wall, table)\n\n" +
+            "Each object: {prompt (detailed image-gen description), " +
             "height_metres, width_metres, depth_metres, category, " +
-            "placement_target (on_clutter/excluding_clutter/anchor), reuse_cached (bool), " +
-            "emits_light, light_type, light_color, light_intensity, light_range, light_offset}";
+            "placement_target, reuse_cached (bool, true only if user wants exact same object again)}";
 
         string body = JsonConvert.SerializeObject(new
         {
@@ -1005,7 +1086,8 @@ public class ARIAOrchestrator : MonoBehaviour
                    $"=== USER STATE ===\n" +
                    $"Position in room: ({userPosition.x:F2}, {userPosition.y:F2}, {userPosition.z:F2}) metres\n" +
                    $"Gaze direction: ({gazeDirection.x:F2}, {gazeDirection.y:F2}, {gazeDirection.z:F2})\n" +
-                   $"The IMAGE CENTER is exactly where the user is looking.\n\n" +
+                   $"RED DOT = EnvironmentRaycast hit (where user is pointing at real surface).\n" +
+                   $"The object should move to the red dot position when user says 'here/there/this'.\n\n" +
                    $"=== VIRTUAL OBJECT TO PLACE ===\n" +
                    $"Object: \"{original.category}\"\n" +
                    $"Current world size: {original.height_metres:F2}m H x {original.width_metres:F2}m W x {original.depth_metres:F2}m D\n" +
@@ -1063,23 +1145,26 @@ public class ARIAOrchestrator : MonoBehaviour
                    "   - If user says 'put it on the table' → 'excluding_clutter' (clear spot on table)\n" +
                    "   - If user just says size/position change → 'anchor' (no relocation)\n\n" +
                    "Return JSON ONLY:\n" +
-                   "{\"surface_label\": \"TABLE\", \"anchor_id\": \"TABLE_0\", \"scale_factor\": 1.0, " +
-                   "\"position_offset\": [0, 0, 0], \"placement_target\": \"anchor\", \"category\": \"lamp\", " +
-                   "\"reasoning\": \"User asked to move to the table, placing on clear spot\"}"
+                   "{\"scale_factor\": 1.0, \"position_offset\": [0, 0, 0], " +
+                   "\"placement_target\": \"on_clutter\", \"category\": \"lamp\", " +
+                   "\"reasoning\": \"short reason\"}"
         });
 
         string body = JsonConvert.SerializeObject(new
         {
             model = "claude-sonnet-4-6",
             max_tokens = 2048,
-            system = "You are the spatial reasoning AI for ARIA on Meta Quest 3. " +
-                     "CRITICAL RULES:\n" +
-                     "1. Voice command is PRIMARY. 'move up 20cm' → offset [0,0.2,0], do NOT relocate to gaze.\n" +
-                     "2. Gaze dot only resolves 'that/this/there/here' references.\n" +
-                     "3. Only change surface_label/anchor_id if user explicitly wants to RELOCATE.\n" +
-                     "4. KEEP YOUR REASONING SHORT. Do NOT write lengthy analysis. Just the key decision and the JSON.\n" +
-                     "5. Return ONLY valid JSON — no markdown fences, no extra text before/after the JSON object.\n" +
-                     "Return: {surface_label, anchor_id, scale_factor, position_offset:[x,y,z], placement_target, category, reasoning}",
+            system = "You are ARIA's adjustment AI on Meta Quest 3. Return ONLY valid JSON.\n" +
+                     "RULES:\n" +
+                     "1. Voice command is PRIMARY. 'move up 20cm' → offset [0,0.2,0].\n" +
+                     "2. RED DOT = where user is pointing. 'put it there/here' → on_clutter (system places at red dot).\n" +
+                     "3. You do NOT need anchor_id or surface_label — the code handles placement from gaze.\n" +
+                     "4. Keep reasoning SHORT.\n\n" +
+                     "placement_target:\n" +
+                     "- 'on_clutter': RELOCATE object to the red dot point (on whatever surface/object is there)\n" +
+                     "- 'excluding_clutter': RELOCATE to clear surface near red dot (avoiding real objects)\n" +
+                     "- 'anchor': NO relocation — just apply scale_factor and position_offset\n\n" +
+                     "Return: {scale_factor, position_offset:[x,y,z], placement_target, category, reasoning}",
             messages = new[] { new { role = "user", content } }
         });
 
@@ -1681,24 +1766,9 @@ public class ARIAOrchestrator : MonoBehaviour
                 placementEngine?.FitToAvailableSpace(root, fitRoom);
         }
 
-        // FitToSurface: size to anchor boundary (works for both clutter and standard)
-        {
-            MRUKAnchor fitAnchor = GetAnchorById(instr.anchor_id);
-            if (fitAnchor == null)
-                fitAnchor = placementEngine?.DetectSurfaceBelow(root.transform.position);
-            if (fitAnchor == null && placementEngine != null)
-                fitAnchor = placementEngine.IdentifyAnchorAtPoint(root.transform.position);
-
-            if (fitAnchor != null)
-            {
-                Vector3 preFitPos = root.transform.position;
-                placementEngine?.FitToSurface(root, fitAnchor, instr.category);
-                // always restore position after FitToSurface — it only needs to change scale.
-                // FitToSurface snaps Y to the anchor surface, but we want the gaze point Y.
-                if (_commandGazeValid || pipelineOnClutter)
-                    root.transform.position = preFitPos;
-            }
-        }
+        // NO FitToSurface during pipeline spawn — Claude/user decides the size.
+        // FitToSurface only runs on grab-release (WaitForSettle in ARIAInteractable)
+        // so the user can resize freely and the auto-fit only kicks in when they drop it.
 
         // Lighting + interaction setup
         if (instr.emits_light) AddVirtualLight(root, instr);
@@ -1945,15 +2015,10 @@ public class ARIAOrchestrator : MonoBehaviour
 
         // Physics + interaction
         // Clutter-placed objects get ClutterItem category (no rotation snap on settle)
-        // Classification priority:
-        // 1. If the ORIGINAL surfaceLabel says WALL_FACE (demo wall art button) → WallItem
-        // 2. If placed on Global Mesh clutter on a wall → WallItem (wall-snap on release)
-        // 3. If placed on Global Mesh clutter on horizontal surface → ClutterItem (gravity, no rotation snap)
-        // 4. Otherwise → use original surfaceLabel (FLOOR → FloorItem, etc.)
+        // demo buttons have explicit surfaceLabel (FLOOR for lamp/bed, WALL_FACE for painting).
+        // that label is the truth — don't override it based on where the gaze happened to land.
+        // only reclassify for pipeline objects where Claude didn't set a clear surface intent.
         string effectiveSurfaceLabel = surfaceLabel;
-        if (usedGlobalMesh && !surfaceLabel.Equals("WALL_FACE", StringComparison.OrdinalIgnoreCase))
-            effectiveSurfaceLabel = (gazeAnchor != null && SemanticPlacementEngine.IsWallLikeAnchor(gazeAnchor))
-                ? "WALL_FACE" : "CLUTTER";
         if (enablePhysics) AddPhysicsAndInteraction(root, category, effectiveSurfaceLabel);
 
         // Reflection probe
@@ -1993,10 +2058,11 @@ public class ARIAOrchestrator : MonoBehaviour
         string objName = lastSpawn.name;
 
         SetStatus($"Capturing scene for Claude...");
-        // Annotated view: passthrough + virtual objects + anchor labels + gaze crosshair
-        // So Claude can see what's already spawned and where anchors are
+        // for adjustment: capture WITHOUT anchor labels — they confuse Claude into returning
+        // anchor_ids that override the gaze point. the gaze dot + image + MRUK JSON text is enough.
+        // Claude sees what's there visually, gaze dot shows WHERE, JSON gives dimensions.
         string mrukJson = SerializeMRUKData();
-        byte[] jpeg = await CaptureAnnotatedViewAsync();
+        byte[] jpeg = await CaptureCleanViewAsync();
         if (jpeg == null)
         {
             SetStatus("Image capture failed.");
@@ -2156,6 +2222,31 @@ public class ARIAOrchestrator : MonoBehaviour
 
         SetStatus($"Claude: {objName} → {placementTarget}, scale {scaleFactor:F2}x. {reasoning}");
         Debug.Log($"[ARIA] Claude adjustment: target={placementTarget}, surface={surface}, scale={scaleFactor:F2}x, reason={reasoning}");
+
+        // after any position/scale change, trigger gravity settle for floor/clutter objects
+        // so they land naturally on the Global Mesh. wall objects skip (they wall-snap).
+        var postInteractable = lastSpawn.GetComponent<ARIAInteractable>();
+        if (postInteractable != null && (didRelocate || Mathf.Abs(scaleFactor - 1f) > 0.05f))
+        {
+            if (postInteractable.category == SurfaceCategory.FloorItem ||
+                postInteractable.category == SurfaceCategory.ClutterItem)
+            {
+                // check if there's Global Mesh below — if not (new object after scan), stay kinematic
+                int gmLayer = LayerMask.GetMask("GlobalMesh");
+                bool hasGlobalMeshBelow = Physics.Raycast(lastSpawn.position, Vector3.down, 5f, gmLayer);
+
+                if (hasGlobalMeshBelow)
+                {
+                    // trigger the same gravity drop that happens on grab-release
+                    postInteractable.TriggerGravitySettle();
+                    Debug.Log($"[ARIA] Gravity settle triggered for {objName}");
+                }
+                else
+                {
+                    Debug.Log($"[ARIA] No Global Mesh below {objName} — staying kinematic (new surface after scan)");
+                }
+            }
+        }
     }
 
     // -------------------------------------------------------------------------
