@@ -236,13 +236,17 @@ public class ARIADebugUI : MonoBehaviour
             }
         }
 
-        // Crosshair + pointer: EnvironmentRaycast when menu hidden, Physics.Raycast when menu visible
+        // Crosshair + pointer logic:
+        // - Menu open + main panel visible → UpdateGazePointer (buttons hover/click)
+        // - Menu open + countdown showing → UpdateAlwaysOnCrosshair (crosshair follows gaze for placement)
+        // - Menu closed → UpdateAlwaysOnCrosshair (EnvironmentRaycast for real-world surface)
         if (IsRunningOnQuest())
         {
-            if (_menuVisible && _vrCanvas != null)
-                UpdateGazePointer(); // Physics.Raycast for button hover/click — also moves reticle onto buttons
+            bool countdownShowing = _countdownActive || _waitingForVoice;
+            if (_menuVisible && _vrCanvas != null && !countdownShowing)
+                UpdateGazePointer();
             else
-                UpdateAlwaysOnCrosshair(); // EnvironmentRaycast for real-world surface detection
+                UpdateAlwaysOnCrosshair();
         }
 
         if (!_countdownActive) return;
