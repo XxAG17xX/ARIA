@@ -164,7 +164,28 @@ public class ARIAOrchestrator : MonoBehaviour
 
     private void EnableOcclusion()
     {
-        // Try the template OcclusionManager first
+        // Quest 3 depth-based occlusion via EnvironmentDepthManager
+        // This occludes virtual objects behind ANY real-world surface the depth sensor sees
+        // (books, chairs, hands — not just anchor boxes). Uses the same depth sensor as EnvironmentRaycastManager.
+        var depthMgr = FindFirstObjectByType<Meta.XR.EnvironmentDepth.EnvironmentDepthManager>(FindObjectsInactive.Include);
+        if (depthMgr == null)
+        {
+            // Auto-create EnvironmentDepthManager for occlusion
+            depthMgr = new GameObject("ARIA_DepthManager").AddComponent<Meta.XR.EnvironmentDepth.EnvironmentDepthManager>();
+            Debug.Log("[ARIA] EnvironmentDepthManager auto-created for occlusion.");
+        }
+
+        if (depthMgr != null)
+        {
+            depthMgr.enabled = true;
+            // Enable occlusion mode — this makes URP shaders use the depth texture for occlusion
+            depthMgr.OcclusionShadersMode = Meta.XR.EnvironmentDepth.OcclusionShadersMode.SoftOcclusion;
+            depthMgr.RemoveHands = true; // hands shouldn't occlude (user needs to see through them)
+            Debug.Log($"[ARIA] Depth occlusion enabled: {depthMgr.OcclusionShadersMode}, RemoveHands={depthMgr.RemoveHands}");
+            return;
+        }
+
+        // Fallback: try template OcclusionManager
         var occMgr = FindFirstObjectByType<UnityEngine.XR.Templates.MR.OcclusionManager>();
         if (occMgr != null)
         {
@@ -174,7 +195,7 @@ public class ARIAOrchestrator : MonoBehaviour
             return;
         }
 
-        // Fallback: enable AROcclusionManager directly
+        // Fallback: AROcclusionManager
         var arocc = FindFirstObjectByType<UnityEngine.XR.ARFoundation.AROcclusionManager>();
         if (arocc != null)
         {
@@ -337,11 +358,33 @@ public class ARIAOrchestrator : MonoBehaviour
     /// Called by VoiceSDKConnector (subscribes to AppVoiceExperience.VoiceEvents.OnFullTranscription)
     /// or directly from ARIADebugUI in editor.
     /// </summary>
+    // Gaze state captured at voice command time — used for placement AFTER Tripo finishes
+    // (1-2 minutes later the user is looking somewhere else)
+    private Vector3 _commandGazeHitPoint;
+    private Vector3 _commandGazeHitNormal = Vector3.up;
+    private MRUKAnchor _commandGazeAnchor;
+    private bool _commandGazeValid;
+
     public async void ProcessVoiceCommand(string transcript)
     {
         Debug.Log($"[ARIA] Voice command: \"{transcript}\"");
-        _lastUserCommand = transcript; // save for Claude adjustment context
+        _lastUserCommand = transcript;
         SetStatus("Capturing room...");
+
+        // SAVE gaze state NOW — by the time Tripo finishes (1-2 min), user is looking elsewhere
+        var debugUI = GetComponent<ARIADebugUI>();
+        if (debugUI != null && debugUI.LastGazeHitValid)
+        {
+            _commandGazeHitPoint = debugUI.LastGazeHitPoint;
+            _commandGazeHitNormal = debugUI.LastGazeHitNormal;
+            _commandGazeAnchor = debugUI.LastGazeAnchor;
+            _commandGazeValid = true;
+            Debug.Log($"[ARIA] Gaze saved at command time: ({_commandGazeHitPoint.x:F2},{_commandGazeHitPoint.y:F2},{_commandGazeHitPoint.z:F2})");
+        }
+        else
+        {
+            _commandGazeValid = false;
+        }
 
         // Serialize MRUK room data first (populates _anchorRegistry for labels)
         string mrukJson = SerializeMRUKData();
@@ -739,96 +782,104 @@ public class ARIAOrchestrator : MonoBehaviour
     private async Task<List<PlacementInstruction>> CallClaudeAsync(
         byte[] jpeg, string mrukJson, string voiceCommand)
     {
+        // Built exactly like CallClaudeAdjustmentAsync (which works on Quest) —
+        // same variable patterns, same request structure.
+        Camera cam = Camera.main;
+        Vector3 userPos = cam != null ? cam.transform.position : Vector3.zero;
+        Vector3 gazeFwd = cam != null ? cam.transform.forward : Vector3.forward;
+
         var content = new List<object>();
 
         if (jpeg != null)
         {
             content.Add(new
             {
-                type   = "image",
-                source = new { type = "base64", media_type = "image/jpeg", data = Convert.ToBase64String(jpeg) }
+                type = "image",
+                source = new { type = "base64", media_type = "image/jpeg",
+                               data = Convert.ToBase64String(jpeg) }
             });
         }
 
         content.Add(new
         {
             type = "text",
-            text = $"Room layout (each surface has a unique ID matching labels in the image):\n{mrukJson}\n\n" +
-                   $"The RED DOT in the image marks where the user is currently looking (gaze crosshair).\n\n" +
-                   $"User command: {voiceCommand}"
+            text = $"Room layout:\n{mrukJson}\n\n" +
+                   $"User position: ({userPos.x:F2}, {userPos.y:F2}, {userPos.z:F2})\n" +
+                   $"Gaze direction: ({gazeFwd.x:F2}, {gazeFwd.y:F2}, {gazeFwd.z:F2})\n" +
+                   "RED DOT = EnvironmentRaycast hit (where user is pointing).\n" +
+                   "YELLOW LABELS = anchor IDs matching room JSON.\n\n" +
+                   $"User command: \"{voiceCommand}\""
         });
+
+        string systemPrompt = "You are ARIA's spatial AI for Meta Quest 3. Return ONLY a JSON array.\n" +
+            "Generate ONLY what the user asked for. Max 4 objects.\n" +
+            "RED DOT = where user is looking. Use for 'here/there/that wall'.\n" +
+            "Objects must fit target surface (check size_metres in room JSON).\n\n" +
+            "Each object: {prompt, surface_label, anchor_id, near_anchor_id, " +
+            "height_metres, width_metres, depth_metres, category, " +
+            "placement_target (on_clutter/excluding_clutter/anchor), reuse_cached (bool), " +
+            "emits_light, light_type, light_color, light_intensity, light_range, light_offset}";
 
         string body = JsonConvert.SerializeObject(new
         {
-            model      = "claude-sonnet-4-6",
+            model = "claude-sonnet-4-6",
             max_tokens = 2048,
-            system     = "You are a spatial interior design AI for mixed reality. Respond with valid JSON only. No explanation.\n\n" +
-                         "OBJECT SELECTION RULES:\n" +
-                         "- Generate ONLY the objects the user explicitly asked for. Do NOT add extra items.\n" +
-                         "- If the user says 'a bed', return exactly 1 object. 'a lamp and a table' = 2 objects.\n" +
-                         "- ONLY placeable 3D furniture/objects. NOT floors, walls, ceilings, rugs, curtains.\n" +
-                         "- Maximum 4 objects.\n\n" +
-                         "ANCHOR-AWARE PLACEMENT:\n" +
-                         "The image has YELLOW LABELS (e.g. WALL_0, WALL_1, TABLE_0, FLOOR_0) at each room surface.\n" +
-                         "A RED DOT shows where the user is looking (gaze crosshair).\n" +
-                         "The room JSON includes each anchor's 'id' matching these labels, plus 'screen_position' (0-1 viewport coords).\n" +
-                         "Use the crosshair position and labels to determine WHICH specific surface the user means.\n\n" +
-                         "DEICTIC REFERENCE RESOLUTION:\n" +
-                         "- 'that wall' / 'this wall' → the wall anchor nearest the crosshair/gaze\n" +
-                         "- 'the door' → the DOOR anchor visible near crosshair\n" +
-                         "- 'this corner' → two walls meeting near the crosshair; place objects on those walls and/or floor\n" +
-                         "- 'decorate it' / 'fill this space' → multiple objects on surfaces near the crosshair\n" +
-                         "- If no location specified, use the anchor nearest the crosshair\n\n" +
-                         "CONTEXTUAL REASONING:\n" +
-                         "- STYLE: Match the room's aesthetic from the image.\n" +
-                         "- COLOR/MATERIAL: Complement existing room colors. Don't clash.\n" +
-                         "- PLACEMENT: Consider existing objects to avoid overlap.\n\n" +
-                         "SIZING RULES (critical):\n" +
-                         "- ALWAYS check the target surface's size_metres in the room JSON before deciding dimensions.\n" +
-                         "- The object must FIT on its target surface. If a wall is 2.5m wide, a painting should be ≤1.0m wide.\n" +
-                         "- If a table is 0.8m × 0.6m, a vase on it should be ≤0.15m wide, not 0.5m.\n" +
-                         "- For FLOOR objects: use real-world furniture size but check the room has space. A bed in a 3m×3m room should be ~1.9m, not 2.5m.\n" +
-                         "- For WALL objects: painting/art should be proportional to the wall — roughly 30-50% of wall width, never more than 70%.\n" +
-                         "- For TABLE objects: must fit on the table surface with room to spare.\n" +
-                         "- Return the NATURAL real-world dimensions — the system will auto-shrink if still too big.\n\n" +
-                         "PROMPT FIELD: Detailed image-generation description (style, color, material, proportions).\n\n" +
-                         "Return a JSON array. Each element:\n" +
-                         "- prompt (string — detailed description for image generation)\n" +
-                         "- surface_label (string: FLOOR/WALL_FACE/CEILING/TABLE — the surface TYPE)\n" +
-                         "- anchor_id (string — specific anchor ID like 'WALL_2' or 'TABLE_0', from room JSON)\n" +
-                         "- near_anchor_id (string, optional — place near this anchor, e.g. 'on the floor near the door' → anchor_id='FLOOR_0', near_anchor_id='DOOR_0')\n" +
-                         "- height_metres (float — real-world height, must fit the target surface)\n" +
-                         "- width_metres (float — real-world width, must fit the target surface)\n" +
-                         "- depth_metres (float — real-world depth, must fit the target surface)\n" +
-                         "- category (string — object type, lowercase)\n" +
-                         "- emits_light (bool)\n" +
-                         "- light_type (string: 'point'/'spot', only if emits_light)\n" +
-                         "- light_color ([R,G,B] 0-1, only if emits_light)\n" +
-                         "- light_intensity (float, only if emits_light)\n" +
-                         "- light_range (float metres, only if emits_light)\n" +
-                         "- light_offset ([x,y,z] relative to root, only if emits_light)",
-            messages   = new[] { new { role = "user", content } }
+            system = systemPrompt,
+            messages = new[] { new { role = "user", content } }
         });
 
+        byte[] bodyBytes = Encoding.UTF8.GetBytes(body);
+        ARIADebugUI.AppendClaudeLog($"Sending to Claude: {bodyBytes.Length / 1024}KB...");
+        Debug.Log($"[ARIA] Claude request: {bodyBytes.Length / 1024}KB, key={(string.IsNullOrEmpty(_claudeKey) ? "EMPTY" : "OK")}");
+
         using var req = new UnityWebRequest("https://api.anthropic.com/v1/messages", "POST");
-        req.uploadHandler   = new UploadHandlerRaw(Encoding.UTF8.GetBytes(body));
+        req.uploadHandler = new UploadHandlerRaw(bodyBytes);
         req.downloadHandler = new DownloadHandlerBuffer();
-        req.timeout         = 30; // 30s — Claude rarely takes more than 10s
-        req.SetRequestHeader("x-api-key",         _claudeKey);
+        req.timeout = 30;
+        req.SetRequestHeader("x-api-key", _claudeKey);
         req.SetRequestHeader("anthropic-version", "2023-06-01");
-        req.SetRequestHeader("content-type",      "application/json");
+        req.SetRequestHeader("content-type", "application/json");
 
         await AwaitRequest(req.SendWebRequest());
 
+        ARIADebugUI.AppendClaudeLog($"Claude responded: {req.responseCode}");
+        Debug.Log($"[ARIA] Claude response: {req.result}, code={req.responseCode}");
+
         if (req.result != UnityWebRequest.Result.Success)
         {
-            Debug.LogError($"[ARIA] Claude error: {req.error}\n{req.downloadHandler.text}");
+            string errBody = req.downloadHandler?.text ?? "(no body)";
+            Debug.LogError($"[ARIA] Claude FAILED: {req.error} | {errBody}");
+            ARIADebugUI.AppendClaudeLog($"CLAUDE ERROR: {req.responseCode} {req.error}");
+            SetStatus($"Claude error: {req.responseCode}");
             return null;
         }
 
-        var    resp = JsonConvert.DeserializeObject<ClaudeResponse>(req.downloadHandler.text);
-        string json = StripCodeFences(resp.content[0].text);
-        return JsonConvert.DeserializeObject<List<PlacementInstruction>>(json);
+        try
+        {
+            var resp = JsonConvert.DeserializeObject<ClaudeResponse>(req.downloadHandler.text);
+            string claudeText = resp.content[0].text;
+            string json = StripCodeFences(claudeText);
+            Debug.Log($"[ARIA] Claude JSON: {json.Substring(0, Mathf.Min(200, json.Length))}...");
+            ARIADebugUI.AppendClaudeLog($"CLAUDE: {claudeText.Substring(0, Mathf.Min(150, claudeText.Length))}...");
+            // Skip individual field errors (e.g. Claude returns "#a0e8ff" for light_color
+            // instead of [0.63, 0.91, 1.0]) — don't kill the entire parse for one bad field.
+            var settings = new JsonSerializerSettings
+            {
+                Error = (sender, args) =>
+                {
+                    Debug.LogWarning($"[ARIA] JSON field skip: {args.ErrorContext.Path} — {args.ErrorContext.Error.Message}");
+                    args.ErrorContext.Handled = true; // skip this field, continue parsing
+                }
+            };
+            return JsonConvert.DeserializeObject<List<PlacementInstruction>>(json, settings);
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[ARIA] Claude parse error: {e.Message}");
+            ARIADebugUI.AppendClaudeLog($"PARSE ERROR: {e.Message}");
+            SetStatus($"Claude parse error");
+            return null;
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -873,7 +924,7 @@ public class ARIAOrchestrator : MonoBehaviour
         string body = JsonConvert.SerializeObject(new
         {
             model      = "claude-sonnet-4-6",
-            max_tokens = 1024,
+            max_tokens = 2048,
             system     = "You are refining a 3D object placement instruction after seeing its AI-generated reference image. " +
                          "Return valid JSON only. A single object (not an array). " +
                          "Keep all original fields. Only adjust dimensions/prompt if the reference image reveals a mismatch " +
@@ -904,7 +955,8 @@ public class ARIAOrchestrator : MonoBehaviour
             Debug.Log($"[ARIA] Claude response received ({req.downloadHandler.text.Length} chars)");
             var resp = JsonConvert.DeserializeObject<ClaudeResponse>(req.downloadHandler.text);
             string json = StripCodeFences(resp.content[0].text);
-            var refined = JsonConvert.DeserializeObject<PlacementInstruction>(json);
+            var skipErrors = new JsonSerializerSettings { Error = (s, e) => { e.ErrorContext.Handled = true; } };
+            var refined = JsonConvert.DeserializeObject<PlacementInstruction>(json, skipErrors);
 
             // Log what changed
             bool changed = false;
@@ -986,7 +1038,7 @@ public class ARIAOrchestrator : MonoBehaviour
                    "1. surface_label: FLOOR / WALL_FACE / TABLE / BED / COUCH / CEILING\n" +
                    "   - Keep the CURRENT surface unless user says to change it\n" +
                    "   - TABLE = desk, table, any horizontal elevated surface\n\n" +
-                   "2. scale_factor: SINGLE float (0.02 to 2.0) for UNIFORM resize\n" +
+                   "2. scale_factor: SINGLE float for UNIFORM resize (no upper limit — user can make it as big as they want)\n" +
                    "   - 1.0 = keep current size. Only change if user asks for size change.\n\n" +
                    "3. position_offset: [x, y, z] metres to MOVE the object from CURRENT position\n" +
                    "   - x = right(+)/left(-), y = up(+)/down(-), z = forward(+)/backward(-)\n" +
@@ -994,9 +1046,11 @@ public class ARIAOrchestrator : MonoBehaviour
                    "   - 'slide left a bit' → [-0.2, 0, 0]\n" +
                    "   - 'raise it higher' → [0, 0.3, 0]\n" +
                    "   - If NOT moving, set [0, 0, 0]\n\n" +
-                   "4. anchor_id: Only set if user wants to RELOCATE to a specific surface\n" +
+                   "4. anchor_id: ONLY set when user wants to RELOCATE. Set to null/omit for scale-only or offset-only changes.\n" +
                    "   - 'put it on that wall' → anchor_id = nearest wall anchor to red dot\n" +
-                   "   - 'move up 20cm' → keep current anchor_id or omit (NO relocation)\n\n" +
+                   "   - 'put it on the door' → anchor_id = DOOR_0\n" +
+                   "   - 'make it bigger' → anchor_id = null (NO relocation, just scale)\n" +
+                   "   - 'move up 20cm' → anchor_id = null, use position_offset instead\n\n" +
                    "5. placement_target: 'on_clutter', 'excluding_clutter', or 'anchor'\n" +
                    "   - 'on_clutter': user wants object ON a real-world object visible in the image (book, box, etc.)\n" +
                    "     The object will be placed on the Global Mesh surface at the red dot point.\n" +
@@ -1069,7 +1123,8 @@ public class ARIAOrchestrator : MonoBehaviour
             ARIADebugUI.AppendClaudeLog(responseLog);
 
             Debug.Log($"[ARIA] Adjustment JSON extracted ({json.Length} chars): {json.Substring(0, Mathf.Min(200, json.Length))}...");
-            var result = JsonConvert.DeserializeObject<PlacementInstruction>(json);
+            var skipErrors = new JsonSerializerSettings { Error = (s, e) => { e.ErrorContext.Handled = true; } };
+            var result = JsonConvert.DeserializeObject<PlacementInstruction>(json, skipErrors);
 
             // Log parsed fields for debugging
             Debug.Log($"[ARIA] Parsed: scale={result.scale_factor:F3}, target={result.placement_target}, " +
@@ -1096,12 +1151,15 @@ public class ARIAOrchestrator : MonoBehaviour
         var pipelineStart = DateTime.UtcNow;
         Debug.Log($"[ARIA] ═══ STARTING: {name} ═══");
 
-        // ── Cache hit: load from local file, zero API calls ─────────────────────
+        // ── Cache: only reuse when Claude explicitly says reuse_cached=true ──────
+        // (user said "same one again", "duplicate that", etc.)
+        // New requests ("give me a lamp", "another chair") always generate fresh.
         string cacheKey = name.ToLower().Trim();
-        if (_glbCache.TryGetValue(cacheKey, out string cachedPath) && File.Exists(cachedPath))
+        if (instr.reuse_cached && _glbCache.TryGetValue(cacheKey, out string cachedPath) && File.Exists(cachedPath))
         {
-            Debug.Log($"[ARIA] ✔ CACHE HIT for \"{name}\" — loading local GLB: {cachedPath}");
-            SetStatus($"Spawning from cache: {name}");
+            Debug.Log($"[ARIA] ✔ CACHE REUSE for \"{name}\" — user wants same object: {cachedPath}");
+            SetStatus($"Spawning cached: {name} (same as before)");
+            ARIADebugUI.AppendClaudeLog($"CACHE REUSE: {name} (user requested same object)");
             await SpawnFromLocalGlb(cachedPath, instr, jpeg);
             Debug.Log($"[ARIA] ═══ COMPLETE (cached): {name} ═══");
             return;
@@ -1543,7 +1601,8 @@ public class ARIAOrchestrator : MonoBehaviour
 
     private async Task SpawnFromGlbBytes(byte[] glbBytes, PlacementInstruction instr, byte[] jpeg)
     {
-        var root = new GameObject(instr.prompt);
+        // Use category for the name (short: "skull"), not prompt (long: "ornate crystal skull...")
+        var root = new GameObject(instr.category ?? instr.prompt);
         root.transform.SetParent(spawnRoot != null ? spawnRoot : transform);
 
         var  gltf = new GltfImport();
@@ -1569,25 +1628,31 @@ public class ARIAOrchestrator : MonoBehaviour
 
         if (placementTarget == "on_clutter" && placementEngine != null)
         {
-            // Claude said place ON clutter — use gaze EnvironmentRaycast for position
-            if (placementEngine.GazeRaycastGlobalMesh(out var clutterPt, out var clutterNm, out var clutterAnc))
+            // Use SAVED gaze from voice command time (not current gaze — user moved in 1-2 min)
+            if (_commandGazeValid)
             {
-                placementEngine.PlaceOnGlobalMesh(root, clutterPt, clutterNm);
+                placementEngine.PlaceOnGlobalMesh(root, _commandGazeHitPoint, _commandGazeHitNormal);
                 pipelineOnClutter = true;
-                Debug.Log($"[ARIA] Pipeline spawn ON CLUTTER: {instr.category}");
+                Debug.Log($"[ARIA] Pipeline ON CLUTTER at saved gaze ({_commandGazeHitPoint.x:F2},{_commandGazeHitPoint.y:F2},{_commandGazeHitPoint.z:F2})");
             }
             else
             {
-                // Fallback to standard if raycast fails
-                placementEngine?.Place(root, instr.surface_label, GetAnchorById(instr.anchor_id), GetAnchorById(instr.near_anchor_id));
+                // Fallback: try live raycast, then standard placement
+                if (placementEngine.GazeRaycastGlobalMesh(out var clutterPt, out var clutterNm, out _))
+                {
+                    placementEngine.PlaceOnGlobalMesh(root, clutterPt, clutterNm);
+                    pipelineOnClutter = true;
+                }
+                else
+                    placementEngine?.Place(root, instr.surface_label, GetAnchorById(instr.anchor_id), GetAnchorById(instr.near_anchor_id));
             }
         }
         else if (placementTarget == "excluding_clutter" && placementEngine != null)
         {
-            // Claude said avoid clutter — find clear spot on anchor
+            // Find clear spot — use saved gaze center, fall back to anchor center
             MRUKAnchor clearAnchor = GetAnchorById(instr.anchor_id);
-            if (clearAnchor == null && placementEngine.GazeRaycastGlobalMesh(out var gzPt, out _, out var gzAnc))
-                clearAnchor = gzAnc;
+            if (clearAnchor == null && _commandGazeAnchor != null)
+                clearAnchor = _commandGazeAnchor;
 
             if (clearAnchor != null)
             {
@@ -1639,13 +1704,15 @@ public class ARIAOrchestrator : MonoBehaviour
         // Lighting + interaction setup
         if (instr.emits_light) AddVirtualLight(root, instr);
 
-        // Wall-clutter should keep WALL_FACE label (so grab-release wall-snaps correctly).
-        // Only horizontal clutter gets CLUTTER label (gravity drop, no rotation snap).
+        // Classification: use the SAVED command gaze anchor (not current object position which
+        // might be wrong if placement went to the wrong spot). Claude's surface_label is the intent.
         string effectiveLabel = instr.surface_label;
         if (pipelineOnClutter)
         {
-            var clutterAnchor = placementEngine?.IdentifyAnchorAtPoint(root.transform.position);
-            effectiveLabel = (clutterAnchor != null && SemanticPlacementEngine.IsWallLikeAnchor(clutterAnchor))
+            // Use saved gaze anchor from command time, or fall back to Claude's surface_label
+            MRUKAnchor classifyAnchor = _commandGazeValid ? _commandGazeAnchor
+                : placementEngine?.IdentifyAnchorAtPoint(root.transform.position);
+            effectiveLabel = (classifyAnchor != null && SemanticPlacementEngine.IsWallLikeAnchor(classifyAnchor))
                 ? "WALL_FACE" : "CLUTTER";
         }
         if (enablePhysics)
@@ -1709,6 +1776,8 @@ public class ARIAOrchestrator : MonoBehaviour
 
         if (fixed_count > 0)
             Debug.Log($"[ARIA] Fixed {fixed_count} pink material(s) → URP/Lit");
+        // NOTE: Occlusion is handled by EnvironmentDepthManager at the depth buffer level.
+        // We do NOT swap working materials to OcclusionLit — that strips textures/colors.
     }
 
     // -------------------------------------------------------------------------
@@ -1977,24 +2046,8 @@ public class ARIAOrchestrator : MonoBehaviour
         if (refined.surface_label == "AUTO")
             Debug.LogWarning("[ARIA] Adjustment returned surface_label=AUTO — parsing may have failed, using original instruction");
 
-        // Cap scale_factor: never exceed canonical real-world dimensions
-        if (scaleFactor > 1f)
-        {
-            Bounds curBounds = CalculateMeshBounds(lastSpawn.gameObject);
-            Vector3 canonical = ScaleInferenceSystem.GetCanonicalDimensions(objName);
-            if (canonical.y > 0.01f)
-            {
-                float maxY = canonical.y / Mathf.Max(curBounds.size.y, 0.001f);
-                float maxX = canonical.x > 0.01f ? canonical.x / Mathf.Max(curBounds.size.x, 0.001f) : 10f;
-                float maxZ = canonical.z > 0.01f ? canonical.z / Mathf.Max(curBounds.size.z, 0.001f) : 10f;
-                float maxAllowed = Mathf.Min(maxY, maxX, maxZ, 10f);
-                if (scaleFactor > maxAllowed)
-                {
-                    Debug.Log($"[ARIA] Claude scale {scaleFactor:F2}x capped to canonical max {maxAllowed:F2}x");
-                    scaleFactor = Mathf.Max(maxAllowed, 0.1f);
-                }
-            }
-        }
+        // No cap on scale_factor — user can make objects as big or small as they want.
+        // Claude decides the appropriate scale based on user's voice command.
 
         // Apply uniform scale (proportional, no deformation)
         if (scaleFactor > 0.01f && Mathf.Abs(scaleFactor - 1f) > 0.05f)
@@ -2067,13 +2120,11 @@ public class ARIAOrchestrator : MonoBehaviour
                 Debug.Log($"[ARIA] Claude: placed {objName} EXCLUDING clutter at ({clearPos.x:F2},{clearPos.y:F2},{clearPos.z:F2})");
             }
         }
-        else if (targetAnchor != null &&
-                 (hasOffset || SemanticPlacementEngine.IsWallLikeAnchor(targetAnchor)))
+        else if (targetAnchor != null)
         {
-            // Relocate to anchor when:
-            // - Claude gave a non-zero offset (intentional move), OR
-            // - Target is a WALL (walls always need snapping — "stick it to the wall" has offset [0,0,0]
-            //   because the snap IS the action, no additional offset needed)
+            // Relocate to any anchor Claude specified.
+            // If Claude returned an anchor_id, it's an intentional relocation — always do it.
+            // "Put it on the door", "move it to the table", "stick to wall" — all have anchor_id.
             placementEngine?.Place(lastSpawn.gameObject, surface, targetAnchor);
 
             var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
@@ -2440,52 +2491,14 @@ public class ARIAOrchestrator : MonoBehaviour
             Debug.Log($"[ARIA] PTRL shadow walls created: {wallCount}");
         }
 
-        // ── Ceiling plane ───────────────────────────────────────────────
-        if (room != null)
-        {
-            var ceilAnchor = room.Anchors.FirstOrDefault(
-                a => a.HasAnyLabel(Meta.XR.MRUtilityKit.MRUKAnchor.SceneLabels.CEILING));
-            if (ceilAnchor != null)
-            {
-                var ceil = GameObject.CreatePrimitive(PrimitiveType.Plane);
-                ceil.name = "ARIA_PTRL_ShadowCeiling";
-                ceil.transform.position = new Vector3(0f, ceilAnchor.transform.position.y - 0.001f, 0f);
-                ceil.transform.rotation = Quaternion.Euler(180f, 0f, 0f); // face downward
-                ceil.transform.localScale = new Vector3(2f, 1f, 2f);
-                Destroy(ceil.GetComponent<Collider>());
-                ConfigurePTRLRenderer(ceil, ptrlMat);
-                _ptrlShadowSurfaces.Add(ceil);
-                Debug.Log($"[ARIA] PTRL shadow ceiling at Y={ceilAnchor.transform.position.y}");
-            }
-        }
+        // NOTE: Ceiling PTRL plane removed — shadows projecting onto ceiling look unnatural
+        // and extend to infinity. Floor + wall planes are sufficient for realistic shadows.
 
-        // ── Global Mesh shadow receiver ─────────────────────────────────
-        // Apply PTRL material to the Global Mesh so shadows follow the continuous
-        // room geometry — shadows stop at walls instead of passing through.
-        if (room != null)
-        {
-            var globalMeshAnchor = room.GetGlobalMeshAnchor();
-            if (globalMeshAnchor != null)
-            {
-                // Find the EffectMesh-generated child with MeshRenderer
-                foreach (var r in globalMeshAnchor.GetComponentsInChildren<MeshRenderer>())
-                {
-                    // Save original material so we can restore on PTRL OFF
-                    if (r.GetComponent<ARIAOriginalMaterialTag>() == null)
-                    {
-                        var tag = r.gameObject.AddComponent<ARIAOriginalMaterialTag>();
-                        tag.originalMaterial = r.sharedMaterial;
-                        tag.originalShadowMode = r.shadowCastingMode;
-                        tag.originalReceiveShadows = r.receiveShadows;
-                    }
-                    r.material = new Material(ptrlMat);
-                    r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off; // don't cast, just receive
-                    r.receiveShadows = true;
-                }
-                _globalMeshPTRLActive = true;
-                Debug.Log("[ARIA] PTRL applied to Global Mesh — shadows follow continuous room geometry.");
-            }
-        }
+        // NOTE: Global Mesh is NOT used as PTRL shadow receiver.
+        // The flat PTRL planes (floor + wall quads + ceiling) produce CLEANER shadows
+        // because they're smooth surfaces. The Global Mesh's triangular geometry
+        // causes jagged shadows and catches light highlights. Global Mesh stays
+        // purely for placement (colliders, raycasting) and visual debugging (green wireframe).
     }
 
     private bool _globalMeshPTRLActive;
@@ -2506,26 +2519,7 @@ public class ARIAOrchestrator : MonoBehaviour
         }
         _ptrlShadowSurfaces.Clear();
 
-        // Restore Global Mesh materials to original (non-PTRL)
-        if (_globalMeshPTRLActive)
-        {
-            var room = MRUK.Instance?.GetCurrentRoom();
-            var globalMeshAnchor = room?.GetGlobalMeshAnchor();
-            if (globalMeshAnchor != null)
-            {
-                foreach (var tag in globalMeshAnchor.GetComponentsInChildren<ARIAOriginalMaterialTag>())
-                {
-                    var r = tag.GetComponent<MeshRenderer>();
-                    if (r != null && tag.originalMaterial != null)
-                    {
-                        r.material = tag.originalMaterial;
-                        r.shadowCastingMode = tag.originalShadowMode;
-                        r.receiveShadows = tag.originalReceiveShadows;
-                    }
-                }
-            }
-            _globalMeshPTRLActive = false;
-        }
+        // Global Mesh PTRL removed — no restore needed (Global Mesh is never modified by PTRL now)
 
         Debug.Log("[ARIA] PTRL shadow surfaces destroyed.");
     }
@@ -2930,11 +2924,23 @@ public class ARIAOrchestrator : MonoBehaviour
     }
 
     /// <summary>Bridges UnityWebRequestAsyncOperation to Task so we can await it.</summary>
-    private static Task AwaitRequest(UnityWebRequestAsyncOperation op)
+    private static async Task AwaitRequest(UnityWebRequestAsyncOperation op)
     {
-        var tcs = new TaskCompletionSource<bool>();
-        op.completed += _ => tcs.TrySetResult(true);
-        return tcs.Task;
+        // Poll isDone instead of relying on completed callback — more reliable on Quest Android.
+        // The completed callback sometimes doesn't fire on Quest when network stalls.
+        float startTime = UnityEngine.Time.realtimeSinceStartup;
+        float timeout = 40f; // 40 second hard timeout
+
+        while (!op.isDone)
+        {
+            if (UnityEngine.Time.realtimeSinceStartup - startTime > timeout)
+            {
+                Debug.LogError($"[ARIA] AwaitRequest: hard timeout after {timeout}s");
+                ARIADebugUI.AppendClaudeLog($"REQUEST TIMEOUT after {timeout}s");
+                break;
+            }
+            await Task.Yield(); // yield back to Unity main thread each frame
+        }
     }
 
     /// <summary>Strips ```json ... ``` fences that LLMs sometimes add around JSON.
@@ -2943,28 +2949,42 @@ public class ARIAOrchestrator : MonoBehaviour
     {
         s = s.Trim();
 
-        // Find the last complete JSON object {...} in the response.
-        // Claude often writes reasoning before the JSON — we want the JSON block at the end.
-        int jsonEnd = s.LastIndexOf('}');
-        if (jsonEnd < 0) return s;
+        // Find the outermost JSON structure — either [...] (array) or {...} (object).
+        // Main pipeline returns arrays: [{...}]
+        // Adjustment returns objects: {...}
+        // Claude may wrap JSON in markdown fences or add reasoning text before/after.
 
-        // Walk backwards from jsonEnd to find the matching opening {
-        int depth = 0;
-        int jsonStart = -1;
-        for (int i = jsonEnd; i >= 0; i--)
+        // Check for array first (main pipeline)
+        int arrayStart = s.IndexOf('[');
+        int arrayEnd = s.LastIndexOf(']');
+
+        // Check for object
+        int objStart = s.IndexOf('{');
+        int objEnd = s.LastIndexOf('}');
+
+        // Use whichever starts FIRST (the outermost JSON structure)
+        if (arrayStart >= 0 && arrayEnd > arrayStart &&
+            (objStart < 0 || arrayStart <= objStart))
         {
-            if (s[i] == '}') depth++;
-            else if (s[i] == '{') depth--;
-            if (depth == 0) { jsonStart = i; break; }
+            // Array found — extract [...] including all objects inside
+            return s.Substring(arrayStart, arrayEnd - arrayStart + 1).Trim();
         }
 
-        if (jsonStart >= 0 && jsonStart < jsonEnd)
-            return s.Substring(jsonStart, jsonEnd - jsonStart + 1).Trim();
-
-        // Fallback: old behavior — first { to last }
-        jsonStart = s.IndexOf('{');
-        if (jsonStart >= 0)
-            return s.Substring(jsonStart, jsonEnd - jsonStart + 1).Trim();
+        if (objStart >= 0 && objEnd > objStart)
+        {
+            // Single object — find the matching { for the last }
+            // (handles reasoning text with { before the actual JSON)
+            int depth = 0;
+            int matchStart = -1;
+            for (int i = objEnd; i >= 0; i--)
+            {
+                if (s[i] == '}') depth++;
+                else if (s[i] == '{') depth--;
+                if (depth == 0) { matchStart = i; break; }
+            }
+            if (matchStart >= 0)
+                return s.Substring(matchStart, objEnd - matchStart + 1).Trim();
+        }
 
         return s.Trim();
     }
@@ -3019,8 +3039,9 @@ public class PlacementInstruction
     public float    width_metres;
     public float    depth_metres;
     public string   category;
-    public float    scale_factor;    // uniform scale (0.05–2.0), used by Claude adjustment
+    public float    scale_factor;    // uniform scale — no limit, user decides size
     public string   placement_target; // "on_clutter", "excluding_clutter", or "anchor" (default)
+    public bool     reuse_cached;    // true only when user explicitly wants the SAME object again
     public string   reasoning;      // Claude's explanation of its decision
     // Virtual light source fields (optional — only set when emits_light = true)
     public bool     emits_light;
@@ -3092,4 +3113,5 @@ public class ARIAOriginalMaterialTag : MonoBehaviour
     [HideInInspector] public Material originalMaterial;
     [HideInInspector] public UnityEngine.Rendering.ShadowCastingMode originalShadowMode;
     [HideInInspector] public bool originalReceiveShadows;
+    [HideInInspector] public bool wasEnabled;
 }
