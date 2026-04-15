@@ -231,10 +231,8 @@ public class ARIADebugUI : MonoBehaviour
             if (_logText.text != _claudeLog || _logScrollDirty)
             {
                 _logScrollDirty = false;
-                if (_logText.text != _claudeLog)
-                    _logText = RemakeLabel(_logText, _claudeLog);
-                // ALWAYS re-apply top anchoring + scroll (RemakeLabel resets to default center anchors)
-                FixLogTextAnchoring(_logScrollOffset);
+                // Recreate from scratch with correct anchoring (not RemakeLabel which preserves old scroll position)
+                RecreateLogText(_logScrollOffset);
             }
         }
 
@@ -810,8 +808,7 @@ public class ARIADebugUI : MonoBehaviour
                     if (_logText != null)
                     {
                         _logScrollOffset = 0f; // reset scroll to top when menu opens
-                        _logText = RemakeLabel(_logText, _claudeLog);
-                        FixLogTextAnchoring(0f);
+                        RecreateLogText(0f);
                     }
                 }
             }
@@ -1227,17 +1224,25 @@ public class ARIADebugUI : MonoBehaviour
     }
 
     /// <summary>
-    /// Fixes log text RectTransform after RemakeLabel (which resets to default center anchors).
-    /// Anchors to top of viewport, applies scroll offset.
+    /// Recreates the log text with correct top anchoring from scratch.
+    /// Does NOT use RemakeLabel (which preserves old position and causes scroll bugs).
     /// </summary>
-    private void FixLogTextAnchoring(float scrollOffset)
+    private void RecreateLogText(float scrollOffset)
     {
         if (_logText == null) return;
+        var parent = _logText.transform.parent; // the viewport
+        var go = _logText.gameObject;
+        Destroy(go);
+
+        // Create fresh label with explicit top anchoring
+        _logText = MakeLabel(parent, "LogContent", _claudeLog,
+            new Vector2(0, 0), new Vector2(480, 4000), 12, FontStyle.Normal, Color.white);
+        _logText.alignment = TextAnchor.UpperLeft;
+
         var rt = _logText.GetComponent<RectTransform>();
         rt.anchorMin = new Vector2(0.5f, 1f);
         rt.anchorMax = new Vector2(0.5f, 1f);
         rt.pivot = new Vector2(0.5f, 1f);
-        rt.sizeDelta = new Vector2(480, 4000);
         rt.anchoredPosition = new Vector2(0f, scrollOffset);
     }
 

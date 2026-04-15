@@ -1015,16 +1015,15 @@ public class ARIAOrchestrator : MonoBehaviour
         string body = JsonConvert.SerializeObject(new
         {
             model = "claude-sonnet-4-6",
-            max_tokens = 1536,
-            system = "You are the spatial reasoning AI for ARIA, a mixed reality furniture placement system on Meta Quest 3. " +
-                     "CRITICAL: The user's VOICE COMMAND takes absolute priority over gaze direction. " +
-                     "If they say 'move up 20cm', apply position_offset [0,0.2,0] — do NOT relocate to the gaze dot. " +
-                     "Only use gaze to resolve 'that/this/there' references. " +
-                     "You receive: annotated image + MRUK data + user voice command. " +
-                     "Return JSON with surface_label, anchor_id, scale_factor, position_offset, category, reasoning. " +
-                     "position_offset [x,y,z] moves the object (x=right, y=up, z=forward). " +
-                     "Only change surface_label/anchor_id if user explicitly wants to RELOCATE. " +
-                     "Return valid JSON only.",
+            max_tokens = 2048,
+            system = "You are the spatial reasoning AI for ARIA on Meta Quest 3. " +
+                     "CRITICAL RULES:\n" +
+                     "1. Voice command is PRIMARY. 'move up 20cm' → offset [0,0.2,0], do NOT relocate to gaze.\n" +
+                     "2. Gaze dot only resolves 'that/this/there/here' references.\n" +
+                     "3. Only change surface_label/anchor_id if user explicitly wants to RELOCATE.\n" +
+                     "4. KEEP YOUR REASONING SHORT. Do NOT write lengthy analysis. Just the key decision and the JSON.\n" +
+                     "5. Return ONLY valid JSON — no markdown fences, no extra text before/after the JSON object.\n" +
+                     "Return: {surface_label, anchor_id, scale_factor, position_offset:[x,y,z], placement_target, category, reasoning}",
             messages = new[] { new { role = "user", content } }
         });
 
@@ -1640,7 +1639,15 @@ public class ARIAOrchestrator : MonoBehaviour
         // Lighting + interaction setup
         if (instr.emits_light) AddVirtualLight(root, instr);
 
-        string effectiveLabel = pipelineOnClutter ? "CLUTTER" : instr.surface_label;
+        // Wall-clutter should keep WALL_FACE label (so grab-release wall-snaps correctly).
+        // Only horizontal clutter gets CLUTTER label (gravity drop, no rotation snap).
+        string effectiveLabel = instr.surface_label;
+        if (pipelineOnClutter)
+        {
+            var clutterAnchor = placementEngine?.IdentifyAnchorAtPoint(root.transform.position);
+            effectiveLabel = (clutterAnchor != null && SemanticPlacementEngine.IsWallLikeAnchor(clutterAnchor))
+                ? "WALL_FACE" : "CLUTTER";
+        }
         if (enablePhysics)
             AddPhysicsAndInteraction(root, instr.category, effectiveLabel);
 
@@ -1772,28 +1779,36 @@ public class ARIAOrchestrator : MonoBehaviour
             placementEngine.GazeRaycastGlobalMesh(out var gazeHit, out var gazeNorm, out gazeAnchor))
         {
             bool isClutter = gazeAnchor != null && placementEngine.IsPointOnClutter(gazeHit, gazeAnchor);
+            bool isWall = gazeAnchor != null && SemanticPlacementEngine.IsWallLikeAnchor(gazeAnchor);
 
-            if (isClutter || gazeHit.y > (gazeAnchor?.transform.position.y ?? -999f) + 0.01f)
+            if (isWall)
             {
-                // Place on whatever the EnvironmentRaycast/GlobalMesh hit
-                // (clutter, or any surface above an anchor — e.g. objects placed after scan)
+                // WALL surfaces: ALWAYS use PlaceOnGlobalMesh for correct flat orientation.
+                // The hit normal makes the object face outward from the wall surface.
+                // Works for clear wall AND wall clutter (pinboard, shelf, etc.)
                 placementEngine.PlaceOnGlobalMesh(root, gazeHit, gazeNorm);
                 usedGlobalMesh = true;
-                Debug.Log($"[ARIA] Demo spawn at gaze point ({gazeHit.x:F2},{gazeHit.y:F2},{gazeHit.z:F2}) " +
+                Debug.Log($"[ARIA] Demo spawn on WALL at ({gazeHit.x:F2},{gazeHit.y:F2},{gazeHit.z:F2}) " +
                           $"clutter={isClutter}, anchor={gazeAnchor?.name ?? "none"}");
+            }
+            else if (isClutter)
+            {
+                // HORIZONTAL clutter: place on whatever the raycast hit (book, box, etc.)
+                placementEngine.PlaceOnGlobalMesh(root, gazeHit, gazeNorm);
+                usedGlobalMesh = true;
+                Debug.Log($"[ARIA] Demo spawn on CLUTTER at ({gazeHit.x:F2},{gazeHit.y:F2},{gazeHit.z:F2}) " +
+                          $"anchor={gazeAnchor?.name ?? "none"}");
             }
             else
             {
-                // Clear anchor surface — place at the gaze point on the anchor
-                // Use the identified anchor rather than the hardcoded surfaceLabel
-                // so objects go where you're looking, not on a fixed surface type
+                // CLEAR horizontal surface — place at gaze point on the anchor
                 if (gazeAnchor != null)
                 {
                     Bounds b = CalculateMeshBounds(root);
                     float halfH = b.extents.y;
                     root.transform.position = new Vector3(gazeHit.x, gazeHit.y + halfH, gazeHit.z);
                     root.transform.rotation = Quaternion.identity;
-                    Debug.Log($"[ARIA] Demo spawn on anchor {gazeAnchor.name} at gaze point");
+                    Debug.Log($"[ARIA] Demo spawn on clear surface {gazeAnchor.name} at gaze point");
                 }
                 else
                 {
@@ -1862,7 +1877,15 @@ public class ARIAOrchestrator : MonoBehaviour
 
         // Physics + interaction
         // Clutter-placed objects get ClutterItem category (no rotation snap on settle)
-        string effectiveSurfaceLabel = usedGlobalMesh ? "CLUTTER" : surfaceLabel;
+        // Classification priority:
+        // 1. If the ORIGINAL surfaceLabel says WALL_FACE (demo wall art button) → WallItem
+        // 2. If placed on Global Mesh clutter on a wall → WallItem (wall-snap on release)
+        // 3. If placed on Global Mesh clutter on horizontal surface → ClutterItem (gravity, no rotation snap)
+        // 4. Otherwise → use original surfaceLabel (FLOOR → FloorItem, etc.)
+        string effectiveSurfaceLabel = surfaceLabel;
+        if (usedGlobalMesh && !surfaceLabel.Equals("WALL_FACE", StringComparison.OrdinalIgnoreCase))
+            effectiveSurfaceLabel = (gazeAnchor != null && SemanticPlacementEngine.IsWallLikeAnchor(gazeAnchor))
+                ? "WALL_FACE" : "CLUTTER";
         if (enablePhysics) AddPhysicsAndInteraction(root, category, effectiveSurfaceLabel);
 
         // Reflection probe
@@ -1998,10 +2021,14 @@ public class ARIAOrchestrator : MonoBehaviour
                 placementEngine.PlaceOnGlobalMesh(lastSpawn.gameObject, clutterHit, clutterNorm);
                 didRelocate = true;
 
-                // Update interactable category to ClutterItem (skip rotation snap)
+                // Wall-clutter → WallItem (grab-release wall-snaps), horizontal clutter → ClutterItem
                 var interactable = lastSpawn.GetComponent<ARIAInteractable>();
                 if (interactable != null)
-                    interactable.category = SurfaceCategory.ClutterItem;
+                {
+                    var clutterAnc = placementEngine.IdentifyAnchorAtPoint(clutterHit);
+                    interactable.category = (clutterAnc != null && SemanticPlacementEngine.IsWallLikeAnchor(clutterAnc))
+                        ? SurfaceCategory.WallItem : SurfaceCategory.ClutterItem;
+                }
 
                 Debug.Log($"[ARIA] Claude: placed {objName} ON CLUTTER at ({clutterHit.x:F2},{clutterHit.y:F2},{clutterHit.z:F2})");
             }
@@ -2040,10 +2067,13 @@ public class ARIAOrchestrator : MonoBehaviour
                 Debug.Log($"[ARIA] Claude: placed {objName} EXCLUDING clutter at ({clearPos.x:F2},{clearPos.y:F2},{clearPos.z:F2})");
             }
         }
-        else if (targetAnchor != null && hasOffset)
+        else if (targetAnchor != null &&
+                 (hasOffset || SemanticPlacementEngine.IsWallLikeAnchor(targetAnchor)))
         {
-            // Standard anchor relocation — only when Claude gives a non-zero offset
-            // (anchor_id alone is just context, not a relocation request)
+            // Relocate to anchor when:
+            // - Claude gave a non-zero offset (intentional move), OR
+            // - Target is a WALL (walls always need snapping — "stick it to the wall" has offset [0,0,0]
+            //   because the snap IS the action, no additional offset needed)
             placementEngine?.Place(lastSpawn.gameObject, surface, targetAnchor);
 
             var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
@@ -2913,18 +2943,28 @@ public class ARIAOrchestrator : MonoBehaviour
     {
         s = s.Trim();
 
-        // Find the first JSON-start character, skipping any fence/preamble
-        int jsonStart = -1;
-        for (int i = 0; i < s.Length; i++)
-        {
-            if (s[i] == '[' || s[i] == '{') { jsonStart = i; break; }
-        }
-        if (jsonStart > 0) s = s.Substring(jsonStart);
+        // Find the last complete JSON object {...} in the response.
+        // Claude often writes reasoning before the JSON — we want the JSON block at the end.
+        int jsonEnd = s.LastIndexOf('}');
+        if (jsonEnd < 0) return s;
 
-        // Trim trailing fence or whitespace after the last JSON-close character
-        int jsonEnd = s.LastIndexOfAny(new[] { ']', '}' });
-        if (jsonEnd >= 0 && jsonEnd < s.Length - 1)
-            s = s.Substring(0, jsonEnd + 1);
+        // Walk backwards from jsonEnd to find the matching opening {
+        int depth = 0;
+        int jsonStart = -1;
+        for (int i = jsonEnd; i >= 0; i--)
+        {
+            if (s[i] == '}') depth++;
+            else if (s[i] == '{') depth--;
+            if (depth == 0) { jsonStart = i; break; }
+        }
+
+        if (jsonStart >= 0 && jsonStart < jsonEnd)
+            return s.Substring(jsonStart, jsonEnd - jsonStart + 1).Trim();
+
+        // Fallback: old behavior — first { to last }
+        jsonStart = s.IndexOf('{');
+        if (jsonStart >= 0)
+            return s.Substring(jsonStart, jsonEnd - jsonStart + 1).Trim();
 
         return s.Trim();
     }

@@ -18,7 +18,7 @@ public class ARIAInteractable : MonoBehaviour
 
     [Header("Wall Snap")]
     [Tooltip("Maximum distance from a wall to trigger magnet snap (metres).")]
-    [SerializeField] private float wallSnapThreshold = 0.15f;
+    [SerializeField] private float wallSnapThreshold = 0.08f;
 
     [Header("Settle Detection")]
     [Tooltip("Seconds to wait before checking if object has settled after drop.")]

@@ -992,14 +992,34 @@ public class SemanticPlacementEngine : MonoBehaviour
     {
         if (anchor == null) return false;
 
+        // For WALLS: clutter = something sticking OUT from the wall plane (depth axis, not Y)
+        if (anchor.HasAnyLabel(MRUKAnchor.SceneLabels.WALL_FACE) ||
+            anchor.HasAnyLabel(MRUKAnchor.SceneLabels.INVISIBLE_WALL_FACE))
+        {
+            // Distance from hit point to the wall plane along the wall's forward (normal) axis
+            Vector3 toHit = hitPoint - anchor.transform.position;
+            float depthFromWall = Mathf.Abs(Vector3.Dot(toHit, anchor.transform.forward));
+            return depthFromWall > 0.03f; // 3cm from wall plane = clutter (pinboard, shelf, etc.)
+        }
+
+        // For HORIZONTAL surfaces: clutter = anything above the anchor surface Y
         float anchorSurfaceY = anchor.transform.position.y;
 
-        // For floor anchors, surface Y is the floor height
         if (anchor.HasAnyLabel(MRUKAnchor.SceneLabels.FLOOR))
             anchorSurfaceY = GetFloorHeight(MRUK.Instance?.GetCurrentRoom());
 
         float difference = hitPoint.y - anchorSurfaceY;
-        return difference > 0.01f; // 1cm threshold — above this = real object on the surface
+        return difference > 0.01f; // 1cm threshold
+    }
+
+    /// <summary>
+    /// Checks if an anchor represents a vertical (wall-like) surface.
+    /// </summary>
+    public static bool IsWallLikeAnchor(MRUKAnchor anchor)
+    {
+        if (anchor == null) return false;
+        return anchor.HasAnyLabel(MRUKAnchor.SceneLabels.WALL_FACE) ||
+               anchor.HasAnyLabel(MRUKAnchor.SceneLabels.INVISIBLE_WALL_FACE);
     }
 
     /// <summary>
@@ -1048,6 +1068,11 @@ public class SemanticPlacementEngine : MonoBehaviour
     public Vector3 FindClearSpotOnAnchor(MRUKAnchor anchor, Vector3 searchCenter, Vector3 objectSize)
     {
         if (anchor == null) return searchCenter;
+
+        // WALL anchors: search along the wall's PlaneRect for clear spots
+        // (downward raycasts don't work for vertical surfaces)
+        if (IsWallLikeAnchor(anchor))
+            return FindClearSpotOnWall(anchor, searchCenter, objectSize);
 
         float anchorSurfaceY = anchor.transform.position.y;
         if (anchor.HasAnyLabel(MRUKAnchor.SceneLabels.FLOOR))
@@ -1106,6 +1131,72 @@ public class SemanticPlacementEngine : MonoBehaviour
         // Fallback: place at anchor center
         Debug.LogWarning("[SemanticPlacement] FindClearSpot: no clear spot found — using anchor center.");
         return new Vector3(anchor.transform.position.x, anchorSurfaceY, anchor.transform.position.z);
+    }
+
+    /// <summary>
+    /// Finds a clear spot on a WALL anchor's PlaneRect, away from Global Mesh clutter.
+    /// Searches along the wall's 2D plane using raycasts perpendicular to the wall surface.
+    /// </summary>
+    private Vector3 FindClearSpotOnWall(MRUKAnchor wallAnchor, Vector3 searchCenter, Vector3 objectSize)
+    {
+        Vector3 wallNormal = wallAnchor.transform.forward;
+        Vector3 wallCenter = wallAnchor.transform.position;
+        Vector3 wallRight = wallAnchor.transform.right;
+        Vector3 wallUp = wallAnchor.transform.up;
+
+        // Project search center onto wall plane
+        Vector3 toSearch = searchCenter - wallCenter;
+        float localX = Vector3.Dot(toSearch, wallRight);
+        float localY = Vector3.Dot(toSearch, wallUp);
+
+        // Wall PlaneRect bounds
+        Rect rect = wallAnchor.PlaneRect.HasValue ? wallAnchor.PlaneRect.Value
+            : new Rect(-2f, -1.4f, 4f, 2.8f);
+
+        float halfObjW = objectSize.x * 0.5f;
+        float halfObjH = objectSize.y * 0.5f;
+
+        // Golden-angle spiral search on wall plane
+        for (int i = 0; i <= maxPlacementAttempts; i++)
+        {
+            float angle = i * 137.5f * Mathf.Deg2Rad;
+            float radius = 0.8f * Mathf.Sqrt((float)i / maxPlacementAttempts);
+            float testX = localX + Mathf.Cos(angle) * radius;
+            float testY = localY + Mathf.Sin(angle) * radius;
+
+            // Clamp within PlaneRect (with object size margin)
+            testX = Mathf.Clamp(testX, rect.xMin + halfObjW, rect.xMax - halfObjW);
+            testY = Mathf.Clamp(testY, rect.yMin + halfObjH, rect.yMax - halfObjH);
+
+            // World position on the wall plane
+            Vector3 testPoint = wallCenter + wallRight * testX + wallUp * testY;
+
+            // Raycast FROM outside the wall TOWARD the wall to check for clutter
+            Vector3 rayOrigin = testPoint + wallNormal * 0.5f;
+            if (Physics.Raycast(rayOrigin, -wallNormal, out RaycastHit hit, 1f, GlobalMeshLayerMask))
+            {
+                // If the Global Mesh hit is close to the wall plane = clear wall surface
+                float depthFromWall = Vector3.Distance(hit.point, testPoint);
+                if (depthFromWall < 0.03f) // within 3cm of wall = clear
+                {
+                    // Offset result slightly away from wall surface
+                    Vector3 result = testPoint + wallNormal * 0.03f;
+                    Debug.Log($"[SemanticPlacement] FindClearSpotOnWall: found at local ({testX:F2},{testY:F2}), attempt {i}");
+                    return result;
+                }
+            }
+            else
+            {
+                // No Global Mesh hit = open wall area = clear
+                Vector3 result = testPoint + wallNormal * 0.03f;
+                Debug.Log($"[SemanticPlacement] FindClearSpotOnWall: open wall at local ({testX:F2},{testY:F2}), attempt {i}");
+                return result;
+            }
+        }
+
+        // Fallback: wall center
+        Debug.LogWarning("[SemanticPlacement] FindClearSpotOnWall: no clear spot found — using wall center.");
+        return wallCenter + wallNormal * 0.03f;
     }
 
     /// <summary>
