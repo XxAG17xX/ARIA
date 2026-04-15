@@ -1,10 +1,8 @@
-// VoiceSDKConnector.cs
-// Bridges Meta Voice SDK (Wit.ai speech-to-text) to the ARIA pipeline.
-// Subscribes to AppVoiceExperience transcription events and forwards the
-// final transcript to ARIAOrchestrator.ProcessVoiceCommand().
-//
-// Attach to ARIA_Manager alongside ARIAOrchestrator and AppVoiceExperience.
-// In editor (no mic): does nothing — use ARIADebugUI text input instead.
+// VoiceSDKConnector.cs — hooks up Meta's Wit.ai voice SDK to our pipeline
+// listens for voice transcriptions and forwards them to the orchestrator.
+// one-shot mode: records voice on button press, fires callback with transcript, stops.
+// auto-activate is OFF so the mic doesn't randomly pick up background speech.
+// whole thing is wrapped in #if !UNITY_EDITOR since there's no mic in editor.
 
 using UnityEngine;
 #if !UNITY_EDITOR

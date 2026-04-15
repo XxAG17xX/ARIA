@@ -1,8 +1,9 @@
-// GlobalMeshWireframe.shader
-// Wireframe visualization for Global Mesh — based on Meta's Phanto WireframeShader.
-// Reads barycentric coordinates from vertex colors (set by EffectMesh when
-// BarycentricCoordinatesEnabled = true). Renders triangle edge outlines only.
-// Adapted for URP (Universal Render Pipeline).
+// GlobalMeshWireframe.shader — shows the Global Mesh as green triangle outlines
+// ported from Meta's Phanto sample (which uses BiRP) to work with URP.
+// EffectMesh stores barycentric coords in vertex colors when BarycentricCoordinatesEnabled
+// is on — each vertex gets (1,0,0), (0,1,0), or (0,0,1). when a coord is near 0
+// we're on an edge, so we draw the wireframe color there and discard the fill.
+// distance scaling keeps edges visible even far away.
 
 Shader "ARIA/GlobalMeshWireframe"
 {

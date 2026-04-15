@@ -1,8 +1,10 @@
-// ARIAInteractable.cs
-// Handles post-grab-release behavior for spawned virtual objects.
-// Grab is triggered externally by ARIADebugUI (A button on right controller).
-// Floor items: gravity drop onto nearest surface, then proportional resize.
-// Wall items: magnet-snap to nearest wall within threshold, or fall if too far.
+// ARIAInteractable.cs — what happens when you grab and let go of objects
+// attached to every spawned object. classifies them as FloorItem, WallItem, or ClutterItem.
+// floor stuff falls with gravity and settles on whatever surface it lands on (uses GlobalMesh
+// raycast so it lands on actual clutter, not just flat anchor planes).
+// wall stuff snaps to nearest wall if within 8cm, otherwise falls.
+// clutter stuff is like floor but skips the rotation correction (keeps its surface angle).
+// tracks originalScale so repeated grab-release doesn't keep shrinking the object.
 
 using System.Collections;
 using UnityEngine;

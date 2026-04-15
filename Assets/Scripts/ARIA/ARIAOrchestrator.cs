@@ -1,10 +1,14 @@
-// ARIAOrchestrator.cs
-// Master controller for the ARIA pipeline.
-// Voice transcript → Claude (multimodal) → Gemini → HiTEM3D → GLTFast → place + scale + light.
-// Objects appear progressively — each placed as soon as its own generation finishes.
+// ARIAOrchestrator.cs — main brain of the whole app
+// handles the full voice-to-3D pipeline: user speaks → Claude figures out what/where →
+// Gemini makes a reference image → Tripo3D generates the GLB → we load it with GLTFast,
+// scale it, place it on the right surface, and set up physics/lighting.
 //
-// APK NOTE: WebCamTexture passthrough capture and real MRUK data require a Quest APK build.
-//           Editor runs with mock MRUK data and a null passthrough image (text-only Claude call).
+// also handles the Claude adjustment flow (user says "make it bigger" etc),
+// manual light placement with passthrough color sampling, PTRL shadow toggle,
+// and pretty much all the API calls (Claude, Gemini, Tripo, HiTEM3D).
+//
+// needs to be built as APK for Quest — passthrough camera and MRUK room data
+// only work on device. editor mode uses mock room data and skips the camera.
 
 using System;
 using System.Collections.Generic;
@@ -238,11 +242,9 @@ public class ARIAOrchestrator : MonoBehaviour
         Debug.Log("[ARIA] Shadow receiver reconfigured after MRUK scene load.");
     }
 
-    /// <summary>
-    /// Finds the GLOBAL_MESH EffectMesh child and assigns it to the "GlobalMesh" layer.
-    /// This separates the detailed scan mesh (wraps over books, clutter, etc.) from
-    /// the flat anchor colliders (TABLE_0, WALL_0, etc.) for filtered raycasting.
-    /// </summary>
+    // puts the Global Mesh on its own physics layer so we can raycast against it
+    // separately from the anchor colliders. needed for clutter detection —
+    // Physics.Raycast with LayerMask.GetMask("GlobalMesh") only hits the detailed scan
     private void AssignGlobalMeshLayer()
     {
         int globalMeshLayer = LayerMask.NameToLayer("GlobalMesh");
@@ -1626,26 +1628,21 @@ public class ARIAOrchestrator : MonoBehaviour
         string placementTarget = instr.placement_target ?? "anchor";
         bool pipelineOnClutter = false;
 
-        if (placementTarget == "on_clutter" && placementEngine != null)
+        // Pipeline spawn: ALWAYS use saved gaze from voice command time.
+        // The user spoke 1-2 minutes ago — they've moved since then.
+        // Saved gaze = where they were looking when they gave the command.
+        bool isWallTarget = _commandGazeValid && _commandGazeAnchor != null
+            && SemanticPlacementEngine.IsWallLikeAnchor(_commandGazeAnchor);
+
+        if (_commandGazeValid && (placementTarget == "on_clutter" || isWallTarget || placementTarget == "anchor"))
         {
-            // Use SAVED gaze from voice command time (not current gaze — user moved in 1-2 min)
-            if (_commandGazeValid)
-            {
-                placementEngine.PlaceOnGlobalMesh(root, _commandGazeHitPoint, _commandGazeHitNormal);
+            // Place at saved gaze point on Global Mesh — simple, exact, no overcomplication.
+            // Wall objects face inward (hitNormal). Floor/table objects sit on top.
+            placementEngine?.PlaceOnGlobalMesh(root, _commandGazeHitPoint, _commandGazeHitNormal);
+            if (placementTarget == "on_clutter" || isWallTarget)
                 pipelineOnClutter = true;
-                Debug.Log($"[ARIA] Pipeline ON CLUTTER at saved gaze ({_commandGazeHitPoint.x:F2},{_commandGazeHitPoint.y:F2},{_commandGazeHitPoint.z:F2})");
-            }
-            else
-            {
-                // Fallback: try live raycast, then standard placement
-                if (placementEngine.GazeRaycastGlobalMesh(out var clutterPt, out var clutterNm, out _))
-                {
-                    placementEngine.PlaceOnGlobalMesh(root, clutterPt, clutterNm);
-                    pipelineOnClutter = true;
-                }
-                else
-                    placementEngine?.Place(root, instr.surface_label, GetAnchorById(instr.anchor_id), GetAnchorById(instr.near_anchor_id));
-            }
+            Debug.Log($"[ARIA] Pipeline spawn at saved gaze ({_commandGazeHitPoint.x:F2},{_commandGazeHitPoint.y:F2},{_commandGazeHitPoint.z:F2}) " +
+                      $"target={placementTarget}, wall={isWallTarget}");
         }
         else if (placementTarget == "excluding_clutter" && placementEngine != null)
         {
@@ -1674,9 +1671,10 @@ public class ARIAOrchestrator : MonoBehaviour
             placementEngine?.Place(root, instr.surface_label, targetAnchor, nearAnchor);
         }
 
-        // Auto-fit sizing — always runs regardless of placement mode.
-        // Objects on clutter still need anchor-relative sizing.
-        if (!pipelineOnClutter)
+        // FitToAvailableSpace only for objects placed via standard Place() (fallback path).
+        // objects placed at saved gaze point via PlaceOnGlobalMesh are already at the right spot —
+        // FitToAvailableSpace would shift them by snapping Y to floor or shrinking from nearby walls.
+        if (!_commandGazeValid && !pipelineOnClutter)
         {
             var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
             if (fitRoom != null)
@@ -1695,9 +1693,10 @@ public class ARIAOrchestrator : MonoBehaviour
             {
                 Vector3 preFitPos = root.transform.position;
                 placementEngine?.FitToSurface(root, fitAnchor, instr.category);
-                // For clutter: restore Y to clutter surface, not anchor surface
-                if (pipelineOnClutter)
-                    root.transform.position = new Vector3(root.transform.position.x, preFitPos.y, root.transform.position.z);
+                // always restore position after FitToSurface — it only needs to change scale.
+                // FitToSurface snaps Y to the anchor surface, but we want the gaze point Y.
+                if (_commandGazeValid || pipelineOnClutter)
+                    root.transform.position = preFitPos;
             }
         }
 
@@ -1969,11 +1968,10 @@ public class ARIAOrchestrator : MonoBehaviour
     // User-triggered Claude adjustment — look at target, then press button
     // -------------------------------------------------------------------------
 
-    /// <summary>
-    /// Captures passthrough from current gaze, sends to Claude with MRUK data,
-    /// and adjusts the most recently spawned object's scale/position.
-    /// Called by "Adjust with Claude" button AFTER user positions their gaze.
-    /// </summary>
+    // readjustment flow: captures what the user sees (passthrough + virtual objects + anchor labels),
+    // sends it to Claude along with the voice command, and applies whatever Claude says
+    // (scale change, move, relocate to different surface, on/off clutter).
+    // called after the user closes the menu — the capture happens with UI hidden.
     public async void AdjustLastSpawnWithClaude()
     {
         Transform root = spawnRoot != null ? spawnRoot : transform;
@@ -2708,7 +2706,10 @@ public class ARIAOrchestrator : MonoBehaviour
             var tex = new Texture2D(2, 2, TextureFormat.RGB24, false);
             if (tex.LoadImage(jpeg))
             {
-                // ── Center 4x4 grid: light source color & intensity ──
+                // ── Center 4x4 grid: sample light source color from image CENTER ──
+                // The light sphere is at the center of the captured image.
+                // Sample a tight center region (40-60% of image) to get the actual light color,
+                // not the whole image which averages to grey.
                 Color avgColor = Color.black;
                 float maxBright = 0f;
                 int samples = 0;
@@ -2716,7 +2717,10 @@ public class ARIAOrchestrator : MonoBehaviour
                 {
                     for (int sCol = 0; sCol < 4; sCol++)
                     {
-                        Color p = tex.GetPixelBilinear((sCol + 0.5f) / 4f, (sRow + 0.5f) / 4f);
+                        // Sample center 20% of image (0.4 to 0.6 in UV space)
+                        float u = 0.4f + (sCol + 0.5f) / 4f * 0.2f;
+                        float v = 0.4f + (sRow + 0.5f) / 4f * 0.2f;
+                        Color p = tex.GetPixelBilinear(u, v);
                         avgColor += p;
                         if (p.grayscale > maxBright) maxBright = p.grayscale;
                         samples++;
@@ -2725,7 +2729,14 @@ public class ARIAOrchestrator : MonoBehaviour
                 avgColor /= Mathf.Max(samples, 1);
                 if (avgColor.grayscale > 0.05f)
                 {
-                    lightColor = Color.Lerp(Color.white, avgColor, 0.7f);
+                    // Use the actual sampled color directly — no Lerp with white
+                    // (Lerp was washing out warm/cool tones to neutral grey)
+                    lightColor = avgColor;
+                    // Normalize to keep hue but ensure visible brightness
+                    float maxChannel = Mathf.Max(lightColor.r, Mathf.Max(lightColor.g, lightColor.b));
+                    if (maxChannel > 0.01f)
+                        lightColor = lightColor / maxChannel; // normalize to brightest channel = 1
+                    lightColor.a = 1f;
                     lightIntensity = Mathf.Clamp(maxBright * 5f, 3f, 10f);
                 }
 

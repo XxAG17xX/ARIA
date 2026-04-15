@@ -1,16 +1,14 @@
-// SemanticPlacementEngine.cs
-// Places spawned objects at correct real-world positions using MRUK anchor data.
-// Maps Claude's surface_label to MRUKAnchor.SceneLabels, finds matching anchors,
-// and uses collision-aware placement to avoid overlapping real-world objects.
+// SemanticPlacementEngine.cs — figures out WHERE to put things in the real room
+// takes Claude's surface_label (FLOOR/WALL/TABLE/etc) and finds the right MRUK anchor,
+// then does collision-aware placement so objects don't overlap real furniture.
+// uses a golden-angle spiral search when the first spot is blocked.
 //
-// Placement strategy per surface type:
-//   FLOOR   — raycast from user gaze onto floor, validate clear spot with Physics.CheckBox
-//   WALL    — find best wall via gaze direction, use GetBestPoseFromRaycast for alignment
-//   TABLE   — place on top of volume anchor, offset to nearest clear edge
-//   CEILING — snap to ceiling anchor
-//   COUCH   — place on top of couch volume
+// also handles the clutter-aware system: detects if the user is pointing at real objects
+// (books, boxes) vs clear surface using Global Mesh vs anchor boundary comparison.
+// PlaceOnGlobalMesh puts objects directly on the scanned geometry.
+// FindClearSpotOnAnchor finds empty spots on tables/walls avoiding clutter.
 //
-// Falls back to 1.5m in front of user's camera in editor (no MRUK available).
+// in editor (no MRUK), just sticks objects 1.5m in front of the camera.
 
 using System.Linq;
 using UnityEngine;
@@ -240,7 +238,9 @@ public class SemanticPlacementEngine : MonoBehaviour
 
         Vector3 wallNormal = wallAnchor.transform.forward;
         Vector3 wallCenter = wallAnchor.transform.position;
-        float halfDepth = GetObjectHalfDepth(obj);
+
+        // Set rotation FIRST so bounds calculation is wall-relative
+        obj.transform.rotation = Quaternion.LookRotation(wallNormal, Vector3.up);
 
         // Intersect gaze ray with this wall's plane for fine positioning
         Plane wallPlane = new Plane(wallNormal, wallCenter);
@@ -264,9 +264,13 @@ public class SemanticPlacementEngine : MonoBehaviour
             }
         }
 
-        Vector3 finalPos = hitPoint + wallNormal * (halfDepth + wallOffset);
+        // Depth along wall normal — use smallest extent (painting thickness), clamped
+        Bounds rotBounds = GetObjectBounds(obj);
+        float halfDepth = Mathf.Min(rotBounds.extents.x, Mathf.Min(rotBounds.extents.y, rotBounds.extents.z));
+        halfDepth = Mathf.Clamp(halfDepth, 0.005f, 0.05f); // 0.5cm - 5cm
+
+        Vector3 finalPos = hitPoint + wallNormal * (halfDepth + 0.005f); // flush + 5mm gap
         obj.transform.position = finalPos;
-        obj.transform.rotation = Quaternion.LookRotation(wallNormal, Vector3.up);
         Debug.Log($"[SemanticPlacement] Specific wall: placed {obj.name} on {wallAnchor.name}");
         ARIADebugUI.AppendClaudeLog($"PLACED: {obj.name}\n  → wall at ({finalPos.x:F1},{finalPos.y:F1},{finalPos.z:F1})");
     }
@@ -1041,10 +1045,19 @@ public class SemanticPlacementEngine : MonoBehaviour
         }
         else if (hitNormal.y < 0.3f)
         {
-            // Mostly vertical surface (side of box, clutter wall) — mount on surface
-            float halfDepth = Mathf.Min(b.extents.x, b.extents.z);
-            obj.transform.position = hitPoint + hitNormal * (halfDepth + 0.02f);
+            // Mostly vertical surface — mount flush against wall.
+            // Set rotation FIRST so bounds are in wall-relative orientation,
+            // then calculate depth along the wall normal direction.
             obj.transform.rotation = Quaternion.LookRotation(hitNormal, Vector3.up);
+
+            // Recalculate bounds AFTER rotation — extents are now wall-relative
+            Bounds rotatedBounds = GetObjectBounds(obj);
+            // Depth along wall normal = the object's extent in the forward (normal) direction
+            // For a thin painting rotated to face outward, this is the smallest extent
+            float depthAlongNormal = Mathf.Min(rotatedBounds.extents.x, Mathf.Min(rotatedBounds.extents.y, rotatedBounds.extents.z));
+            // Clamp to reasonable range — paintings are thin (1-5cm half-depth)
+            depthAlongNormal = Mathf.Clamp(depthAlongNormal, 0.005f, 0.05f);
+            obj.transform.position = hitPoint + hitNormal * (depthAlongNormal + 0.005f);
         }
         else
         {

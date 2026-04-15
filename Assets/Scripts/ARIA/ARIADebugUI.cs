@@ -1,10 +1,10 @@
-// ARIADebugUI.cs
-// Debug/testing UI for ARIA — works in both editor (IMGUI) and Quest headset (world-space Canvas).
-//
-// Quest: world-space Canvas with big buttons, positioned in front of user at launch.
-//   Controller laser pointer clicks buttons. Countdown overlay for gaze-directed placement.
-//
-// Editor: IMGUI text field + buttons (same as before).
+// ARIADebugUI.cs — all the VR UI stuff for Quest
+// builds a world-space Canvas with buttons at runtime (no prefabs, everything procedural).
+// handles controller input: Y=menu, grip=grab, thumbstick=rotate/scale, X=select/delete.
+// also manages the always-on EnvironmentRaycast crosshair that switches between
+// real-world surface tracking (menu closed) and button hover detection (menu open).
+// the ARIA Log panel on the left shows everything the system does — scrollable with
+// right thumbstick. countdown overlay for voice commands and gaze-directed placement.
 
 using System.Collections.Generic;
 using System.Linq;
@@ -242,8 +242,9 @@ public class ARIADebugUI : MonoBehaviour
         // - Menu closed → UpdateAlwaysOnCrosshair (EnvironmentRaycast for real-world surface)
         if (IsRunningOnQuest())
         {
-            bool countdownShowing = _countdownActive || _waitingForVoice;
-            if (_menuVisible && _vrCanvas != null && !countdownShowing)
+            bool buttonsAvailable = _menuVisible && _vrCanvas != null
+                && !_countdownActive && !_waitingForVoice && !_adjustmentPending;
+            if (buttonsAvailable)
                 UpdateGazePointer();
             else
                 UpdateAlwaysOnCrosshair();
@@ -568,7 +569,7 @@ public class ARIADebugUI : MonoBehaviour
         MakeButton(_mainPanel.transform, "DemoWall", "Spawn Wall Art",
             new Vector2(0, y), new Vector2(560, 48),
             () => StartCountdownForAction("Wall art at crosshair",
-                () => { _orchestrator.SetUserContext("hang a painting on the wall"); _orchestrator.SpawnBundledGlb("wall_art.glb", "WALL_FACE", 0.6f, "wall_art", 0.8f, 0.05f); }));
+                () => { _orchestrator.SetUserContext("hang a painting on the wall"); _orchestrator.SpawnBundledGlb("wall_art.glb", "WALL_FACE", 1.2f, "wall_art", 1.6f, 0.05f); }));
         y -= 58f;
 
         // Tripo quality toggle

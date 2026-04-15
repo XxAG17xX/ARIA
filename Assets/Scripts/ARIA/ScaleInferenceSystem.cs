@@ -1,7 +1,8 @@
-// ScaleInferenceSystem.cs
-// Scales a GLTFast-spawned object so its real-world height matches the LLM-specified
-// height in metres. Uses a canonical height dictionary keyed by object category.
-// After scaling, resizes the BoxCollider to match new bounds.
+// ScaleInferenceSystem.cs — makes sure objects are the right real-world size
+// Claude tells us height in metres, we scale the GLTFast model to match.
+// has a dictionary of 35+ real-world object sizes (bed=0.5m, lamp=1.5m, etc)
+// as a sanity check — if Claude gives something weird we fall back to canonical.
+// ALWAYS uniform scaling (no squashing/stretching). resizes BoxCollider after.
 
 using System.Collections.Generic;
 using UnityEngine;

@@ -1,15 +1,8 @@
-// ShadowReceiverSetup.cs
-// Configures MRUK EffectMesh surfaces to receive shadows AND highlights using
-// Meta's Passthrough Relighting (PTRL) HighlightsAndShadows shader.
-//
-// This shader renders:
-//   - Shadows from the main directional light onto real room surfaces
-//   - Highlights from additional point/spot lights (our detected room lights)
-//   - Environment depth occlusion so shadows respect real geometry
-//
-// Call Configure() once after the scene/room is loaded.
-// The shader works with any Unity light — our detected ceiling lights
-// automatically cast shadows and highlights through this shader.
+// ShadowReceiverSetup.cs — creates the PTRL material for shadow rendering
+// finds Meta's HighlightsAndShadows shader (from the MRUK package) and makes
+// a material from it. the orchestrator uses this material on invisible floor/wall
+// planes so Unity light shadows show up on top of the passthrough camera feed.
+// has multiple fallback paths in case the shader isn't found (Resources, package path, etc).
 
 using System.Linq;
 using UnityEngine;
