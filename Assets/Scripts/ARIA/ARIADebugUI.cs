@@ -11,6 +11,7 @@ using System.Linq;
 using UnityEngine;
 using UnityEngine.UI;
 using UnityEngine.EventSystems;
+using Meta.XR.MRUtilityKit;
 
 [RequireComponent(typeof(ARIAOrchestrator))]
 public class ARIADebugUI : MonoBehaviour
@@ -54,12 +55,14 @@ public class ARIADebugUI : MonoBehaviour
     // Activity log panel (shows Claude calls, light confirms, spawns, PTRL, errors)
     private GameObject _logCanvasGO;
     private Text       _logText;
+    private float      _logScrollOffset; // pixels scrolled down (right thumbstick)
+    private bool       _logScrollDirty;
     private static string _claudeLog = "No activity yet.";
     public static void AppendClaudeLog(string msg)
     {
         string timestamp = System.DateTime.Now.ToString("HH:mm:ss");
         _claudeLog = $"[{timestamp}] {msg}\n\n{_claudeLog}";
-        if (_claudeLog.Length > 8000) _claudeLog = _claudeLog.Substring(0, 8000);
+        if (_claudeLog.Length > 24000) _claudeLog = _claudeLog.Substring(0, 24000);
     }
 
 
@@ -126,10 +129,23 @@ public class ARIADebugUI : MonoBehaviour
             new Vector2(220, 320), new Vector2(50, 30),
             () => { _logCanvasGO.SetActive(false); });
 
-        // Log text (scrollable via pages)
-        _logText = MakeLabel(panel.transform, "LogContent", _claudeLog,
-            new Vector2(0, -20), new Vector2(480, 600), 12, FontStyle.Normal, Color.white);
+        // Scroll viewport with clipping mask — text stays inside the panel
+        var viewport = new GameObject("LogViewport", typeof(RectTransform), typeof(RectMask2D));
+        viewport.transform.SetParent(panel.transform, false);
+        var vpRT = viewport.GetComponent<RectTransform>();
+        vpRT.anchoredPosition = new Vector2(0, -20);
+        vpRT.sizeDelta = new Vector2(480, 600);
+
+        // Log text inside viewport (much taller than viewport — scrollable)
+        _logText = MakeLabel(viewport.transform, "LogContent", _claudeLog,
+            new Vector2(0, 0), new Vector2(480, 4000), 12, FontStyle.Normal, Color.white);
         _logText.alignment = TextAnchor.UpperLeft;
+        // Anchor to top of viewport so text starts at top and extends down
+        var logRT = _logText.GetComponent<RectTransform>();
+        logRT.anchorMin = new Vector2(0.5f, 1f);
+        logRT.anchorMax = new Vector2(0.5f, 1f);
+        logRT.pivot = new Vector2(0.5f, 1f);
+        logRT.anchoredPosition = Vector2.zero;
 
         _logCanvasGO.SetActive(false);
     }
@@ -196,16 +212,44 @@ public class ARIADebugUI : MonoBehaviour
         // Voice recording timeout check
         CheckVoiceTimeout();
 
-        // Keep log panel text fresh while menu is open
+        // Log panel: keep text fresh + right thumbstick scrolling
         if (_menuVisible && _logCanvasGO != null && _logCanvasGO.activeSelf && _logText != null)
         {
-            if (_logText.text != _claudeLog)
-                _logText = RemakeLabel(_logText, _claudeLog);
+            // Right thumbstick Y = scroll log (when NOT grabbing an object)
+            if (_grabbedObject == null && _grabbedLight == null)
+            {
+                float scrollInput = OVRInput.Get(OVRInput.Axis2D.SecondaryThumbstick).y;
+                if (Mathf.Abs(scrollInput) > 0.2f)
+                {
+                    _logScrollOffset += scrollInput * Time.deltaTime * 800f;
+                    _logScrollOffset = Mathf.Max(0f, _logScrollOffset); // can't scroll above top
+                    _logScrollDirty = true;
+                }
+            }
+
+            // Update log text + apply scroll offset within clipped viewport
+            if (_logText.text != _claudeLog || _logScrollDirty)
+            {
+                _logScrollDirty = false;
+                if (_logText.text != _claudeLog)
+                    _logText = RemakeLabel(_logText, _claudeLog);
+                // Move text down inside viewport = scroll up (text anchored to top)
+                var logRT = _logText.GetComponent<RectTransform>();
+                logRT.anchorMin = new Vector2(0.5f, 1f);
+                logRT.anchorMax = new Vector2(0.5f, 1f);
+                logRT.pivot = new Vector2(0.5f, 1f);
+                logRT.anchoredPosition = new Vector2(0f, _logScrollOffset);
+            }
         }
 
-        // Gaze-based VR pointer (only when menu is visible)
-        if (IsRunningOnQuest() && _vrCanvas != null && _menuVisible)
-            UpdateGazePointer();
+        // Crosshair + pointer: EnvironmentRaycast when menu hidden, Physics.Raycast when menu visible
+        if (IsRunningOnQuest())
+        {
+            if (_menuVisible && _vrCanvas != null)
+                UpdateGazePointer(); // Physics.Raycast for button hover/click — also moves reticle onto buttons
+            else
+                UpdateAlwaysOnCrosshair(); // EnvironmentRaycast for real-world surface detection
+        }
 
         if (!_countdownActive) return;
 
@@ -238,30 +282,145 @@ public class ARIADebugUI : MonoBehaviour
         }
     }
 
+    // Last gaze hit state — used by placement engine and Claude context
+    private Vector3 _lastGazeHitPoint;
+    private Vector3 _lastGazeHitNormal = Vector3.up;
+    private bool _lastGazeIsOnClutter;
+    private MRUKAnchor _lastGazeAnchor;
+    private bool _lastGazeHitValid;
+
+    /// <summary>Last gaze raycast hit point via EnvironmentRaycastManager (live depth sensor).</summary>
+    public Vector3 LastGazeHitPoint => _lastGazeHitPoint;
+    public Vector3 LastGazeHitNormal => _lastGazeHitNormal;
+    public bool LastGazeIsOnClutter => _lastGazeIsOnClutter;
+    public MRUKAnchor LastGazeAnchor => _lastGazeAnchor;
+    public bool LastGazeHitValid => _lastGazeHitValid;
+
+    // Cached reference to EnvironmentRaycastManager (found at runtime)
+    private Meta.XR.EnvironmentRaycastManager _envRaycastMgr;
+    private bool _envRaycastSearched;
+
+    private Meta.XR.EnvironmentRaycastManager GetEnvRaycastManager()
+    {
+        if (_envRaycastMgr == null && !_envRaycastSearched)
+        {
+            _envRaycastMgr = FindFirstObjectByType<Meta.XR.EnvironmentRaycastManager>();
+            if (_envRaycastMgr == null)
+            {
+                // Auto-create it on the ARIA_Manager GameObject
+                if (Meta.XR.EnvironmentRaycastManager.IsSupported)
+                {
+                    _envRaycastMgr = gameObject.AddComponent<Meta.XR.EnvironmentRaycastManager>();
+                    Debug.Log("[ARIA] EnvironmentRaycastManager auto-created on ARIA_Manager.");
+                }
+                else
+                {
+                    Debug.LogWarning("[ARIA] EnvironmentRaycastManager not supported (Quest 3+ only).");
+                }
+            }
+            _envRaycastSearched = true;
+        }
+        return _envRaycastMgr;
+    }
+
+    /// <summary>
+    /// Always-on crosshair — uses EnvironmentRaycastManager (live depth sensor) for precise
+    /// surface detection including clutter objects. Falls back to Physics.Raycast in editor.
+    /// </summary>
+    private void UpdateAlwaysOnCrosshair()
+    {
+        Camera cam = Camera.main;
+        if (cam == null) return;
+        if (_reticle == null) CreateReticle(cam);
+
+        Ray gazeRay = new Ray(cam.transform.position, cam.transform.forward);
+        bool hit = false;
+        Vector3 hitPt = Vector3.zero;
+        Vector3 hitNorm = Vector3.up;
+
+        // Primary: EnvironmentRaycastManager (live depth sensor — sees actual physical surfaces)
+        var envMgr = GetEnvRaycastManager();
+        if (envMgr != null)
+        {
+            if (envMgr.Raycast(gazeRay, out var envHit, 10f))
+            {
+                hitPt = envHit.point;
+                hitNorm = envHit.normal;
+                hit = true;
+            }
+        }
+
+        // Fallback: Physics.Raycast against colliders (editor mode, or if depth not ready)
+        if (!hit && Physics.Raycast(gazeRay, out RaycastHit physHit, 10f))
+        {
+            hitPt = physHit.point;
+            hitNorm = physHit.normal;
+            hit = true;
+        }
+
+        if (hit)
+        {
+            _lastGazeHitPoint = hitPt;
+            _lastGazeHitNormal = hitNorm;
+            _lastGazeHitValid = true;
+
+            // Identify anchor and clutter state via placement engine
+            var pe = _orchestrator.GetPlacementEngine();
+            if (pe != null)
+            {
+                _lastGazeAnchor = pe.IdentifyAnchorAtPoint(hitPt);
+                _lastGazeIsOnClutter = _lastGazeAnchor != null && pe.IsPointOnClutter(hitPt, _lastGazeAnchor);
+            }
+
+            _reticle.transform.position = hitPt + hitNorm * 0.002f;
+            _reticle.transform.rotation = Quaternion.LookRotation(-hitNorm);
+
+            // Color: yellow on clutter, white on clear surface
+            var mat = _reticle.GetComponent<Renderer>()?.material;
+            if (mat != null)
+                mat.color = _lastGazeIsOnClutter
+                    ? new Color(1f, 0.9f, 0.2f, 0.9f)  // yellow = clutter
+                    : new Color(1f, 1f, 1f, 0.8f);       // white = clear surface
+        }
+        else
+        {
+            // Nothing hit — park reticle 2m ahead
+            _reticle.transform.position = cam.transform.position + cam.transform.forward * 2f;
+            _reticle.transform.rotation = Quaternion.LookRotation(cam.transform.forward);
+            _lastGazeIsOnClutter = false;
+            _lastGazeAnchor = null;
+            _lastGazeHitValid = false;
+        }
+
+        _reticle.SetActive(true);
+    }
+
     private void UpdateGazePointer()
     {
         Camera cam = Camera.main;
         if (cam == null) return;
-
-        // Ensure reticle dot exists
         if (_reticle == null) CreateReticle(cam);
 
+        // When menu is open: Physics.Raycast lands on Canvas buttons for hover/click.
+        // Reticle moves onto buttons so user can see what they're pointing at.
         Ray gazeRay = new Ray(cam.transform.position, cam.transform.forward);
         Button hitBtn = null;
 
         if (Physics.Raycast(gazeRay, out RaycastHit hit, 5f))
         {
             hitBtn = hit.collider.GetComponentInParent<Button>();
-            // Move reticle to hit point
             _reticle.transform.position = hit.point - gazeRay.direction * 0.001f;
             _reticle.transform.rotation = Quaternion.LookRotation(-hit.normal);
+            // White reticle on menu
+            var mat = _reticle.GetComponent<Renderer>()?.material;
+            if (mat != null) mat.color = new Color(1f, 1f, 1f, 0.9f);
         }
         else
         {
-            // Park reticle 2m ahead
             _reticle.transform.position = cam.transform.position + cam.transform.forward * 2f;
             _reticle.transform.rotation = Quaternion.LookRotation(cam.transform.forward);
         }
+        _reticle.SetActive(true);
 
         // Hover highlight
         if (hitBtn != _hoveredButton)
@@ -463,8 +622,11 @@ public class ARIADebugUI : MonoBehaviour
         y -= 52f;
 
         MakeButton(_mainPanel.transform, "BtnAnchors", "Toggle Anchors",
-            new Vector2(0, y), new Vector2(560, 44),
+            new Vector2(-145, y), new Vector2(270, 44),
             () => ToggleAnchorLabels());
+        MakeButton(_mainPanel.transform, "BtnGlobalMesh", "Toggle Global Mesh",
+            new Vector2(145, y), new Vector2(270, 44),
+            () => ToggleGlobalMesh());
         y -= 52f;
 
         // Transcript — taller to show full voice input
@@ -668,7 +830,7 @@ public class ARIADebugUI : MonoBehaviour
             }
         }
 
-        if (_reticle != null) _reticle.SetActive(_menuVisible);
+        // Reticle stays always-on (UpdateAlwaysOnCrosshair handles it)
     }
 
     // -------------------------------------------------------------------------
@@ -1069,15 +1231,88 @@ public class ARIADebugUI : MonoBehaviour
     {
         _effectMeshHidden = !_effectMeshHidden;
 
+        // Get Global Mesh anchor so we can SKIP it (independent toggle)
+        var room = MRUK.Instance?.GetCurrentRoom();
+        var globalMeshAnchor = room?.GetGlobalMeshAnchor();
+
         var effectMesh = FindFirstObjectByType<Meta.XR.MRUtilityKit.EffectMesh>();
         if (effectMesh != null)
         {
             foreach (Transform child in effectMesh.transform)
+            {
+                // Skip Global Mesh children — they have their own toggle
+                if (globalMeshAnchor != null && child.IsChildOf(globalMeshAnchor.transform))
+                    continue;
                 child.gameObject.SetActive(!_effectMeshHidden);
+            }
             effectMesh.HideMesh = _effectMeshHidden;
         }
 
         SetStatus(_effectMeshHidden ? "Room wireframe OFF" : "Room wireframe ON");
+    }
+
+    private bool _globalMeshVisible;
+    private Material _globalMeshWireframeMat;
+
+    private void ToggleGlobalMesh()
+    {
+        _globalMeshVisible = !_globalMeshVisible;
+
+        var room = MRUK.Instance?.GetCurrentRoom();
+        var globalMeshAnchor = room?.GetGlobalMeshAnchor();
+
+        if (globalMeshAnchor != null)
+        {
+            // Create wireframe material using ARIA's GlobalMeshWireframe shader
+            // (URP port of Meta's Phanto WireframeShader — reads barycentric coords from vertex colors)
+            if (_globalMeshWireframeMat == null)
+            {
+                var shader = Shader.Find("ARIA/GlobalMeshWireframe");
+                if (shader != null)
+                {
+                    _globalMeshWireframeMat = new Material(shader);
+                    _globalMeshWireframeMat.SetColor("_WireframeColor", new Color(0f, 1f, 0.3f, 0.7f)); // green wireframe
+                    _globalMeshWireframeMat.SetColor("_Color", new Color(0f, 0f, 0f, 0f));               // transparent fill
+                    _globalMeshWireframeMat.SetFloat("_DistanceMultiplier", 2f);
+                    Debug.Log("[ARIA] Global Mesh wireframe material created (ARIA/GlobalMeshWireframe shader)");
+                }
+                else
+                {
+                    // Fallback: simple transparent material
+                    shader = Shader.Find("UI/Default") ?? Shader.Find("Sprites/Default");
+                    if (shader != null)
+                    {
+                        _globalMeshWireframeMat = new Material(shader);
+                        _globalMeshWireframeMat.color = new Color(0f, 1f, 0.3f, 0.12f);
+                        _globalMeshWireframeMat.renderQueue = 3000;
+                    }
+                    Debug.LogWarning("[ARIA] ARIA/GlobalMeshWireframe shader not found — using transparent fallback");
+                }
+            }
+
+            foreach (var r in globalMeshAnchor.GetComponentsInChildren<MeshRenderer>())
+            {
+                r.enabled = _globalMeshVisible;
+                if (_globalMeshVisible && _globalMeshWireframeMat != null)
+                    r.material = _globalMeshWireframeMat;
+            }
+
+            int triCount = 0;
+            foreach (var mf in globalMeshAnchor.GetComponentsInChildren<MeshFilter>())
+                if (mf.sharedMesh != null) triCount += mf.sharedMesh.triangles.Length / 3;
+
+            SetStatus(_globalMeshVisible
+                ? $"Global Mesh ON ({triCount} triangles)"
+                : "Global Mesh OFF");
+            ARIADebugUI.AppendClaudeLog(_globalMeshVisible
+                ? $"Global Mesh VISIBLE — {triCount} triangles"
+                : "Global Mesh hidden");
+        }
+        else
+        {
+            SetStatus("Global Mesh not found — room scan may not include it");
+            Debug.LogWarning("[ARIA] No GlobalMeshAnchor found in current room");
+        }
     }
 
     private bool _anchorsVisible;

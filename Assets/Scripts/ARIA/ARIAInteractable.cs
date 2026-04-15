@@ -8,7 +8,7 @@ using System.Collections;
 using UnityEngine;
 using Meta.XR.MRUtilityKit;
 
-public enum SurfaceCategory { FloorItem, WallItem }
+public enum SurfaceCategory { FloorItem, WallItem, ClutterItem }
 
 public class ARIAInteractable : MonoBehaviour
 {
@@ -133,26 +133,39 @@ public class ARIAInteractable : MonoBehaviour
         if (_placementEngine != null)
         {
             MRUKAnchor landedOn = _placementEngine.DetectSurfaceBelow(transform.position);
+
+            // Snap Y to the ACTUAL surface (GlobalMesh or EnvironmentRaycast) not just the anchor plane.
+            // This ensures objects rest on real geometry (books, boxes, clutter) not flat anchor planes.
+            float actualSurfaceY = landedOn?.transform.position.y ?? 0f;
+            int globalMeshLayer = LayerMask.GetMask("GlobalMesh");
+            Vector3 rayOrigin = transform.position + Vector3.up * 0.5f;
+            if (Physics.Raycast(rayOrigin, Vector3.down, out RaycastHit meshHit, 2f, globalMeshLayer))
+            {
+                // GlobalMesh hit — use its Y (higher than anchor = clutter surface)
+                actualSurfaceY = Mathf.Max(actualSurfaceY, meshHit.point.y);
+            }
+
             if (landedOn != null)
             {
                 // Correct rotation to upright — floor/table items should stand up, not lie on side
+                // ClutterItems skip this (they were oriented to a surface normal and should keep it)
                 if (category == SurfaceCategory.FloorItem)
                 {
                     Vector3 euler = transform.eulerAngles;
-                    transform.rotation = Quaternion.Euler(0f, euler.y, 0f); // keep Y rotation, zero tilt
+                    transform.rotation = Quaternion.Euler(0f, euler.y, 0f);
                 }
 
                 // Reset to original scale before fitting — prevents multiplicative shrink
                 transform.localScale = originalScale;
                 _placementEngine.FitToSurface(gameObject, landedOn, objectCategory);
 
-                // Snap bottom to surface — fixes floating after physics settle
+                // Snap bottom to actual surface (GlobalMesh Y, not just anchor Y)
                 Bounds b = ARIAOrchestrator.CalculateMeshBounds(gameObject);
-                float surfaceY = landedOn.transform.position.y;
                 float bottomToOrigin = transform.position.y - b.min.y;
-                transform.position = new Vector3(transform.position.x, surfaceY + bottomToOrigin, transform.position.z);
+                transform.position = new Vector3(transform.position.x, actualSurfaceY + bottomToOrigin, transform.position.z);
 
-                Debug.Log($"[ARIAInteractable] {gameObject.name} settled on {landedOn.name}");
+                Debug.Log($"[ARIAInteractable] {gameObject.name} settled on {landedOn.name} " +
+                          $"(anchorY={landedOn.transform.position.y:F2}, meshY={actualSurfaceY:F2})");
             }
         }
 
@@ -221,6 +234,11 @@ public class ARIAInteractable : MonoBehaviour
 
     public static SurfaceCategory ClassifyObject(string category, string surfaceLabel)
     {
+        // Clutter-placed objects skip rotation snap on settle
+        if (!string.IsNullOrEmpty(surfaceLabel) &&
+            surfaceLabel.Equals("CLUTTER", System.StringComparison.OrdinalIgnoreCase))
+            return SurfaceCategory.ClutterItem;
+
         if (!string.IsNullOrEmpty(surfaceLabel) &&
             surfaceLabel.Equals("WALL_FACE", System.StringComparison.OrdinalIgnoreCase))
             return SurfaceCategory.WallItem;

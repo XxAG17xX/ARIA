@@ -209,7 +209,49 @@ public class ARIAOrchestrator : MonoBehaviour
         // Wait 1 second for EffectMesh to finish generating surfaces
         yield return new WaitForSeconds(1f);
         shadowReceiver?.Reconfigure();
+
+        // Assign Global Mesh children to the "GlobalMesh" physics layer (Layer 8)
+        // so we can filter raycasts: anchor colliders (Default) vs detailed scan mesh (GlobalMesh)
+        AssignGlobalMeshLayer();
+
         Debug.Log("[ARIA] Shadow receiver reconfigured after MRUK scene load.");
+    }
+
+    /// <summary>
+    /// Finds the GLOBAL_MESH EffectMesh child and assigns it to the "GlobalMesh" layer.
+    /// This separates the detailed scan mesh (wraps over books, clutter, etc.) from
+    /// the flat anchor colliders (TABLE_0, WALL_0, etc.) for filtered raycasting.
+    /// </summary>
+    private void AssignGlobalMeshLayer()
+    {
+        int globalMeshLayer = LayerMask.NameToLayer("GlobalMesh");
+        if (globalMeshLayer < 0)
+        {
+            Debug.LogWarning("[ARIA] GlobalMesh layer not found — add it in Project Settings > Tags & Layers.");
+            return;
+        }
+
+        var room = MRUK.Instance?.GetCurrentRoom();
+        if (room == null) return;
+
+        var globalMeshAnchor = room.GetGlobalMeshAnchor();
+        if (globalMeshAnchor == null)
+        {
+            Debug.LogWarning("[ARIA] No Global Mesh anchor found — room scan may not include GLOBAL_MESH.");
+            return;
+        }
+
+        // Set the anchor and all its children (EffectMesh-generated MeshCollider objects) to GlobalMesh layer
+        SetLayerRecursive(globalMeshAnchor.gameObject, globalMeshLayer);
+        int count = globalMeshAnchor.GetComponentsInChildren<MeshCollider>().Length;
+        Debug.Log($"[ARIA] Global Mesh assigned to layer {globalMeshLayer} — {count} MeshCollider(s) found.");
+    }
+
+    private static void SetLayerRecursive(GameObject go, int layer)
+    {
+        go.layer = layer;
+        foreach (Transform child in go.transform)
+            SetLayerRecursive(child.gameObject, layer);
     }
 
     // -------------------------------------------------------------------------
@@ -484,14 +526,35 @@ public class ARIAOrchestrator : MonoBehaviour
                 tempObjects.Add(labelGO);
             }
 
-            // Crosshair at gaze hit point
+            // Crosshair at gaze hit point — use EnvironmentRaycastManager (live depth)
+            // with Physics.Raycast fallback (editor or depth not ready)
             Ray gazeRay = new Ray(cam.transform.position, cam.transform.forward);
-            if (Physics.Raycast(gazeRay, out RaycastHit hit, 10f))
+            Vector3 crosshairPos = Vector3.zero;
+            Vector3 crosshairNormal = Vector3.up;
+            bool crosshairHit = false;
+
+            // Try EnvironmentRaycastManager first (real-world depth sensor)
+            var envMgr = FindFirstObjectByType<Meta.XR.EnvironmentRaycastManager>();
+            if (envMgr != null && envMgr.Raycast(gazeRay, out var envHit, 10f))
+            {
+                crosshairPos = envHit.point;
+                crosshairNormal = envHit.normal;
+                crosshairHit = true;
+            }
+            // Fallback: Physics.Raycast
+            else if (Physics.Raycast(gazeRay, out RaycastHit hit, 10f))
+            {
+                crosshairPos = hit.point;
+                crosshairNormal = hit.normal;
+                crosshairHit = true;
+            }
+
+            if (crosshairHit)
             {
                 var crosshair = GameObject.CreatePrimitive(PrimitiveType.Sphere);
                 crosshair.name = "GazeCrosshair";
-                crosshair.transform.position = hit.point + hit.normal * 0.01f;
-                crosshair.transform.localScale = Vector3.one * 0.04f;
+                crosshair.transform.position = crosshairPos + crosshairNormal * 0.01f;
+                crosshair.transform.localScale = Vector3.one * 0.02f; // 2cm dot — precise for Claude
                 Destroy(crosshair.GetComponent<Collider>());
                 var shader = Shader.Find("Universal Render Pipeline/Unlit") ?? Shader.Find("Universal Render Pipeline/Lit");
                 if (shader != null)
@@ -917,16 +980,25 @@ public class ARIAOrchestrator : MonoBehaviour
                    "4. anchor_id: Only set if user wants to RELOCATE to a specific surface\n" +
                    "   - 'put it on that wall' → anchor_id = nearest wall anchor to red dot\n" +
                    "   - 'move up 20cm' → keep current anchor_id or omit (NO relocation)\n\n" +
+                   "5. placement_target: 'on_clutter', 'excluding_clutter', or 'anchor'\n" +
+                   "   - 'on_clutter': user wants object ON a real-world object visible in the image (book, box, etc.)\n" +
+                   "     The object will be placed on the Global Mesh surface at the red dot point.\n" +
+                   "   - 'excluding_clutter': user wants object on the surface but NOT on any real objects.\n" +
+                   "     A clear spot on the anchor surface will be found, 10cm from nearest clutter.\n" +
+                   "   - 'anchor': standard placement on anchor surface (current behavior, default).\n" +
+                   "   - If red dot is on clutter and user says 'put it there' → 'on_clutter'\n" +
+                   "   - If user says 'put it on the table' → 'excluding_clutter' (clear spot on table)\n" +
+                   "   - If user just says size/position change → 'anchor' (no relocation)\n\n" +
                    "Return JSON ONLY:\n" +
-                   "{\"surface_label\": \"FLOOR\", \"anchor_id\": \"FLOOR_0\", \"scale_factor\": 1.0, " +
-                   "\"position_offset\": [0, 0.2, 0], \"category\": \"lamp\", " +
-                   "\"reasoning\": \"User asked to move up 20cm, keeping on floor, raising by offset\"}"
+                   "{\"surface_label\": \"TABLE\", \"anchor_id\": \"TABLE_0\", \"scale_factor\": 1.0, " +
+                   "\"position_offset\": [0, 0, 0], \"placement_target\": \"anchor\", \"category\": \"lamp\", " +
+                   "\"reasoning\": \"User asked to move to the table, placing on clear spot\"}"
         });
 
         string body = JsonConvert.SerializeObject(new
         {
             model = "claude-sonnet-4-6",
-            max_tokens = 512,
+            max_tokens = 1536,
             system = "You are the spatial reasoning AI for ARIA, a mixed reality furniture placement system on Meta Quest 3. " +
                      "CRITICAL: The user's VOICE COMMAND takes absolute priority over gaze direction. " +
                      "If they say 'move up 20cm', apply position_offset [0,0.2,0] — do NOT relocate to the gaze dot. " +
@@ -980,7 +1052,13 @@ public class ARIAOrchestrator : MonoBehaviour
             Debug.Log($"[ARIA] {responseLog}");
             ARIADebugUI.AppendClaudeLog(responseLog);
 
+            Debug.Log($"[ARIA] Adjustment JSON extracted ({json.Length} chars): {json.Substring(0, Mathf.Min(200, json.Length))}...");
             var result = JsonConvert.DeserializeObject<PlacementInstruction>(json);
+
+            // Log parsed fields for debugging
+            Debug.Log($"[ARIA] Parsed: scale={result.scale_factor:F3}, target={result.placement_target}, " +
+                      $"surface={result.surface_label}, anchor={result.anchor_id}");
+
             SetStatus($"Claude: {result.category} → {result.surface_label}, scale {result.scale_factor:F2}x. {result.reasoning ?? ""}");
             return result;
         }
@@ -1469,31 +1547,85 @@ public class ARIAOrchestrator : MonoBehaviour
         scaleSystem?.ApplyScale(root, instr.height_metres, instr.category,
                                 instr.width_metres, instr.depth_metres);
 
-        // Place on the correct MRUK surface — use specific anchor if Claude provided one
-        MRUKAnchor targetAnchor = GetAnchorById(instr.anchor_id);
-        MRUKAnchor nearAnchor = GetAnchorById(instr.near_anchor_id);
-        placementEngine?.Place(root, instr.surface_label, targetAnchor, nearAnchor);
+        // ── Clutter-aware placement via Claude's placement_target ──────────
+        string placementTarget = instr.placement_target ?? "anchor";
+        bool pipelineOnClutter = false;
 
-        // Auto-fit: shrink if object clips walls/ceiling/furniture
+        if (placementTarget == "on_clutter" && placementEngine != null)
+        {
+            // Claude said place ON clutter — use gaze EnvironmentRaycast for position
+            if (placementEngine.GazeRaycastGlobalMesh(out var clutterPt, out var clutterNm, out var clutterAnc))
+            {
+                placementEngine.PlaceOnGlobalMesh(root, clutterPt, clutterNm);
+                pipelineOnClutter = true;
+                Debug.Log($"[ARIA] Pipeline spawn ON CLUTTER: {instr.category}");
+            }
+            else
+            {
+                // Fallback to standard if raycast fails
+                placementEngine?.Place(root, instr.surface_label, GetAnchorById(instr.anchor_id), GetAnchorById(instr.near_anchor_id));
+            }
+        }
+        else if (placementTarget == "excluding_clutter" && placementEngine != null)
+        {
+            // Claude said avoid clutter — find clear spot on anchor
+            MRUKAnchor clearAnchor = GetAnchorById(instr.anchor_id);
+            if (clearAnchor == null && placementEngine.GazeRaycastGlobalMesh(out var gzPt, out _, out var gzAnc))
+                clearAnchor = gzAnc;
 
-        var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
-        if (fitRoom != null)
-            placementEngine?.FitToAvailableSpace(root, fitRoom);
+            if (clearAnchor != null)
+            {
+                Bounds objSize = CalculateMeshBounds(root);
+                Vector3 clearPos = placementEngine.FindClearSpotOnAnchor(clearAnchor, clearAnchor.transform.position, objSize.size);
+                root.transform.position = clearPos + Vector3.up * objSize.extents.y;
+                Debug.Log($"[ARIA] Pipeline spawn EXCLUDING clutter: {instr.category}");
+            }
+            else
+            {
+                placementEngine?.Place(root, instr.surface_label, GetAnchorById(instr.anchor_id), GetAnchorById(instr.near_anchor_id));
+            }
+        }
+        else
+        {
+            // Standard anchor placement
+            MRUKAnchor targetAnchor = GetAnchorById(instr.anchor_id);
+            MRUKAnchor nearAnchor = GetAnchorById(instr.near_anchor_id);
+            placementEngine?.Place(root, instr.surface_label, targetAnchor, nearAnchor);
+        }
 
-        // Surface-specific fit: shrink to surface if too big, cap at canonical real-world size
-        MRUKAnchor fitAnchor = GetAnchorById(instr.anchor_id);
-        if (fitAnchor == null)
-            fitAnchor = placementEngine?.DetectSurfaceBelow(root.transform.position);
-        if (fitAnchor != null)
-            placementEngine?.FitToSurface(root, fitAnchor, instr.category);
+        // Auto-fit sizing — always runs regardless of placement mode.
+        // Objects on clutter still need anchor-relative sizing.
+        if (!pipelineOnClutter)
+        {
+            var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
+            if (fitRoom != null)
+                placementEngine?.FitToAvailableSpace(root, fitRoom);
+        }
+
+        // FitToSurface: size to anchor boundary (works for both clutter and standard)
+        {
+            MRUKAnchor fitAnchor = GetAnchorById(instr.anchor_id);
+            if (fitAnchor == null)
+                fitAnchor = placementEngine?.DetectSurfaceBelow(root.transform.position);
+            if (fitAnchor == null && placementEngine != null)
+                fitAnchor = placementEngine.IdentifyAnchorAtPoint(root.transform.position);
+
+            if (fitAnchor != null)
+            {
+                Vector3 preFitPos = root.transform.position;
+                placementEngine?.FitToSurface(root, fitAnchor, instr.category);
+                // For clutter: restore Y to clutter surface, not anchor surface
+                if (pipelineOnClutter)
+                    root.transform.position = new Vector3(root.transform.position.x, preFitPos.y, root.transform.position.z);
+            }
+        }
 
         // Lighting + interaction setup
-        // Lighting is handled by PTRL toggle, not per-spawn
-        // Only add virtual light if object emits light (e.g. lamp)
         if (instr.emits_light) AddVirtualLight(root, instr);
 
+        string effectiveLabel = pipelineOnClutter ? "CLUTTER" : instr.surface_label;
         if (enablePhysics)
-            AddPhysicsAndInteraction(root, instr.category, instr.surface_label);
+            AddPhysicsAndInteraction(root, instr.category, effectiveLabel);
 
         if (_previews.TryGetValue(instr.prompt, out var preview))
         {
@@ -1611,24 +1743,110 @@ public class ARIAOrchestrator : MonoBehaviour
         // Wait one frame for mesh renderers to initialize bounds properly
         await Task.Yield();
 
-        // Place on the correct surface using the placement engine
-        placementEngine?.Place(root, surfaceLabel);
+        // ── Clutter-aware placement via Global Mesh ──────────────────────
+        // Demo objects place wherever the user is looking (gaze → Global Mesh hit).
+        // If gaze hits clutter (book, mouse, etc.), object sits on the clutter.
+        // If gaze hits clear surface, object sits on the anchor surface.
+        var debugUI = GetComponent<ARIADebugUI>();
+        bool usedGlobalMesh = false;
+        MRUKAnchor gazeAnchor = null;
 
-        // Auto-fit to available MRUK space
-        var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
-        if (fitRoom != null)
-            placementEngine?.FitToAvailableSpace(root, fitRoom);
+        if (placementEngine != null &&
+            placementEngine.GazeRaycastGlobalMesh(out var gazeHit, out var gazeNorm, out gazeAnchor))
+        {
+            bool isClutter = gazeAnchor != null && placementEngine.IsPointOnClutter(gazeHit, gazeAnchor);
 
-        // Surface-specific fit: shrink to surface if too big, cap at canonical size
-        MRUKAnchor demoAnchor = placementEngine?.DetectSurfaceBelow(root.transform.position);
-        if (demoAnchor != null)
-            placementEngine?.FitToSurface(root, demoAnchor, category);
+            if (isClutter || gazeHit.y > (gazeAnchor?.transform.position.y ?? -999f) + 0.01f)
+            {
+                // Place on whatever the EnvironmentRaycast/GlobalMesh hit
+                // (clutter, or any surface above an anchor — e.g. objects placed after scan)
+                placementEngine.PlaceOnGlobalMesh(root, gazeHit, gazeNorm);
+                usedGlobalMesh = true;
+                Debug.Log($"[ARIA] Demo spawn at gaze point ({gazeHit.x:F2},{gazeHit.y:F2},{gazeHit.z:F2}) " +
+                          $"clutter={isClutter}, anchor={gazeAnchor?.name ?? "none"}");
+            }
+            else
+            {
+                // Clear anchor surface — place at the gaze point on the anchor
+                // Use the identified anchor rather than the hardcoded surfaceLabel
+                // so objects go where you're looking, not on a fixed surface type
+                if (gazeAnchor != null)
+                {
+                    Bounds b = CalculateMeshBounds(root);
+                    float halfH = b.extents.y;
+                    root.transform.position = new Vector3(gazeHit.x, gazeHit.y + halfH, gazeHit.z);
+                    root.transform.rotation = Quaternion.identity;
+                    Debug.Log($"[ARIA] Demo spawn on anchor {gazeAnchor.name} at gaze point");
+                }
+                else
+                {
+                    placementEngine.Place(root, surfaceLabel);
+                }
+            }
+        }
+        else
+        {
+            // Fallback: standard placement (no raycast hit)
+            placementEngine?.Place(root, surfaceLabel);
+        }
+
+        // Auto-fit sizing — applies to BOTH clutter and anchor placements.
+        // Objects placed on clutter still need to be sized relative to the anchor they sit on
+        // (e.g., lamp on book on TABLE_0 should be sized for TABLE_0, not oversized).
+        if (!usedGlobalMesh)
+        {
+            // Standard path: FitToAvailableSpace + FitToSurface
+            var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
+            if (fitRoom != null)
+                placementEngine?.FitToAvailableSpace(root, fitRoom);
+        }
+        // else: skip FitToAvailableSpace for clutter (would mess with Y on clutter surface)
+
+        // FitToSurface always runs — sizes object to the anchor boundary it belongs to.
+        // For clutter: uses the identified anchor (gazeAnchor = TABLE_0, FLOOR_0, etc.)
+        // For standard: uses surface-appropriate anchor
+        {
+            MRUKAnchor fitAnchor = null;
+
+            if (usedGlobalMesh && gazeAnchor != null)
+            {
+                // Clutter path: size to the anchor the clutter sits on
+                fitAnchor = gazeAnchor;
+            }
+            else if (surfaceLabel != null && surfaceLabel.Equals("FLOOR", StringComparison.OrdinalIgnoreCase))
+            {
+                var demoRoom = MRUK.Instance?.GetCurrentRoom();
+                if (demoRoom != null)
+                    fitAnchor = demoRoom.Anchors.FirstOrDefault(
+                        a => a.HasAnyLabel(MRUKAnchor.SceneLabels.FLOOR));
+            }
+            else
+            {
+                fitAnchor = placementEngine?.DetectSurfaceBelow(root.transform.position);
+            }
+
+            if (fitAnchor != null)
+            {
+                // Save position before FitToSurface — for clutter, restore Y after
+                // (FitToSurface snaps Y to anchor surface, but we want clutter surface Y)
+                Vector3 preFitPos = root.transform.position;
+                placementEngine?.FitToSurface(root, fitAnchor, category);
+                if (usedGlobalMesh)
+                {
+                    // Restore clutter Y — FitToSurface snapped to anchor, but we want world mesh height
+                    root.transform.position = new Vector3(
+                        root.transform.position.x, preFitPos.y, root.transform.position.z);
+                }
+            }
+        }
 
         // Reset layer so future raycasts CAN hit this object
         root.layer = 0;
 
-        // Physics + interaction (gravity for floor items, wall snap for wall items)
-        if (enablePhysics) AddPhysicsAndInteraction(root, category, surfaceLabel);
+        // Physics + interaction
+        // Clutter-placed objects get ClutterItem category (no rotation snap on settle)
+        string effectiveSurfaceLabel = usedGlobalMesh ? "CLUTTER" : surfaceLabel;
+        if (enablePhysics) AddPhysicsAndInteraction(root, category, effectiveSurfaceLabel);
 
         // Reflection probe
         AddReflectionProbe(root);
@@ -1706,9 +1924,18 @@ public class ARIAOrchestrator : MonoBehaviour
         var refined = await CallClaudeAdjustmentAsync(instr, jpeg, mrukJson, gazePos, gazeFwd);
 
         // Claude returns scale_factor + surface_label + anchor_id + position_offset + reasoning
+        Debug.Log($"[ARIA] Adjustment raw values: scale_factor={refined.scale_factor:F3}, " +
+                  $"placement_target={refined.placement_target}, surface={refined.surface_label}, " +
+                  $"anchor={refined.anchor_id}");
+
         float scaleFactor = refined.scale_factor > 0.01f ? refined.scale_factor : 1f;
         string surface = refined.surface_label ?? "FLOOR";
         string reasoning = refined.reasoning ?? "";
+
+        if (refined.scale_factor <= 0.01f && refined.scale_factor != 0f)
+            Debug.LogWarning($"[ARIA] scale_factor too small ({refined.scale_factor}), defaulting to 1.0");
+        if (refined.surface_label == "AUTO")
+            Debug.LogWarning("[ARIA] Adjustment returned surface_label=AUTO — parsing may have failed, using original instruction");
 
         // Cap scale_factor: never exceed canonical real-world dimensions
         if (scaleFactor > 1f)
@@ -1736,36 +1963,88 @@ public class ARIAOrchestrator : MonoBehaviour
             Debug.Log($"[ARIA] Claude scale: {scaleFactor:F2}x (uniform)");
         }
 
-        // Only re-place if Claude explicitly wants to RELOCATE (gave an anchor_id)
+        // ── Clutter-aware placement based on Claude's placement_target ──
+        string placementTarget = refined.placement_target ?? "anchor";
         MRUKAnchor targetAnchor = GetAnchorById(refined.anchor_id);
         bool hasOffset = refined.position_offset != null && refined.position_offset.Length >= 3
             && (Mathf.Abs(refined.position_offset[0]) > 0.001f ||
                 Mathf.Abs(refined.position_offset[1]) > 0.001f ||
                 Mathf.Abs(refined.position_offset[2]) > 0.001f);
 
-        if (targetAnchor != null)
+        bool didRelocate = false;
+
+        if (placementTarget == "on_clutter" && placementEngine != null)
         {
+            // Place on whatever real-world object the gaze hits (Global Mesh)
+            if (placementEngine.GazeRaycastGlobalMesh(out var clutterHit, out var clutterNorm, out _))
+            {
+                placementEngine.PlaceOnGlobalMesh(lastSpawn.gameObject, clutterHit, clutterNorm);
+                didRelocate = true;
+
+                // Update interactable category to ClutterItem (skip rotation snap)
+                var interactable = lastSpawn.GetComponent<ARIAInteractable>();
+                if (interactable != null)
+                    interactable.category = SurfaceCategory.ClutterItem;
+
+                Debug.Log($"[ARIA] Claude: placed {objName} ON CLUTTER at ({clutterHit.x:F2},{clutterHit.y:F2},{clutterHit.z:F2})");
+            }
+        }
+        else if (placementTarget == "excluding_clutter" && placementEngine != null)
+        {
+            // Find a clear spot on the anchor surface, away from clutter
+            MRUKAnchor clearAnchor = targetAnchor;
+            if (clearAnchor == null)
+            {
+                // Use gaze to determine which anchor
+                var debugUI = GetComponent<ARIADebugUI>();
+                if (debugUI != null && debugUI.LastGazeAnchor != null)
+                    clearAnchor = debugUI.LastGazeAnchor;
+            }
+
+            if (clearAnchor != null)
+            {
+                Bounds objBoundsNow = CalculateMeshBounds(lastSpawn.gameObject);
+                Vector3 gazeCenter = cam != null
+                    ? cam.transform.position + cam.transform.forward * 2f
+                    : lastSpawn.position;
+
+                // Use gaze hit point as search center
+                if (placementEngine.GazeRaycastGlobalMesh(out var gazeHitPt, out _, out _))
+                    gazeCenter = gazeHitPt;
+
+                Vector3 clearPos = placementEngine.FindClearSpotOnAnchor(
+                    clearAnchor, gazeCenter, objBoundsNow.size);
+
+                Bounds b = CalculateMeshBounds(lastSpawn.gameObject);
+                float halfH = b.extents.y;
+                lastSpawn.position = new Vector3(clearPos.x, clearPos.y + halfH, clearPos.z);
+                didRelocate = true;
+
+                Debug.Log($"[ARIA] Claude: placed {objName} EXCLUDING clutter at ({clearPos.x:F2},{clearPos.y:F2},{clearPos.z:F2})");
+            }
+        }
+        else if (targetAnchor != null && hasOffset)
+        {
+            // Standard anchor relocation — only when Claude gives a non-zero offset
+            // (anchor_id alone is just context, not a relocation request)
             placementEngine?.Place(lastSpawn.gameObject, surface, targetAnchor);
 
             var fitRoom = Meta.XR.MRUtilityKit.MRUK.Instance?.GetCurrentRoom();
             if (fitRoom != null)
                 placementEngine?.FitToAvailableSpace(lastSpawn.gameObject, fitRoom);
 
-            // Surface-specific fit after relocation
             placementEngine?.FitToSurface(lastSpawn.gameObject, targetAnchor, objName);
+            didRelocate = true;
         }
+        // else: scale-only or no-change — don't move the object at all
 
-        // Apply position offset AFTER fit — so Claude's "move up 20cm" actually sticks
+        // Apply position offset AFTER placement — so "move up 20cm" sticks
         if (hasOffset)
         {
             Vector3 offset = new Vector3(refined.position_offset[0], refined.position_offset[1], refined.position_offset[2]);
 
-            // If Place() already ran (anchor_id provided), it already set the correct Y for the surface.
-            // Zero out Y offset to avoid double-dipping (Claude often returns Y offset that duplicates
-            // what the anchor placement already did — e.g. "move down 0.21m to floor" when Place
-            // already snapped to floor).
-            // Only keep Y offset when NO anchor was used (pure offset from current position).
-            if (targetAnchor != null)
+            // Zero out Y offset when anchor/clutter placement already set correct Y
+            if (didRelocate)
                 offset.y = 0f;
 
             if (offset.sqrMagnitude > 0.001f)
@@ -1777,11 +2056,10 @@ public class ARIAOrchestrator : MonoBehaviour
 
         string offsetStr = refined.position_offset != null && refined.position_offset.Length >= 3
             ? $", offset ({refined.position_offset[0]:F2},{refined.position_offset[1]:F2},{refined.position_offset[2]:F2})" : "";
-        ARIADebugUI.AppendClaudeLog($"ADJUST: {objName}\n  → {refined.anchor_id ?? surface}, scale {scaleFactor:F2}x{offsetStr}\n  {reasoning}");
+        ARIADebugUI.AppendClaudeLog($"ADJUST: {objName}\n  → {placementTarget} / {refined.anchor_id ?? surface}, scale {scaleFactor:F2}x{offsetStr}\n  {reasoning}");
 
-
-        SetStatus($"Claude: {objName} → {surface}, scale {scaleFactor:F2}x. {reasoning}");
-        Debug.Log($"[ARIA] Claude adjustment: surface={surface}, scale={scaleFactor:F2}x, reason={reasoning}");
+        SetStatus($"Claude: {objName} → {placementTarget}, scale {scaleFactor:F2}x. {reasoning}");
+        Debug.Log($"[ARIA] Claude adjustment: target={placementTarget}, surface={surface}, scale={scaleFactor:F2}x, reason={reasoning}");
     }
 
     // -------------------------------------------------------------------------
@@ -1911,6 +2189,27 @@ public class ARIAOrchestrator : MonoBehaviour
     /// Directional: single directional light aimed from first sphere toward objects, point lights for color only.
     /// PointLight: each point light casts its own shadows (cubemap), no directional shadow.
     /// </summary>
+    /// <summary>
+    /// Continuously updates directional light direction when PTRL is active in Directional mode.
+    /// Tracks the first manual light sphere position so moving the sphere updates shadows in real-time.
+    /// </summary>
+    private void LateUpdate()
+    {
+        if (!_ptrlActive || _shadowMode != ShadowMode.Directional) return;
+        if (sceneDirectionalLight == null || _manualLights.Count == 0) return;
+
+        var firstLight = _manualLights[0];
+        if (firstLight == null) return;
+
+        Vector3 lightPos = firstLight.transform.position;
+        Transform objRoot = spawnRoot != null ? spawnRoot : transform;
+        Vector3 targetPos = objRoot.childCount > 0
+            ? objRoot.GetChild(0).position : Vector3.zero;
+        Vector3 dir = (targetPos - lightPos).normalized;
+        if (dir.sqrMagnitude > 0.01f)
+            sceneDirectionalLight.transform.rotation = Quaternion.LookRotation(dir);
+    }
+
     private void ApplyShadowMode()
     {
         if (_shadowMode == ShadowMode.Directional)
@@ -2112,7 +2411,37 @@ public class ARIAOrchestrator : MonoBehaviour
                 Debug.Log($"[ARIA] PTRL shadow ceiling at Y={ceilAnchor.transform.position.y}");
             }
         }
+
+        // ── Global Mesh shadow receiver ─────────────────────────────────
+        // Apply PTRL material to the Global Mesh so shadows follow the continuous
+        // room geometry — shadows stop at walls instead of passing through.
+        if (room != null)
+        {
+            var globalMeshAnchor = room.GetGlobalMeshAnchor();
+            if (globalMeshAnchor != null)
+            {
+                // Find the EffectMesh-generated child with MeshRenderer
+                foreach (var r in globalMeshAnchor.GetComponentsInChildren<MeshRenderer>())
+                {
+                    // Save original material so we can restore on PTRL OFF
+                    if (r.GetComponent<ARIAOriginalMaterialTag>() == null)
+                    {
+                        var tag = r.gameObject.AddComponent<ARIAOriginalMaterialTag>();
+                        tag.originalMaterial = r.sharedMaterial;
+                        tag.originalShadowMode = r.shadowCastingMode;
+                        tag.originalReceiveShadows = r.receiveShadows;
+                    }
+                    r.material = new Material(ptrlMat);
+                    r.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off; // don't cast, just receive
+                    r.receiveShadows = true;
+                }
+                _globalMeshPTRLActive = true;
+                Debug.Log("[ARIA] PTRL applied to Global Mesh — shadows follow continuous room geometry.");
+            }
+        }
     }
+
+    private bool _globalMeshPTRLActive;
 
     private static void ConfigurePTRLRenderer(GameObject go, Material ptrlMat)
     {
@@ -2129,6 +2458,28 @@ public class ARIAOrchestrator : MonoBehaviour
             if (go != null) Destroy(go);
         }
         _ptrlShadowSurfaces.Clear();
+
+        // Restore Global Mesh materials to original (non-PTRL)
+        if (_globalMeshPTRLActive)
+        {
+            var room = MRUK.Instance?.GetCurrentRoom();
+            var globalMeshAnchor = room?.GetGlobalMeshAnchor();
+            if (globalMeshAnchor != null)
+            {
+                foreach (var tag in globalMeshAnchor.GetComponentsInChildren<ARIAOriginalMaterialTag>())
+                {
+                    var r = tag.GetComponent<MeshRenderer>();
+                    if (r != null && tag.originalMaterial != null)
+                    {
+                        r.material = tag.originalMaterial;
+                        r.shadowCastingMode = tag.originalShadowMode;
+                        r.receiveShadows = tag.originalReceiveShadows;
+                    }
+                }
+            }
+            _globalMeshPTRLActive = false;
+        }
+
         Debug.Log("[ARIA] PTRL shadow surfaces destroyed.");
     }
 
@@ -2612,6 +2963,7 @@ public class PlacementInstruction
     public float    depth_metres;
     public string   category;
     public float    scale_factor;    // uniform scale (0.05–2.0), used by Claude adjustment
+    public string   placement_target; // "on_clutter", "excluding_clutter", or "anchor" (default)
     public string   reasoning;      // Claude's explanation of its decision
     // Virtual light source fields (optional — only set when emits_light = true)
     public bool     emits_light;
@@ -2672,4 +3024,15 @@ public class PlacementInstruction
 {
     public string model;      // GLB download URL
     public string pbr_model;  // PBR variant (we don't use this)
+}
+
+/// <summary>
+/// Tag component that saves original material state before PTRL is applied to Global Mesh.
+/// Used to restore the original material when PTRL is toggled off.
+/// </summary>
+public class ARIAOriginalMaterialTag : MonoBehaviour
+{
+    [HideInInspector] public Material originalMaterial;
+    [HideInInspector] public UnityEngine.Rendering.ShadowCastingMode originalShadowMode;
+    [HideInInspector] public bool originalReceiveShadows;
 }

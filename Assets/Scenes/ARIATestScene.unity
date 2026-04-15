@@ -941,7 +941,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: 
   SpawnOnStart: 1
   MeshMaterial: {fileID: 2100000, guid: 599b01c5f1d17436c89b88cc04257314, type: 2}
-  BarycentricCoordinatesEnabled: 0
+  BarycentricCoordinatesEnabled: 1
   Colliders: 1
   CutHoles: 0
   castShadows: 1
@@ -951,7 +951,7 @@ MonoBehaviour:
   - WallU: 5
     WallV: 2
     AnchorUV: 1
-  Labels: 442367
+  Labels: 458751
 --- !u!114 &286710428
 MonoBehaviour:
   m_ObjectHideFlags: 0

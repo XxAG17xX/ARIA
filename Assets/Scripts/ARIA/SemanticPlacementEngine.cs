@@ -918,6 +918,245 @@ public class SemanticPlacementEngine : MonoBehaviour
     }
 
     // -------------------------------------------------------------------------
+    // Clutter-aware placement (Global Mesh + Anchor Boundaries)
+    // -------------------------------------------------------------------------
+
+    private static readonly int GlobalMeshLayerMask = 1 << 8; // Layer 8 = GlobalMesh
+
+    /// <summary>
+    /// Identifies which MRUK anchor's footprint contains the given world point.
+    /// Checks volume anchors first (TABLE, COUCH, BED, etc.), then falls back to FLOOR.
+    /// Returns null if no anchor matches (shouldn't happen in a scanned room).
+    /// </summary>
+    public MRUKAnchor IdentifyAnchorAtPoint(Vector3 worldPoint)
+    {
+        var room = MRUK.Instance?.GetCurrentRoom();
+        if (room == null) return null;
+
+        MRUKAnchor bestVolume = null;
+        float bestDist = float.MaxValue;
+
+        foreach (var anchor in room.Anchors)
+        {
+            // Skip non-surface anchors
+            if (anchor.HasAnyLabel(MRUKAnchor.SceneLabels.CEILING) ||
+                anchor.HasAnyLabel(MRUKAnchor.SceneLabels.DOOR_FRAME) ||
+                anchor.HasAnyLabel(MRUKAnchor.SceneLabels.WINDOW_FRAME) ||
+                anchor.HasAnyLabel(MRUKAnchor.SceneLabels.GLOBAL_MESH)) continue;
+
+            // For walls: check plane distance
+            if (anchor.HasAnyLabel(MRUKAnchor.SceneLabels.WALL_FACE))
+            {
+                Vector3 toPoint = worldPoint - anchor.transform.position;
+                float planeDist = Mathf.Abs(Vector3.Dot(toPoint, anchor.transform.forward));
+                if (planeDist < 0.15f && planeDist < bestDist)
+                {
+                    bestDist = planeDist;
+                    bestVolume = anchor;
+                }
+                continue;
+            }
+
+            // For volumes (TABLE, BED, COUCH, OTHER, etc.): check XZ footprint + Y proximity
+            if (anchor.VolumeBounds.HasValue)
+            {
+                Vector3 localPos = anchor.transform.InverseTransformPoint(worldPoint);
+                Vector2 halfSize = anchor.VolumeBounds.Value.size * 0.5f;
+
+                // Within XZ footprint (with small margin)?
+                if (Mathf.Abs(localPos.x) <= halfSize.x + 0.1f &&
+                    Mathf.Abs(localPos.z) <= halfSize.y + 0.1f) // VolumeBounds.size.y = depth
+                {
+                    float yDiff = Mathf.Abs(worldPoint.y - anchor.transform.position.y);
+                    if (yDiff < 1.0f && yDiff < bestDist)
+                    {
+                        bestDist = yDiff;
+                        bestVolume = anchor;
+                    }
+                }
+            }
+
+            // Floor as fallback
+            if (anchor.HasAnyLabel(MRUKAnchor.SceneLabels.FLOOR) && bestVolume == null)
+                bestVolume = anchor;
+        }
+
+        return bestVolume;
+    }
+
+    /// <summary>
+    /// Checks if a Global Mesh hit point is above the anchor surface (= clutter).
+    /// Returns true if the hit is more than 1cm above the anchor's top surface.
+    /// </summary>
+    public bool IsPointOnClutter(Vector3 hitPoint, MRUKAnchor anchor)
+    {
+        if (anchor == null) return false;
+
+        float anchorSurfaceY = anchor.transform.position.y;
+
+        // For floor anchors, surface Y is the floor height
+        if (anchor.HasAnyLabel(MRUKAnchor.SceneLabels.FLOOR))
+            anchorSurfaceY = GetFloorHeight(MRUK.Instance?.GetCurrentRoom());
+
+        float difference = hitPoint.y - anchorSurfaceY;
+        return difference > 0.01f; // 1cm threshold — above this = real object on the surface
+    }
+
+    /// <summary>
+    /// Places an object directly on the Global Mesh surface at the given hit point,
+    /// oriented by the surface normal. Used for "on_clutter" placement.
+    /// </summary>
+    public void PlaceOnGlobalMesh(GameObject obj, Vector3 hitPoint, Vector3 hitNormal)
+    {
+        Bounds b = GetObjectBounds(obj);
+        float halfH = b.extents.y;
+
+        if (hitNormal.y > 0.7f)
+        {
+            // Mostly flat surface (top of book, flat clutter) — place upright
+            obj.transform.position = hitPoint + Vector3.up * halfH;
+            // Keep existing Y rotation, just ensure upright
+            Vector3 euler = obj.transform.eulerAngles;
+            obj.transform.rotation = Quaternion.Euler(0f, euler.y, 0f);
+        }
+        else if (hitNormal.y < 0.3f)
+        {
+            // Mostly vertical surface (side of box, clutter wall) — mount on surface
+            float halfDepth = Mathf.Min(b.extents.x, b.extents.z);
+            obj.transform.position = hitPoint + hitNormal * (halfDepth + 0.02f);
+            obj.transform.rotation = Quaternion.LookRotation(hitNormal, Vector3.up);
+        }
+        else
+        {
+            // Angled surface — orient object to follow the surface
+            obj.transform.position = hitPoint + hitNormal * halfH;
+            Vector3 up = Vector3.ProjectOnPlane(Vector3.up, hitNormal).normalized;
+            if (up.sqrMagnitude < 0.01f) up = Vector3.up;
+            obj.transform.rotation = Quaternion.LookRotation(
+                Vector3.ProjectOnPlane(obj.transform.forward, hitNormal).normalized, hitNormal);
+        }
+
+        Debug.Log($"[SemanticPlacement] PlaceOnGlobalMesh: {obj.name} at {hitPoint}, normal={hitNormal}");
+        ARIADebugUI.AppendClaudeLog($"PLACED on clutter: {obj.name}\n  pos=({hitPoint.x:F2},{hitPoint.y:F2},{hitPoint.z:F2})");
+    }
+
+    /// <summary>
+    /// Finds a clear spot on an anchor surface, away from clutter detected via Global Mesh.
+    /// Searches outward from the search center using golden-angle spiral.
+    /// Returns a position with 10cm gap from the nearest clutter edge.
+    /// </summary>
+    public Vector3 FindClearSpotOnAnchor(MRUKAnchor anchor, Vector3 searchCenter, Vector3 objectSize)
+    {
+        if (anchor == null) return searchCenter;
+
+        float anchorSurfaceY = anchor.transform.position.y;
+        if (anchor.HasAnyLabel(MRUKAnchor.SceneLabels.FLOOR))
+            anchorSurfaceY = GetFloorHeight(MRUK.Instance?.GetCurrentRoom());
+
+        float searchRadius = 0.8f;
+        if (anchor.VolumeBounds.HasValue)
+            searchRadius = Mathf.Max(anchor.VolumeBounds.Value.size.x, anchor.VolumeBounds.Value.size.y) * 0.4f;
+
+        float halfObjW = objectSize.x * 0.5f;
+        float halfObjD = objectSize.z * 0.5f;
+        float gapFromClutter = 0.10f; // 10cm gap from clutter edge
+
+        // Golden-angle spiral search for clear spot
+        for (int i = 0; i <= maxPlacementAttempts; i++)
+        {
+            float angle = i * 137.5f * Mathf.Deg2Rad;
+            float radius = searchRadius * Mathf.Sqrt((float)i / maxPlacementAttempts);
+            float dx = Mathf.Cos(angle) * radius;
+            float dz = Mathf.Sin(angle) * radius;
+
+            Vector3 testPoint = searchCenter + new Vector3(dx, 0, dz);
+            testPoint.y = anchorSurfaceY + 1.0f; // raycast from 1m above
+
+            // Raycast down against Global Mesh
+            if (Physics.Raycast(testPoint, Vector3.down, out RaycastHit hit, 2f, GlobalMeshLayerMask))
+            {
+                float meshHeight = hit.point.y - anchorSurfaceY;
+                if (meshHeight < 0.01f) // clear spot — mesh is at anchor level
+                {
+                    // Check a small area around candidate to ensure object fits
+                    bool fits = true;
+                    for (float cx = -halfObjW; cx <= halfObjW && fits; cx += 0.05f)
+                    {
+                        for (float cz = -halfObjD; cz <= halfObjD && fits; cz += 0.05f)
+                        {
+                            Vector3 checkPoint = new Vector3(testPoint.x + cx, testPoint.y, testPoint.z + cz);
+                            if (Physics.Raycast(checkPoint, Vector3.down, out RaycastHit checkHit, 2f, GlobalMeshLayerMask))
+                            {
+                                if (checkHit.point.y - anchorSurfaceY > 0.01f)
+                                    fits = false; // clutter in the way
+                            }
+                        }
+                    }
+
+                    if (fits)
+                    {
+                        Vector3 result = new Vector3(testPoint.x, anchorSurfaceY, testPoint.z);
+                        Debug.Log($"[SemanticPlacement] FindClearSpot: found at ({result.x:F2},{result.y:F2},{result.z:F2}), attempt {i}");
+                        return result;
+                    }
+                }
+            }
+        }
+
+        // Fallback: place at anchor center
+        Debug.LogWarning("[SemanticPlacement] FindClearSpot: no clear spot found — using anchor center.");
+        return new Vector3(anchor.transform.position.x, anchorSurfaceY, anchor.transform.position.z);
+    }
+
+    /// <summary>
+    /// Raycasts from the camera gaze using EnvironmentRaycastManager (live depth sensor)
+    /// for precise real-world surface detection. Falls back to Physics.Raycast against
+    /// Global Mesh collider in editor or if depth API isn't ready.
+    /// Returns true if hit, with point, normal, and the anchor it belongs to.
+    /// </summary>
+    public bool GazeRaycastGlobalMesh(out Vector3 hitPoint, out Vector3 hitNormal, out MRUKAnchor hitAnchor)
+    {
+        hitPoint = Vector3.zero;
+        hitNormal = Vector3.up;
+        hitAnchor = null;
+
+        Camera cam = Camera.main;
+        if (cam == null) return false;
+
+        Ray gazeRay = new Ray(cam.transform.position, cam.transform.forward);
+
+        // Primary: EnvironmentRaycastManager (live depth sensor — sees actual physical surfaces)
+        var envMgr = FindFirstObjectByType<Meta.XR.EnvironmentRaycastManager>();
+        if (envMgr != null && envMgr.Raycast(gazeRay, out var envHit, 10f))
+        {
+            hitPoint = envHit.point;
+            hitNormal = envHit.normal;
+            hitAnchor = IdentifyAnchorAtPoint(hitPoint);
+            return true;
+        }
+
+        // Fallback 1: Physics.Raycast against Global Mesh layer (stored scan mesh)
+        if (Physics.Raycast(gazeRay, out RaycastHit meshHit, 10f, GlobalMeshLayerMask))
+        {
+            hitPoint = meshHit.point;
+            hitNormal = meshHit.normal;
+            hitAnchor = IdentifyAnchorAtPoint(hitPoint);
+            return true;
+        }
+
+        // Fallback 2: Physics.Raycast against all layers (anchor colliders)
+        if (Physics.Raycast(gazeRay, out RaycastHit anyHit, 10f))
+        {
+            hitPoint = anyHit.point;
+            hitNormal = anyHit.normal;
+            hitAnchor = IdentifyAnchorAtPoint(hitPoint);
+            return true;
+        }
+
+        return false;
+    }
+
+    // -------------------------------------------------------------------------
     // Geometry helpers
     // -------------------------------------------------------------------------
 
