@@ -1097,6 +1097,8 @@ public class ARIADebugUI : MonoBehaviour
             cur.y = Mathf.Clamp(cur.y, orig.y * 0.05f, orig.y * 5f);
             cur.z = Mathf.Clamp(cur.z, orig.z * 0.05f, orig.z * 5f);
             _grabbedObject.transform.localScale = cur;
+            // thumbstick scaling is temporary — auto-resize still active on grab-release.
+            // only Claude voice adjustment permanently disables auto-resize.
         }
     }
 

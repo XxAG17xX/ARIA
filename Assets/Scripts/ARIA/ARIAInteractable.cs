@@ -36,6 +36,9 @@ public class ARIAInteractable : MonoBehaviour
     /// <summary>Original scale at spawn time — used to reset before FitToSurface so shrink isn't multiplicative.</summary>
     [HideInInspector] public Vector3 originalScale = Vector3.one;
 
+    /// <summary>When true, FitToSurface is skipped on grab-release. Set by Claude adjustment or thumbstick scaling.</summary>
+    [HideInInspector] public bool disableAutoResize;
+
     private void Awake()
     {
         _rb = GetComponent<Rigidbody>();
@@ -95,12 +98,29 @@ public class ARIAInteractable : MonoBehaviour
     {
         if (_rb == null) return;
 
-        // Verify there's something below to land on (EffectMesh colliders)
-        if (!Physics.Raycast(transform.position, Vector3.down, 10f))
+        // check if there's Global Mesh or anchor collider below to land on.
+        // if the object is on a real-world surface that only EnvironmentRaycast sees
+        // (no Global Mesh, e.g. object placed after room scan), keep kinematic —
+        // gravity would make it fall through to the floor since there's no collider.
+        int gmLayer = LayerMask.GetMask("GlobalMesh");
+        bool hasGlobalMesh = Physics.Raycast(transform.position, Vector3.down, 2f, gmLayer);
+        bool hasAnyGround = Physics.Raycast(transform.position, Vector3.down, 10f);
+
+        if (!hasAnyGround)
         {
             _rb.isKinematic = true;
             _rb.useGravity = false;
             Debug.LogWarning($"[ARIAInteractable] No ground below {gameObject.name}, keeping kinematic");
+            return;
+        }
+
+        if (!hasGlobalMesh)
+        {
+            // on a surface only visible to EnvironmentRaycast (post-scan object).
+            // stay kinematic — gravity would drop it to the anchor floor below.
+            _rb.isKinematic = true;
+            _rb.useGravity = false;
+            Debug.Log($"[ARIAInteractable] {gameObject.name} on non-mesh surface, keeping kinematic until grabbed");
             return;
         }
 
@@ -163,9 +183,13 @@ public class ARIAInteractable : MonoBehaviour
                     transform.rotation = Quaternion.Euler(0f, euler.y, 0f);
                 }
 
-                // Reset to original scale before fitting — prevents multiplicative shrink
-                transform.localScale = originalScale;
-                _placementEngine.FitToSurface(gameObject, landedOn, objectCategory);
+                // auto-resize to fit surface — unless user manually set the size
+                // (via Claude adjustment or thumbstick). once manually sized, stays that size forever.
+                if (!disableAutoResize)
+                {
+                    transform.localScale = originalScale;
+                    _placementEngine.FitToSurface(gameObject, landedOn, objectCategory);
+                }
 
                 // Snap bottom to actual surface (GlobalMesh Y, not just anchor Y)
                 Bounds b = ARIAOrchestrator.CalculateMeshBounds(gameObject);

@@ -1766,9 +1766,22 @@ public class ARIAOrchestrator : MonoBehaviour
                 placementEngine?.FitToAvailableSpace(root, fitRoom);
         }
 
-        // NO FitToSurface during pipeline spawn — Claude/user decides the size.
-        // FitToSurface only runs on grab-release (WaitForSettle in ARIAInteractable)
-        // so the user can resize freely and the auto-fit only kicks in when they drop it.
+        // FitToSurface on initial spawn — auto-size to fit the landing surface.
+        // this gets permanently disabled only after Claude voice adjustment changes the scale.
+        // grab-release also triggers FitToSurface (unless disableAutoResize is set).
+        {
+            MRUKAnchor fitAnchor = placementEngine?.IdentifyAnchorAtPoint(root.transform.position);
+            if (fitAnchor == null)
+                fitAnchor = placementEngine?.DetectSurfaceBelow(root.transform.position);
+            if (fitAnchor != null)
+            {
+                Vector3 preFitPos = root.transform.position;
+                placementEngine?.FitToSurface(root, fitAnchor, instr.category);
+                // restore gaze position — FitToSurface may snap Y to anchor
+                if (_commandGazeValid)
+                    root.transform.position = new Vector3(root.transform.position.x, preFitPos.y, root.transform.position.z);
+            }
+        }
 
         // Lighting + interaction setup
         if (instr.emits_light) AddVirtualLight(root, instr);
@@ -2114,10 +2127,19 @@ public class ARIAOrchestrator : MonoBehaviour
         // Claude decides the appropriate scale based on user's voice command.
 
         // Apply uniform scale (proportional, no deformation)
+        bool didScale = false;
         if (scaleFactor > 0.01f && Mathf.Abs(scaleFactor - 1f) > 0.05f)
         {
             lastSpawn.localScale *= scaleFactor;
-            Debug.Log($"[ARIA] Claude scale: {scaleFactor:F2}x (uniform)");
+            didScale = true;
+            // update originalScale and disable auto-resize permanently for this object
+            var interactable = lastSpawn.GetComponent<ARIAInteractable>();
+            if (interactable != null)
+            {
+                interactable.originalScale = lastSpawn.localScale;
+                interactable.disableAutoResize = true;
+            }
+            Debug.Log($"[ARIA] Claude scale: {scaleFactor:F2}x (uniform), originalScale updated");
         }
 
         // ── Clutter-aware placement based on Claude's placement_target ──
@@ -2223,10 +2245,10 @@ public class ARIAOrchestrator : MonoBehaviour
         SetStatus($"Claude: {objName} → {placementTarget}, scale {scaleFactor:F2}x. {reasoning}");
         Debug.Log($"[ARIA] Claude adjustment: target={placementTarget}, surface={surface}, scale={scaleFactor:F2}x, reason={reasoning}");
 
-        // after any position/scale change, trigger gravity settle for floor/clutter objects
-        // so they land naturally on the Global Mesh. wall objects skip (they wall-snap).
+        // gravity settle after relocation — object falls onto Global Mesh naturally.
+        // NOT triggered for scale-only changes (object stays in place).
         var postInteractable = lastSpawn.GetComponent<ARIAInteractable>();
-        if (postInteractable != null && (didRelocate || Mathf.Abs(scaleFactor - 1f) > 0.05f))
+        if (postInteractable != null && didRelocate && !didScale)
         {
             if (postInteractable.category == SurfaceCategory.FloorItem ||
                 postInteractable.category == SurfaceCategory.ClutterItem)
