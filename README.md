@@ -146,12 +146,38 @@ Assets/StreamingAssets/GLBCache/   <- Pre-bundled demo models (bed.glb, lamp.glb
 
 ---
 
-## How to Run
+## Setup Instructions
 
-### Quest 3 (primary target)
-1. API keys are hardcoded in ARIAOrchestrator.cs (stripped before git push)
-2. Build via File → Build Profiles → Meta Quest 3
-3. Deploy APK via Meta Quest Developer Hub
+### Prerequisites
+- Unity 6000.3.8f1 LTS (must match exactly — Meta XR SDK is version-sensitive)
+- Meta Quest 3 headset with developer mode enabled
+- Meta XR All-in-One SDK v85 (installed via Unity Package Manager)
+
+### API Keys
+Create `Assets/config.json` (not tracked by git) with your API keys:
+```json
+{
+  "claude_key": "your-anthropic-api-key",
+  "gemini_key": "your-google-ai-key",
+  "hitem_access_key": "your-hitem-key",
+  "hitem_secret_key": "your-hitem-secret",
+  "tripo_key": "your-tripo3d-key"
+}
+```
+Also copy this file to `Assets/StreamingAssets/config.json` for Quest APK builds.
+
+### Opening the Project
+1. Open Unity Hub → Add → browse to the project root folder
+2. Unity will import packages and regenerate the Library folder (may take 5-10 minutes)
+3. Open `Assets/Scenes/ARIATestScene.unity`
+4. The scene contains ARIA_Manager (with all scripts), MRUK, EffectMesh, and camera rig
+
+### Building for Quest 3
+1. File → Build Profiles → Android → Meta Quest 3
+2. Ensure `ARIATestScene` is in the build scenes list
+3. Build and Run — deploys APK directly to headset (~1 minute build)
+
+## How to Use
 4. In headset:
    - **Y** to open menu
    - **"Speak to ARIA"** → voice command → 3-2-1 countdown → look at target surface
