@@ -16,23 +16,49 @@ ARIA generates and places 3D furniture in your real room through Mixed Reality o
 
 ---
 
+## Demo Video
+
+<p align="center">
+  <a href="https://www.youtube.com/watch?v=2N-jfHEKipg">
+    <img src="https://img.youtube.com/vi/2N-jfHEKipg/sddefault.jpg" alt="ARIA Demo Video" width="640">
+  </a>
+  <br>
+  <a href="https://www.youtube.com/watch?v=2N-jfHEKipg"><b>▶ Watch the full demo on YouTube</b></a>
+</p>
+
+---
+
+## What Makes ARIA Different
+
+AR furniture apps (IKEA Place, Amazon "View in Room") place pre-made catalog models. Generative 3D tools (Tripo, Meshy) create meshes but know nothing about your room. ARIA closes the loop between the two:
+
+1. **Objects are generated, not picked** — say "a steampunk brass lamp" and that exact object is created on the fly as a textured 3D mesh. There is no catalog.
+2. **The AI sees your actual room** — Claude receives the live passthrough image and the room-scan geometry, so "near the door", "on that wall", "beside the bed" resolve against *your* real furniture and surfaces.
+3. **Placement understands the physical world** — clutter detection (Global Mesh vs anchor boundaries) knows the difference between "on the table" and "on the book that's on the table"; canonical real-world dimensions stop a bed from spawning at dollhouse size.
+4. **It all runs on a consumer headset** — the entire chain (voice → spatial reasoning → generation → placement → relighting) runs on a standalone Quest 3. No PC tether, no cloud rendering.
+
+Each piece exists somewhere in isolation. The integrated loop — speak, and a contextually appropriate object materializes on the right surface, at the right scale, with shadows matching your room's real lights — is what ARIA contributes.
+
+---
+
 ## Pipeline Architecture
 
 ```
 Voice command (Meta Voice SDK / Wit.ai)
   │
   v
-Annotated Room Capture
-  - Passthrough camera frame + yellow anchor labels (WALL_0, TABLE_1...)
-  - Red gaze crosshair at raycast hit point
-  - Virtual objects visible, wireframe hidden
-  - MRUK room JSON with indexed anchor IDs + dimensions + viewport coords
+Room Capture
+  - Rendered view: passthrough + virtual objects, wireframe hidden
+  - Red gaze dot at EnvironmentRaycast hit point (where the user points)
+  - MRUK room JSON: indexed anchor IDs (WALL_0, TABLE_1...) + dimensions + viewport coords
+  - Gaze state saved at command time (generation takes 1-2 min; the user moves)
   │
   v
 Claude API (multimodal spatial reasoning)
-  - Receives: annotated image + room JSON + voice transcript + user position/gaze
-  - Resolves deictic references: "that wall" → WALL_2 (nearest to gaze dot)
-  - Decides: object style, dimensions, surface_label, anchor_id, near_anchor_id
+  - Receives: captured image + room JSON + voice transcript + user position/gaze + gaze-anchor hit
+  - Resolves deictic references: "that wall" → the anchor under the red gaze dot
+  - Decides: image prompt, real-world dimensions, category, placement_target
+    (on_clutter / excluding_clutter / anchor), reuse_cached
   - Voice commands override gaze (explicit prompt priority rule)
   │
   v
@@ -60,7 +86,7 @@ Runtime Systems:
 ## Key Features
 
 ### Anchor-Aware Spatial Placement
-- **Deictic reference resolution** — "put a painting on THAT wall" → Claude sees gaze dot near WALL_2 label, returns `anchor_id: "WALL_2"`
+- **Deictic reference resolution** — "put a painting on THAT wall" → the red gaze dot in the captured image plus gaze-anchor data resolve *which* wall the user means
 - **MRUK collision-aware placement** — golden-angle spiral search avoids real furniture + virtual objects
 - **Surface-specific placement** — floor (gaze raycast), wall (plane intersection + PlaneRect clamping), table/couch (volume top surface)
 - **Proximity hints** — "near the door" → `near_anchor_id: "DOOR_0"` nudges position toward that anchor
@@ -75,7 +101,7 @@ Runtime Systems:
 ### Physical Interaction
 - **Grab with right grip** — hold to move objects with controller, release to drop
 - **Floor items** (bed, lamp, chair) — fall with gravity, land on surfaces, auto-resize + upright correction
-- **Wall items** (painting, clock, mirror) — magnet-snap to nearest wall within 15cm, or fall if too far
+- **Wall items** (painting, clock, mirror) — magnet-snap to nearest wall within 8cm, or fall if too far
 - **Right thumbstick** — rotate grabbed objects (X=turn, Y=tilt)
 - **Left thumbstick** — scale grabbed objects (forward=bigger, backward=smaller)
 - **A button** — reset rotation to upright while holding
@@ -106,6 +132,19 @@ Runtime Systems:
 - MRUK room scan with EffectMesh wireframe visualization
 - Environment depth occlusion enabled at startup
 - One-shot voice recording (no ambient speech capture)
+
+---
+
+## Engineering Highlights
+
+Beyond the visuals, ARIA is a networking and systems project running on mobile-class hardware:
+
+- **Concurrent async pipelines** — each requested object runs its own async chain (image gen → refinement → mesh gen → download → spawn), fanned out with `Task.WhenAll` so objects appear progressively as they finish, never blocking the render thread
+- **Four external APIs orchestrated on-device** — Anthropic, Google, Tripo3D/HiTEM3D, Wit.ai — all through `UnityWebRequest` bridged to C# `async/await` with a custom awaiter that polls completion on the main thread (Quest's async callback path silently stalls under network pressure)
+- **Resilience by default** — 429 retry with backoff, model fallback chains (Gemini 2.5 → 3.1 preview), per-request timeouts plus a hard outer timeout, and long-poll state machines for mesh generation (5s interval, 5–10 min budget, states: queued → running → success/failed)
+- **Defensive LLM response parsing** — code-fence stripping with bracket-depth matching (handles reasoning text around the JSON), and tolerant deserialization that skips individual malformed fields instead of failing the whole response
+- **Local GLB cache** — generated mesh bytes persist to disk (provider download URLs expire within ~1 hour) with eviction at 10 entries; cached models are reused only when the user explicitly asks for "the same one again"
+- **Platform-guarded code paths** — editor mock room data vs on-device MRUK, StreamingAssets → persistentDataPath config copy for APK builds, and a dedicated physics layer for the Global Mesh so raycasts can distinguish the detailed scan geometry from flat anchor colliders
 
 ---
 
@@ -178,15 +217,16 @@ Also copy this file to `Assets/StreamingAssets/config.json` for Quest APK builds
 3. Build and Run — deploys APK directly to headset (~1 minute build)
 
 ## How to Use
-4. In headset:
-   - **Y** to open menu
-   - **"Speak to ARIA"** → voice command → 3-2-1 countdown → look at target surface
-   - **Demo spawns** → Spawn Bed / Lamp / Wall Art (zero credits)
-   - **"Adjust with Claude"** → speak adjustment → close UI (Y) → look at object
-   - **Left grip** → place light sphere → position → Confirm → PTRL toggle for shadows
-   - **Right grip** → grab objects → move → release (gravity or wall snap)
-   - **"Toggle Anchors"** → see MRUK anchor labels in room
-   - **"Shadow Mode"** → cycle Directional ↔ Point Light
+
+In the headset:
+- **Y** to open menu
+- **"Speak to ARIA"** → voice command → 3-2-1 countdown → look at target surface
+- **Demo spawns** → Spawn Bed / Lamp / Wall Art (zero credits)
+- **"Adjust with Claude"** → speak adjustment → close UI (Y) → look at object
+- **Left grip** → place light sphere → position → Confirm → PTRL toggle for shadows
+- **Right grip** → grab objects → move → release (gravity or wall snap)
+- **"Toggle Anchors"** → see MRUK anchor labels in room
+- **"Shadow Mode"** → cycle Directional ↔ Point Light
 
 ---
 
