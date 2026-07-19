@@ -1,0 +1,151 @@
+<svg viewBox="0 0 1200 700" xmlns="http://www.w3.org/2000/svg" font-family="'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#8b949e"/>
+    </marker>
+    <marker id="arrowDim" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 9 5 L 0 9 z" fill="#6e7681"/>
+    </marker>
+  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="1200" height="700" rx="14" fill="#0d1117"/>
+
+  <!-- title -->
+  <text x="40" y="40" font-size="20" font-weight="700" fill="#e6edf2">ARIA Pipeline</text>
+  <text x="40" y="60" font-size="12.5" fill="#8b949e">from a spoken command to a generated object placed in your real room</text>
+
+  <!-- ======================= ZONE A: On-device capture ======================= -->
+  <rect x="32" y="80" width="330" height="410" rx="12" fill="#161b22" stroke="#30363d"/>
+  <text x="62" y="106" font-size="11.5" font-weight="700" letter-spacing="2" fill="#58a6ff">ON-DEVICE · CAPTURE</text>
+
+  <!-- A1 Voice command -->
+  <rect x="62" y="120" width="270" height="64" rx="10" fill="#1c2128" stroke="#58a6ff" stroke-opacity="0.55"/>
+  <text x="78" y="146" font-size="14.5" font-weight="600" fill="#e6edf2">Voice command</text>
+  <text x="78" y="166" font-size="11.5" fill="#8b949e">Wit.ai · VoiceSDKConnector · one-shot mic</text>
+
+  <!-- A2 Gaze snapshot -->
+  <rect x="62" y="214" width="270" height="64" rx="10" fill="#1c2128" stroke="#58a6ff" stroke-opacity="0.55"/>
+  <text x="78" y="240" font-size="14.5" font-weight="600" fill="#e6edf2">Gaze snapshot</text>
+  <text x="78" y="260" font-size="11.5" fill="#8b949e">saved at command time · depth raycast</text>
+
+  <!-- A3 Room scan -->
+  <rect x="62" y="308" width="270" height="64" rx="10" fill="#1c2128" stroke="#58a6ff" stroke-opacity="0.55"/>
+  <text x="78" y="334" font-size="14.5" font-weight="600" fill="#e6edf2">Room scan &#8594; JSON</text>
+  <text x="78" y="354" font-size="11.5" fill="#8b949e">MRUK anchors &#8594; WALL_0, TABLE_1&#8230;</text>
+
+  <!-- A4 Passthrough capture -->
+  <rect x="62" y="402" width="270" height="64" rx="10" fill="#1c2128" stroke="#58a6ff" stroke-opacity="0.55"/>
+  <text x="78" y="428" font-size="14.5" font-weight="600" fill="#e6edf2">Passthrough capture</text>
+  <text x="78" y="448" font-size="11.5" fill="#8b949e">1536&#178; JPEG + red gaze dot</text>
+  <circle cx="240" cy="444" r="3.5" fill="#f85149"/>
+
+  <!-- chain arrows A -->
+  <line x1="197" y1="184" x2="197" y2="212" stroke="#8b949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <line x1="197" y1="278" x2="197" y2="306" stroke="#8b949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <line x1="197" y1="372" x2="197" y2="400" stroke="#8b949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- Demo mode (outside zone) -->
+  <rect x="62" y="560" width="270" height="64" rx="10" fill="#12161d" stroke="#6e7681" stroke-dasharray="5 4"/>
+  <text x="78" y="586" font-size="14.5" font-weight="600" fill="#c9d1d9">Demo mode</text>
+  <text x="78" y="606" font-size="11.5" fill="#8b949e">pre-bundled GLBs · zero API credits</text>
+
+  <!-- ======================= ZONE B: External AI APIs ======================= -->
+  <rect x="386" y="80" width="390" height="490" rx="12" fill="#161b22" stroke="#30363d"/>
+  <text x="416" y="106" font-size="11.5" font-weight="700" letter-spacing="2" fill="#d2a8ff">EXTERNAL AI APIS</text>
+
+  <!-- B1 Claude spatial reasoning -->
+  <rect x="416" y="120" width="330" height="76" rx="10" fill="#1c2128" stroke="#d2a8ff" stroke-opacity="0.55"/>
+  <text x="432" y="146" font-size="14.5" font-weight="600" fill="#e6edf2">Claude &#183; spatial reasoning</text>
+  <text x="432" y="166" font-size="11.5" fill="#8b949e">image + room JSON &#8594; PlacementInstruction[]</text>
+  <text x="432" y="182" font-size="11.5" fill="#8b949e">defensive JSON parsing (bracket-depth match)</text>
+
+  <!-- fan-out badge -->
+  <rect x="446" y="226" width="270" height="36" rx="18" fill="#0d1117" stroke="#d2a8ff" stroke-opacity="0.35"/>
+  <text x="581" y="249" font-size="11.5" font-weight="600" fill="#d2a8ff" text-anchor="middle">per-object async fan-out &#183; Task.WhenAll</text>
+
+  <!-- fanout arrows into B2 (three stubs) -->
+  <line x1="541" y1="262" x2="541" y2="288" stroke="#8b949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <line x1="581" y1="262" x2="581" y2="288" stroke="#8b949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <line x1="621" y1="262" x2="621" y2="288" stroke="#8b949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <line x1="581" y1="196" x2="581" y2="224" stroke="#8b949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- B2 Gemini -->
+  <rect x="416" y="290" width="330" height="64" rx="10" fill="#1c2128" stroke="#d2a8ff" stroke-opacity="0.55"/>
+  <text x="432" y="316" font-size="14.5" font-weight="600" fill="#e6edf2">Gemini 2.5 Flash &#183; reference image</text>
+  <text x="432" y="336" font-size="11.5" fill="#8b949e">429 retry + backoff &#183; model fallback chain</text>
+
+  <!-- B3 Claude refinement (optional) -->
+  <rect x="416" y="382" width="330" height="56" rx="10" fill="#1c2128" stroke="#d2a8ff" stroke-opacity="0.35" stroke-dasharray="5 4"/>
+  <text x="432" y="406" font-size="14.5" font-weight="600" fill="#c9d1d9">Claude refinement <tspan font-size="11.5" fill="#8b949e">(optional)</tspan></text>
+  <text x="432" y="424" font-size="11.5" fill="#8b949e">adjusts dimensions from the reference image</text>
+
+  <!-- B4 Tripo3D -->
+  <rect x="416" y="466" width="330" height="76" rx="10" fill="#1c2128" stroke="#d2a8ff" stroke-opacity="0.55"/>
+  <text x="432" y="492" font-size="14.5" font-weight="600" fill="#e6edf2">Tripo3D &#183; mesh generation</text>
+  <text x="432" y="512" font-size="11.5" fill="#8b949e">long-poll: queued &#8594; running &#8594; success</text>
+  <text x="432" y="528" font-size="11.5" fill="#8b949e">v2.5 10k / v3.1 30k+PBR &#183; HiTEM3D alt path</text>
+
+  <!-- chain arrows B -->
+  <line x1="581" y1="354" x2="581" y2="380" stroke="#8b949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <line x1="581" y1="438" x2="581" y2="464" stroke="#8b949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- ======================= ZONE C: Placement & rendering ======================= -->
+  <rect x="800" y="80" width="368" height="550" rx="12" fill="#161b22" stroke="#30363d"/>
+  <text x="830" y="106" font-size="11.5" font-weight="700" letter-spacing="2" fill="#3fb950">ON-DEVICE · PLACEMENT &amp; RENDERING</text>
+
+  <!-- C1 GLB cache -->
+  <rect x="830" y="120" width="308" height="56" rx="10" fill="#1c2128" stroke="#3fb950" stroke-opacity="0.55"/>
+  <text x="846" y="144" font-size="14.5" font-weight="600" fill="#e6edf2">GLB cache</text>
+  <text x="846" y="162" font-size="11.5" fill="#8b949e">disk &#183; 10-entry eviction (URLs expire ~1 h)</text>
+
+  <!-- C2 Spawn -->
+  <rect x="830" y="204" width="308" height="56" rx="10" fill="#1c2128" stroke="#3fb950" stroke-opacity="0.55"/>
+  <text x="846" y="228" font-size="14.5" font-weight="600" fill="#e6edf2">Spawn</text>
+  <text x="846" y="246" font-size="11.5" fill="#8b949e">GLTFast import &#183; FixPinkMaterials</text>
+
+  <!-- C3 Scale -->
+  <rect x="830" y="288" width="308" height="56" rx="10" fill="#1c2128" stroke="#3fb950" stroke-opacity="0.55"/>
+  <text x="846" y="312" font-size="14.5" font-weight="600" fill="#e6edf2">Scale</text>
+  <text x="846" y="330" font-size="11.5" fill="#8b949e">canonical real-world dims &#183; clamps &#183; caps</text>
+
+  <!-- C4 Place -->
+  <rect x="830" y="372" width="308" height="64" rx="10" fill="#1c2128" stroke="#3fb950" stroke-opacity="0.55"/>
+  <text x="846" y="396" font-size="14.5" font-weight="600" fill="#e6edf2">Place</text>
+  <text x="846" y="414" font-size="11.5" fill="#8b949e">SemanticPlacementEngine &#183; gaze hit &#183;</text>
+  <text x="846" y="428" font-size="11.5" fill="#8b949e">golden-angle spiral &#183; clutter detection</text>
+
+  <!-- C5 Physics -->
+  <rect x="830" y="464" width="308" height="56" rx="10" fill="#1c2128" stroke="#3fb950" stroke-opacity="0.55"/>
+  <text x="846" y="488" font-size="14.5" font-weight="600" fill="#e6edf2">Physics &amp; grab</text>
+  <text x="846" y="506" font-size="11.5" fill="#8b949e">gravity settle &#183; wall magnet snap</text>
+
+  <!-- C6 PTRL lighting -->
+  <rect x="830" y="548" width="308" height="56" rx="10" fill="#1c2128" stroke="#3fb950" stroke-opacity="0.55"/>
+  <text x="846" y="572" font-size="14.5" font-weight="600" fill="#e6edf2">PTRL lighting</text>
+  <text x="846" y="590" font-size="11.5" fill="#8b949e">passthrough-sampled light &#183; real shadows</text>
+
+  <!-- chain arrows C -->
+  <line x1="984" y1="176" x2="984" y2="202" stroke="#8b949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <line x1="984" y1="260" x2="984" y2="286" stroke="#8b949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <line x1="984" y1="344" x2="984" y2="370" stroke="#8b949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <line x1="984" y1="436" x2="984" y2="462" stroke="#8b949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <line x1="984" y1="520" x2="984" y2="546" stroke="#8b949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- ======================= CROSS-ZONE ARROWS ======================= -->
+
+  <!-- A4 -> B1: room context -->
+  <path d="M 332 434 H 374 V 158 H 414" fill="none" stroke="#8b949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+
+  <!-- B4 -> C1: GLB bytes -->
+  <path d="M 746 504 H 792 V 164 H 828" fill="none" stroke="#8b949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+  <text x="769" y="497" font-size="10.5" fill="#6e7681" text-anchor="middle">GLB</text>
+
+  <!-- B1 -> C1: cache hit (dashed) -->
+  <path d="M 746 134 H 828" fill="none" stroke="#6e7681" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arrowDim)"/>
+  <text x="787" y="126" font-size="10.5" fill="#6e7681" text-anchor="middle">reuse_cached</text>
+
+  <!-- Demo mode -> C2 (dashed, bottom gutter) -->
+  <path d="M 332 592 H 784 V 232 H 828" fill="none" stroke="#6e7681" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arrowDim)"/>
+  <text x="560" y="584" font-size="10.5" fill="#6e7681" text-anchor="middle">skips all APIs</text>
+</svg>

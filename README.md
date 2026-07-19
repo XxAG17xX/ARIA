@@ -43,43 +43,7 @@ Each piece exists somewhere in isolation. The integrated loop — speak, and a c
 
 ## Pipeline Architecture
 
-```
-Voice command (Meta Voice SDK / Wit.ai)
-  │
-  v
-Room Capture
-  - Rendered view: passthrough + virtual objects, wireframe hidden
-  - Red gaze dot at EnvironmentRaycast hit point (where the user points)
-  - MRUK room JSON: indexed anchor IDs (WALL_0, TABLE_1...) + dimensions + viewport coords
-  - Gaze state saved at command time (generation takes 1-2 min; the user moves)
-  │
-  v
-Claude API (multimodal spatial reasoning)
-  - Receives: captured image + room JSON + voice transcript + user position/gaze + gaze-anchor hit
-  - Resolves deictic references: "that wall" → the anchor under the red gaze dot
-  - Decides: image prompt, real-world dimensions, category, placement_target
-    (on_clutter / excluding_clutter / anchor), reuse_cached
-  - Voice commands override gaze (explicit prompt priority rule)
-  │
-  v
-Gemini (reference image generation)
-  │
-  v
-Claude refinement (optional — compares reference image to room context, adjusts dimensions)
-  │
-  v
-Tripo3D (textured 3D GLB mesh generation)
-  │
-  v
-Runtime Systems:
-  - ScaleInferenceSystem       → uniform scaling from Claude dimensions, canonical cap
-  - SemanticPlacementEngine    → anchor-aware MRUK placement, collision-aware spiral
-  - FitToAvailableSpace        → room-level shrink (walls, ceiling), surface-aware Y
-  - FitToSurface               → surface-specific proportional resize + canonical max
-  - ARIAInteractable           → gravity drop (floor items) / wall magnet snap (wall items)
-  - PTRL HighlightsAndShadows  → shadows on real surfaces (directional + point light modes)
-  - Claude post-spawn adjustment → voice + annotated capture refinement
-```
+<img src="docs/pipeline-diagram.svg" width="100%" alt="ARIA pipeline: voice command through Claude spatial reasoning, Gemini, and Tripo3D to placed object">
 
 ---
 
