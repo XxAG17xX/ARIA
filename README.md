@@ -43,7 +43,7 @@ Each piece exists somewhere in isolation. The integrated loop — speak, and a c
 
 ## Pipeline Architecture
 
-<img src="docs/pipeline-diagram.svg" width="100%" alt="ARIA pipeline: voice command through Claude spatial reasoning, Gemini, and Tripo3D to placed object">
+<img src="docs/aria-pipeline.png" width="100%" alt="ARIA pipeline: voice command through Claude spatial reasoning, Gemini, and Tripo3D to placed object">
 
 ---
 
